@@ -6,6 +6,7 @@
 //! golden-bytes tests in both places keep them in sync.
 
 /// UDP port the receiver (projector) listens on: START, media, PROBE.
+pub mod geom;
 pub mod h264;
 pub mod rate;
 

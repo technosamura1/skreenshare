@@ -1,6 +1,7 @@
 // One streaming session: capture -> NVENC H.264 -> paced UDP to the projector, plus system audio, plus a
 // small control thread (keyframe requests, keep-alive, receiver reports).
-use crate::capture::{self, Capturer, Event};
+use crate::capture::{self, Capturer, Event, Source};
+use crate::wincap::WindowCapturer;
 use crate::video::{Encoder, EncoderConfig, Scaler};
 use anyhow::{anyhow, bail, Result};
 use proto as p;
@@ -15,8 +16,8 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// Index into the monitor list (None = primary).
-    pub monitor: Option<usize>,
+    /// What to show: a monitor (None = primary) or one window.
+    pub source: Source,
     pub fps: u32,
     /// Bitrate (Mbit/s): fixed value, or with `adaptive` the starting point and the ceiling (it drops on loss and recovers slowly).
     pub bitrate_mbps: u32,
@@ -43,6 +44,8 @@ pub struct Status {
     pub text: String,
     pub stats: String,
     pub audio: String,
+    /// Something the user should know that is not an error (e.g. "the window was closed, showing the whole screen").
+    pub notice: String,
     pub error: Option<String>,
 }
 
@@ -97,15 +100,23 @@ impl Stream {
                 text: "Соединяюсь с проектором...".into(),
                 stats: String::new(),
                 audio: String::new(),
+                notice: String::new(),
                 error: None,
             }),
             repaint: Box::new(repaint),
         });
         let sh = shared.clone();
+        let mut settings = settings;
         let thread = std::thread::spawn(move || {
             loop {
                 match run_once(&sh, peer, limit, &settings) {
                     Ok(End::Resized) => continue,
+                    Ok(End::SourceLost(msg)) => {
+                        // The window is gone (or cannot be captured): carry on with the whole screen.
+                        settings.source = Source::Monitor(None);
+                        sh.set(|s| s.notice = msg);
+                        continue;
+                    }
                     Ok(End::Stopped) => break,
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -146,6 +157,8 @@ enum End {
     Stopped,
     /// The desktop changed size; the projector must be told again.
     Resized,
+    /// The window being shown cannot be captured any more; the message says what happens next.
+    SourceLost(String),
 }
 
 fn even(v: f64) -> u32 {
@@ -176,23 +189,35 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
     let session = u32::from_le_bytes(sid) | 1;
 
     // ---- screen
-    let monitors = capture::list_monitors()?;
-    if monitors.is_empty() {
-        bail!("не найден ни один монитор");
-    }
-    let mon = match o.monitor {
-        Some(i) if i < monitors.len() => &monitors[i],
-        _ => monitors.iter().find(|m| m.primary).unwrap_or(&monitors[0]),
-    };
     crate::video::init()?;
-    let mut cap = Capturer::new(mon)?;
-    let (cw, ch) = (cap.width, cap.height);
+    let (mut cap, window_title) = match &o.source {
+        Source::Window { hwnd, title } => match WindowCapturer::new(*hwnd) {
+            Ok(w) => (Cap::Window(w), Some(title.clone())),
+            Err(e) => {
+                return Ok(End::SourceLost(format!("Не удалось показать окно «{}»: {e:#}. Показываю весь экран.", crate::wincap::ellipsize_title(title))));
+            }
+        },
+        Source::Monitor(m) => {
+            let monitors = capture::list_monitors()?;
+            if monitors.is_empty() {
+                bail!("не найден ни один монитор");
+            }
+            let mon = match m {
+                Some(i) if *i < monitors.len() => &monitors[*i],
+                _ => monitors.iter().find(|m| m.primary).unwrap_or(&monitors[0]),
+            };
+            (Cap::Screen(Capturer::new(mon)?), None)
+        }
+    };
+    let (cw, ch) = cap.size();
 
     // ---- what to send: never more than the projector can decode
     let fps = if limit.2 > 0 { o.fps.min(limit.2) } else { o.fps }.clamp(15, 60);
     let max_w = if limit.0 > 0 { o.max_w.min(limit.0) } else { o.max_w };
     let max_h = if limit.1 > 0 { o.max_h.min(limit.1) } else { o.max_h };
-    let (ow, oh) = fit(cw, ch, max_w, max_h);
+    // A monitor is sent in its own proportions. A window changes size whenever the user drags its edge, but the
+    // projector is told the picture size only once, so a window always gets a fixed canvas that it is letterboxed into.
+    let (ow, oh) = if window_title.is_some() { (max_w.max(2) & !1, max_h.max(2) & !1) } else { fit(cw, ch, max_w, max_h) };
 
     // ---- audio format is part of START
     let audio_rate = if o.audio { crate::audio::default_rate().unwrap_or(0) } else { 0 };
@@ -312,7 +337,7 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
     let start_mbps = if o.adaptive { (max_mbps * area.clamp(0.45, 1.0)).clamp(min_mbps, max_mbps) } else { max_mbps };
     let rate_ctl = RateController::new(start_mbps, min_mbps, max_mbps);
     sh.target_kbps.store((start_mbps * 1000.0) as u32, Ordering::Relaxed);
-    let result = capture_loop(sh, &mut cap, &tx, (cw, ch), (ow, oh), fps, rate_ctl, o.adaptive);
+    let result = capture_loop(sh, &mut cap, &tx, (cw, ch), (ow, oh), window_title.as_deref(), fps, rate_ctl, o.adaptive);
     drop(_audio_stream);
     drop(tx);
     let _ = sender.join();
@@ -334,12 +359,71 @@ struct Frame {
     ts_ms: u32,
 }
 
+/// The picture source: a whole monitor or one window.
+enum Cap {
+    Screen(Capturer),
+    Window(WindowCapturer),
+}
+
+impl Cap {
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Cap::Screen(c) => (c.width, c.height),
+            Cap::Window(w) => (w.width, w.height),
+        }
+    }
+    fn next(&mut self, timeout_ms: u32) -> Result<Event> {
+        match self {
+            Cap::Screen(c) => c.next(timeout_ms),
+            Cap::Window(w) => w.next(timeout_ms),
+        }
+    }
+}
+
+/// Draws `src` (sw x sh BGRA) into the `ow` x `oh` canvas `dst`, scaled to fit and centred; the rest is black.
+fn draw_letterboxed(
+    scaler: &mut Scaler,
+    scratch: &mut Vec<u8>,
+    src: &[u8],
+    (sw, sh): (u32, u32),
+    dst: &mut [u8],
+    stride: usize,
+    (ow, oh): (u32, u32),
+) -> Result<()> {
+    let (x, y, fw, fh) = p::geom::letterbox_rect(sw, sh, ow, oh);
+    let (x, y, fw, fh) = (x as usize, y as usize, fw as usize, fh as usize);
+    let (ow, oh) = (ow as usize, oh as usize);
+    // black bars
+    for row in 0..oh {
+        let line = &mut dst[row * stride..row * stride + ow * 4];
+        if row < y || row >= y + fh {
+            line.fill(0);
+        } else {
+            line[..x * 4].fill(0);
+            line[(x + fw) * 4..].fill(0);
+        }
+    }
+    if (fw, fh) == (sw as usize, sh as usize) {
+        for row in 0..fh {
+            dst[(y + row) * stride + x * 4..][..fw * 4].copy_from_slice(&src[row * sw as usize * 4..][..fw * 4]);
+        }
+    } else {
+        scratch.resize(fw * fh * 4, 0);
+        scaler.scale(src, sw, sh, sw as usize * 4, scratch, fw as u32, fh as u32, fw * 4)?;
+        for row in 0..fh {
+            dst[(y + row) * stride + x * 4..][..fw * 4].copy_from_slice(&scratch[row * fw * 4..][..fw * 4]);
+        }
+    }
+    Ok(())
+}
+
 fn capture_loop(
     sh: &Arc<Shared>,
-    cap: &mut Capturer,
+    cap: &mut Cap,
     tx: &mpsc::SyncSender<Frame>,
     (cw, ch): (u32, u32),
     (ow, oh): (u32, u32),
+    window_title: Option<&str>,
     fps: u32,
     mut ctl: RateController,
     adaptive: bool,
@@ -354,7 +438,8 @@ fn capture_loop(
         gop: fps * 2,
     })?;
     let mut scaler = Scaler::new();
-    let mut tmp: Vec<u8> = if (cw, ch) != (ow, oh) { vec![0; (cw * ch * 4) as usize] } else { Vec::new() };
+    let mut tmp: Vec<u8> = if window_title.is_none() && (cw, ch) != (ow, oh) { vec![0; (cw * ch * 4) as usize] } else { Vec::new() };
+    let mut scratch: Vec<u8> = Vec::new();
     let mut dirty = true;
     let mut force_key = true;
     let mut next_due = Instant::now();
@@ -374,10 +459,14 @@ fn capture_loop(
         match cap.next(timeout)? {
             Event::Updated => dirty = true,
             Event::Reset => {
-                if (cap.width, cap.height) != (cw, ch) {
+                if cap.size() != (cw, ch) {
                     return Ok(End::Resized);
                 }
                 dirty = true;
+            }
+            Event::Closed => {
+                let t = crate::wincap::ellipsize_title(window_title.unwrap_or(""));
+                return Ok(End::SourceLost(format!("Окно «{t}» закрыто. Показываю весь экран.")));
             }
             Event::Timeout => {}
         }
@@ -410,11 +499,18 @@ fn capture_loop(
         let ts_ms = sh.now_ms() as u32;
         {
             let (buf, stride) = enc.input()?;
-            if tmp.is_empty() {
-                cap.compose(buf, stride);
-            } else {
-                cap.compose(&mut tmp, (cw * 4) as usize);
-                scaler.scale(&tmp, cw, ch, (cw * 4) as usize, buf, ow, oh, stride)?;
+            match cap {
+                Cap::Window(w) => {
+                    draw_letterboxed(&mut scaler, &mut scratch, w.pixels(), (w.width, w.height), buf, stride, (ow, oh))?;
+                }
+                Cap::Screen(c) => {
+                    if tmp.is_empty() {
+                        c.compose(buf, stride);
+                    } else {
+                        c.compose(&mut tmp, (cw * 4) as usize);
+                        scaler.scale(&tmp, cw, ch, (cw * 4) as usize, buf, ow, oh, stride)?;
+                    }
+                }
             }
         }
         let key_now = force_key;
@@ -440,7 +536,10 @@ fn capture_loop(
             started = true;
             sh.set(|s| {
                 s.phase = Phase::Streaming;
-                s.text = format!("Идёт трансляция · {ow}×{oh} · {fps} к/с");
+                s.text = match window_title {
+                    Some(t) => format!("Идёт трансляция окна «{}» · {ow}×{oh} · {fps} к/с", crate::wincap::ellipsize_title(t)),
+                    None => format!("Идёт трансляция · {ow}×{oh} · {fps} к/с"),
+                };
             });
         }
 

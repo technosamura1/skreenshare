@@ -60,6 +60,13 @@ struct Cursor {
     info: DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 }
 
+/// What to show: a whole monitor (None = the primary one) or a single window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    Monitor(Option<usize>),
+    Window { hwnd: isize, title: String },
+}
+
 pub struct Capturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -84,6 +91,8 @@ pub enum Event {
     Updated,
     /// Duplication was lost (UAC prompt, mode change, ...) and recreated; size may differ.
     Reset,
+    /// (window capture) The captured window was closed.
+    Closed,
 }
 
 impl Capturer {

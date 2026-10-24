@@ -9,6 +9,7 @@ mod discovery;
 mod gui;
 mod stream;
 mod video;
+mod wincap;
 
 fn main() {
     unsafe {

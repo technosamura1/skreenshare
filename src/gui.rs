@@ -1,11 +1,12 @@
 // The only window: one big "Транслировать" button. Everything else is under "Дополнительно".
-use crate::capture::{self, MonitorInfo};
+use crate::capture::{self, MonitorInfo, Source};
 use crate::discovery::{Device, Discovery};
 use crate::stream::{Phase, Settings, Stream};
+use crate::wincap::{self, WindowInfo};
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, RichText, Stroke, Vec2};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BG: Color32 = Color32::from_rgb(0x12, 0x13, 0x18);
 const CARD: Color32 = Color32::from_rgb(0x1d, 0x1f, 0x27);
@@ -108,7 +109,10 @@ struct App {
     monitors: Vec<MonitorInfo>,
     selected: Option<Ipv4Addr>,
     preset: usize,
-    monitor: usize,
+    /// "Что показывать": the whole screen (default), a monitor, or one window.
+    source: Source,
+    windows: Vec<WindowInfo>,
+    windows_at: Instant,
     audio: bool,
     max_mbps: u32,
     adaptive: bool,
@@ -123,13 +127,14 @@ struct App {
 impl App {
     fn new() -> App {
         let monitors = capture::list_monitors().unwrap_or_default();
-        let monitor = monitors.iter().position(|m| m.primary).unwrap_or(0);
         App {
             discovery: Discovery::start(),
             monitors,
             selected: None,
             preset: 0,
-            monitor,
+            source: Source::Monitor(None),
+            windows: Vec::new(),
+            windows_at: Instant::now(),
             audio: true,
             max_mbps: DEFAULT_MAX_MBPS,
             adaptive: true,
@@ -144,7 +149,7 @@ impl App {
     fn start(&mut self, ctx: &egui::Context, dev: &Device) {
         let p = &PRESETS[self.preset];
         let settings = Settings {
-            monitor: if self.monitors.is_empty() { None } else { Some(self.monitor) },
+            source: self.source.clone(),
             fps: p.fps,
             bitrate_mbps: self.max_mbps,
             adaptive: self.adaptive,
@@ -157,6 +162,51 @@ impl App {
         let ctx2 = ctx.clone();
         self.last = None;
         self.stream = Some(Stream::start(dev.addr(), limit, settings, move || ctx2.request_repaint()));
+    }
+}
+
+impl App {
+    /// "Что показывать": whole screen (default) / each monitor / each open window. The window list is read
+    /// again every time the menu is opened (and once a second while it stays open).
+    fn source_picker(&mut self, ui: &mut egui::Ui, streaming: bool) {
+        let monitor_name = |m: &MonitorInfo, i: usize| format!("Экран {} · {}×{}{}", i + 1, m.width, m.height, if m.primary { " (основной)" } else { "" });
+        let selected = match &self.source {
+            Source::Monitor(None) => "Весь экран".to_string(),
+            Source::Monitor(Some(i)) => self.monitors.get(*i).map(|m| monitor_name(m, *i)).unwrap_or_else(|| "Весь экран".into()),
+            Source::Window { title, .. } => format!("Окно: {}", proto::geom::ellipsize(title, 48)),
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Что показывать").font(bold(14.0)));
+            ui.add_enabled_ui(!streaming, |ui| {
+                let resp = egui::ComboBox::from_id_salt("source").width(ui.available_width()).selected_text(selected).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.source, Source::Monitor(None), "Весь экран");
+                    if self.monitors.len() > 1 {
+                        for (i, m) in self.monitors.iter().enumerate() {
+                            ui.selectable_value(&mut self.source, Source::Monitor(Some(i)), monitor_name(m, i));
+                        }
+                    }
+                    ui.separator();
+                    if self.windows.is_empty() {
+                        ui.label(RichText::new("Нет открытых окон").color(MUTED));
+                    }
+                    for w in &self.windows {
+                        let label = format!("{}{}", proto::geom::ellipsize(&w.title, 60), if w.minimized { " (свёрнуто)" } else { "" });
+                        let value = Source::Window { hwnd: w.hwnd, title: w.title.clone() };
+                        // The same window is the same choice even if its title changed since it was picked.
+                        let sel = matches!(&self.source, Source::Window { hwnd, .. } if *hwnd == w.hwnd);
+                        if ui.selectable_label(sel, label).clicked() {
+                            self.source = value;
+                        }
+                    }
+                });
+                let open = resp.inner.is_some();
+                let clicked = resp.response.clicked();
+                if clicked || (open && self.windows_at.elapsed() >= Duration::from_secs(1)) {
+                    self.windows = wincap::list_windows();
+                    self.windows_at = Instant::now();
+                }
+            });
+        });
     }
 }
 
@@ -224,6 +274,7 @@ impl eframe::App for App {
             }
 
             ui.add_space(8.0);
+            self.source_picker(ui, streaming);
             if streaming {
                 let b = egui::Button::new(RichText::new("Остановить").font(bold(26.0)).color(Color32::WHITE))
                     .fill(RED)
@@ -256,6 +307,9 @@ impl eframe::App for App {
                 if !st.stats.is_empty() && st.phase == Phase::Streaming {
                     ui.label(RichText::new(&st.stats).color(MUTED).size(13.0));
                 }
+                if !st.notice.is_empty() {
+                    ui.label(RichText::new(&st.notice).color(Color32::from_rgb(0xf2, 0xb8, 0x4b)).size(14.0));
+                }
                 if !st.audio.is_empty() {
                     ui.label(RichText::new(&st.audio).color(MUTED).size(13.0));
                 }
@@ -277,25 +331,12 @@ impl eframe::App for App {
                         ui.add(egui::Slider::new(&mut self.max_mbps, 6..=80).suffix(" Мбит/с"));
                         ui.label(if self.adaptive { "старт и максимум" } else { "постоянный битрейт" });
                     });
-                    if self.monitors.len() > 1 {
-                        ui.label(RichText::new("Какой экран показывать").font(bold(14.0)));
-                        let name = |m: &MonitorInfo, i: usize| {
-                            format!("Экран {} · {}×{}{}", i + 1, m.width, m.height, if m.primary { " (основной)" } else { "" })
-                        };
-                        egui::ComboBox::from_id_salt("monitor")
-                            .width(ui.available_width())
-                            .selected_text(name(&self.monitors[self.monitor.min(self.monitors.len() - 1)], self.monitor))
-                            .show_ui(ui, |ui| {
-                                for (i, m) in self.monitors.iter().enumerate() {
-                                    ui.selectable_value(&mut self.monitor, i, name(m, i));
-                                }
-                            });
-                    }
                     ui.checkbox(&mut self.audio, "Передавать звук компьютера");
                     ui.label(RichText::new("Звук и картинка не совпадают? Сдвиг звука (мс, «+» — звук позже):").size(13.0).color(MUTED));
                     ui.add(egui::Slider::new(&mut self.av_offset_ms, -300..=300).suffix(" мс"));
                     if ui.small_button("Сбросить настройки").clicked() {
                         self.preset = 0;
+                        self.source = Source::Monitor(None);
                         self.max_mbps = DEFAULT_MAX_MBPS;
                         self.adaptive = true;
                         self.audio = true;
