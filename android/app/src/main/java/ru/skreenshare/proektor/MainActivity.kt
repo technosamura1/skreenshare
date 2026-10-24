@@ -58,6 +58,10 @@ class MainActivity : Activity(), Engine.Listener, SurfaceHolder.Callback {
         overlay = box
         root.addView(box, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         setContentView(root)
+        // Rotation / split screen on a phone: re-fit the picture (letterboxed) to the new size.
+        root.addOnLayoutChangeListener { _, l, tp, r, b, ol, ot, or, ob ->
+            if (streaming && (r - l != or - ol || b - tp != ob - ot)) fitSurface(picW, picH)
+        }
         hideSystemUi()
 
         engine = Engine(this, this)
@@ -123,7 +127,11 @@ class MainActivity : Activity(), Engine.Listener, SurfaceHolder.Callback {
     }
 
     /** Keeps the picture's aspect ratio (black bars) instead of stretching it over the whole screen. */
+    private var picW = 0
+    private var picH = 0
+
     private fun fitSurface(w: Int, h: Int) {
+        picW = w; picH = h
         val root = surfaceView.parent as? View ?: return
         val rw = root.width
         val rh = root.height

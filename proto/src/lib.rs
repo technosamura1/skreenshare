@@ -7,6 +7,7 @@
 
 /// UDP port the receiver (projector) listens on: START, media, PROBE.
 pub mod h264;
+pub mod rate;
 
 pub const PORT: u16 = 47800;
 /// UDP port the sender listens on for receiver announcements (broadcast HELLO).
@@ -115,6 +116,9 @@ pub struct Start {
     pub vcodec: u8,
     pub audio_rate: u32,
     pub audio_channels: u8,
+    /// 1 = audio timestamps are capture times on the same clock (same origin) as the video timestamps, so the
+    /// receiver can lip-sync. 0 = (v0.1 sender) timestamps of audio are not comparable to video.
+    pub clock_sync: u8,
 }
 
 pub fn write_start(session: u32, s: &Start, out: &mut Vec<u8>) {
@@ -125,6 +129,7 @@ pub fn write_start(session: u32, s: &Start, out: &mut Vec<u8>) {
     out.push(s.vcodec);
     out.extend_from_slice(&s.audio_rate.to_le_bytes());
     out.push(s.audio_channels);
+    out.push(s.clock_sync);
 }
 
 pub fn parse_start(body: &[u8]) -> Option<Start> {
@@ -138,6 +143,7 @@ pub fn parse_start(body: &[u8]) -> Option<Start> {
         vcodec: body[5],
         audio_rate: u32::from_le_bytes(body[6..10].try_into().unwrap()),
         audio_channels: body[10],
+        clock_sync: body.get(11).copied().unwrap_or(0),
     })
 }
 
@@ -387,12 +393,20 @@ mod tests {
     #[test]
     fn golden_start() {
         let mut o = Vec::new();
-        let s = Start { width: 1920, height: 1080, fps: 30, vcodec: 1, audio_rate: 48000, audio_channels: 2 };
+        let s = Start { width: 1920, height: 1080, fps: 30, vcodec: 1, audio_rate: 48000, audio_channels: 2, clock_sync: 1 };
         write_start(0x01020304, &s, &mut o);
-        assert_eq!(hex(&o), "d703".to_string() + "04030201" + "8007" + "3804" + "1e" + "01" + "80bb0000" + "02");
+        assert_eq!(hex(&o), "d703".to_string() + "04030201" + "8007" + "3804" + "1e" + "01" + "80bb0000" + "02" + "01");
         let (_, sess, body) = parse_header(&o).unwrap();
         assert_eq!(sess, 0x01020304);
         assert_eq!(parse_start(body).unwrap(), s);
+    }
+
+    #[test]
+    fn start_from_v01_sender_has_no_clock_sync() {
+        // 11-byte START as sent by v0.1.0: still understood, but flagged as not lip-sync capable.
+        let body = [0x80, 0x07, 0x38, 0x04, 0x1e, 0x01, 0x80, 0xbb, 0x00, 0x00, 0x02];
+        let s = parse_start(&body).unwrap();
+        assert_eq!((s.width, s.audio_rate, s.clock_sync), (1920, 48000, 0));
     }
 
     #[test]

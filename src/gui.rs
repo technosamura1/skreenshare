@@ -1,4 +1,4 @@
-// The only window: pick a projector, press "Транслировать".
+// The only window: one big "Транслировать" button. Everything else is under "Дополнительно".
 use crate::capture::{self, MonitorInfo};
 use crate::discovery::{Device, Discovery};
 use crate::stream::{Phase, Settings, Stream};
@@ -22,22 +22,25 @@ struct Preset {
     w: u32,
     h: u32,
     fps: u32,
-    mbps: u32,
 }
 
+/// The first one is the default: Full HD at 60 frames. The bitrate adapts to the Wi-Fi on its own.
 const PRESETS: &[Preset] = &[
-    Preset { name: "Full HD · 30 к/с · 10 Мбит/с — рекомендуется", w: 1920, h: 1080, fps: 30, mbps: 10 },
-    Preset { name: "Full HD · 60 к/с · 15 Мбит/с — если проектор тянет", w: 1920, h: 1080, fps: 60, mbps: 15 },
-    Preset { name: "HD 720p · 30 к/с · 6 Мбит/с — если лагает", w: 1280, h: 720, fps: 30, mbps: 6 },
-    Preset { name: "HD 720p · 60 к/с · 8 Мбит/с", w: 1280, h: 720, fps: 60, mbps: 8 },
+    Preset { name: "Full HD · 60 к/с (по умолчанию)", w: 1920, h: 1080, fps: 60 },
+    Preset { name: "Full HD · 30 к/с — запасной вариант, если лагает", w: 1920, h: 1080, fps: 30 },
+    Preset { name: "HD 720p · 60 к/с", w: 1280, h: 720, fps: 60 },
+    Preset { name: "HD 720p · 30 к/с — самый лёгкий", w: 1280, h: 720, fps: 30 },
 ];
+
+/// Default bitrate: where 1080p60 starts; with auto-adjust it is also the ceiling. Selectable up to 80.
+const DEFAULT_MAX_MBPS: u32 = 30;
 
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Skreenshare проектор")
-            .with_inner_size([560.0, 640.0])
-            .with_min_inner_size([480.0, 560.0]),
+            .with_inner_size([520.0, 560.0])
+            .with_min_inner_size([460.0, 480.0]),
         centered: true,
         ..Default::default()
     };
@@ -107,6 +110,9 @@ struct App {
     preset: usize,
     monitor: usize,
     audio: bool,
+    max_mbps: u32,
+    adaptive: bool,
+    av_offset_ms: i32,
     manual_ip: String,
     manual_err: Option<String>,
     stream: Option<Stream>,
@@ -125,6 +131,9 @@ impl App {
             preset: 0,
             monitor,
             audio: true,
+            max_mbps: DEFAULT_MAX_MBPS,
+            adaptive: true,
+            av_offset_ms: 0,
             manual_ip: String::new(),
             manual_err: None,
             stream: None,
@@ -137,7 +146,9 @@ impl App {
         let settings = Settings {
             monitor: if self.monitors.is_empty() { None } else { Some(self.monitor) },
             fps: p.fps,
-            bitrate_mbps: p.mbps,
+            bitrate_mbps: self.max_mbps,
+            adaptive: self.adaptive,
+            av_offset_ms: self.av_offset_ms,
             max_w: p.w,
             max_h: p.h,
             audio: self.audio,
@@ -169,106 +180,63 @@ impl eframe::App for App {
             ui.label(RichText::new("Экран и звук компьютера — на проектор по Wi-Fi, без кодов").color(MUTED));
             ui.add_space(6.0);
 
-            ui.label(RichText::new("Проекторы в сети").font(bold(16.0)));
+            let chosen = devices.iter().find(|d| Some(d.ip) == self.selected).cloned();
+
+            // 0 projectors: say what to do. 1: just show it (nothing to choose). 2+: pick one (first is preselected).
             if devices.is_empty() {
                 egui::Frame::new().fill(CARD).corner_radius(10).inner_margin(14).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("Ищу проекторы... Откройте приложение «Skreenshare проектор» на проекторе.");
+                        ui.label("Ищу проектор... Откройте приложение «Skreenshare проектор» на проекторе.");
                     });
                 });
             }
             for d in &devices {
                 let sel = Some(d.ip) == self.selected;
-                let fill = if sel { Color32::from_rgb(0x22, 0x2c, 0x4d) } else { CARD };
+                let many = devices.len() > 1;
+                let fill = if sel && many { Color32::from_rgb(0x22, 0x2c, 0x4d) } else { CARD };
                 let resp = egui::Frame::new()
                     .fill(fill)
                     .corner_radius(10)
-                    .stroke(Stroke::new(1.0, if sel { ACCENT } else { Color32::TRANSPARENT }))
+                    .stroke(Stroke::new(1.0, if sel && many { ACCENT } else { Color32::TRANSPARENT }))
                     .inner_margin(12)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
+                            ui.label(RichText::new("●").color(GREEN));
                             ui.label(RichText::new(&d.hello.name).font(bold(16.0)));
                             if d.hello.busy {
-                                ui.label(RichText::new("● уже принимает").color(GREEN));
+                                ui.label(RichText::new("уже принимает").color(MUTED));
                             }
                         });
                         ui.label(
-                            RichText::new(format!(
-                                "{} · до {}×{}, {} к/с",
-                                d.ip, d.hello.max_w, d.hello.max_h, d.hello.max_fps
-                            ))
-                            .color(MUTED)
-                            .size(13.0),
+                            RichText::new(format!("{} · до {}×{}, {} к/с", d.ip, d.hello.max_w, d.hello.max_h, d.hello.max_fps))
+                                .color(MUTED)
+                                .size(13.0),
                         );
                     })
                     .response
                     .interact(egui::Sense::click());
-                if resp.clicked() && !streaming {
+                if resp.clicked() && !streaming && many {
                     self.selected = Some(d.ip);
                 }
             }
-            ui.collapsing("Не находит проектор? Ввести IP вручную", |ui| {
-                ui.label(RichText::new("IP написан на экране проектора в приложении").color(MUTED).size(13.0));
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.manual_ip).hint_text("192.168.1.50").desired_width(180.0));
-                    if ui.button("Добавить").clicked() {
-                        match self.manual_ip.trim().parse::<Ipv4Addr>() {
-                            Ok(ip) => {
-                                self.discovery.add_manual(ip);
-                                self.manual_err = None;
-                            }
-                            Err(_) => self.manual_err = Some("Это не похоже на IP-адрес".into()),
-                        }
-                    }
-                });
-                if let Some(e) = &self.manual_err {
-                    ui.label(RichText::new(e).color(RED));
-                }
-            });
-
-            ui.add_space(6.0);
-            ui.add_enabled_ui(!streaming, |ui| {
-                ui.label(RichText::new("Качество").font(bold(16.0)));
-                egui::ComboBox::from_id_salt("preset").width(ui.available_width()).selected_text(PRESETS[self.preset].name).show_ui(
-                    ui,
-                    |ui| {
-                        for (i, p) in PRESETS.iter().enumerate() {
-                            ui.selectable_value(&mut self.preset, i, p.name);
-                        }
-                    },
-                );
-                if self.monitors.len() > 1 {
-                    ui.label(RichText::new("Какой экран показывать").font(bold(16.0)));
-                    let name = |m: &MonitorInfo, i: usize| {
-                        format!("Экран {} · {}×{}{}", i + 1, m.width, m.height, if m.primary { " (основной)" } else { "" })
-                    };
-                    egui::ComboBox::from_id_salt("monitor")
-                        .width(ui.available_width())
-                        .selected_text(name(&self.monitors[self.monitor.min(self.monitors.len() - 1)], self.monitor))
-                        .show_ui(ui, |ui| {
-                            for (i, m) in self.monitors.iter().enumerate() {
-                                ui.selectable_value(&mut self.monitor, i, name(m, i));
-                            }
-                        });
-                }
-                ui.checkbox(&mut self.audio, "Передавать звук компьютера");
-            });
 
             ui.add_space(8.0);
-            let chosen = devices.iter().find(|d| Some(d.ip) == self.selected).cloned();
             if streaming {
-                let b = egui::Button::new(RichText::new("Остановить").font(bold(18.0))).fill(RED).min_size(Vec2::new(ui.available_width(), 52.0));
+                let b = egui::Button::new(RichText::new("Остановить").font(bold(26.0)).color(Color32::WHITE))
+                    .fill(RED)
+                    .min_size(Vec2::new(ui.available_width(), 96.0));
                 if ui.add(b).clicked() {
                     if let Some(s) = &self.stream {
                         s.stop();
                     }
                 }
             } else {
-                let b = egui::Button::new(RichText::new("Транслировать").font(bold(18.0)).color(Color32::WHITE))
+                let b = egui::Button::new(RichText::new("Транслировать").font(bold(26.0)).color(Color32::WHITE))
                     .fill(ACCENT)
-                    .min_size(Vec2::new(ui.available_width(), 52.0));
+                    .min_size(Vec2::new(ui.available_width(), 96.0));
                 if ui.add_enabled(chosen.is_some(), b).clicked() {
                     if let Some(d) = &chosen {
                         self.start(ctx, d);
@@ -293,8 +261,67 @@ impl eframe::App for App {
                 }
             }
             ui.add_space(6.0);
+            ui.collapsing(RichText::new("Дополнительно").font(bold(15.0)), |ui| {
+                ui.add_enabled_ui(!streaming, |ui| {
+                    ui.label(RichText::new("Качество").font(bold(14.0)));
+                    egui::ComboBox::from_id_salt("preset").width(ui.available_width()).selected_text(PRESETS[self.preset].name).show_ui(
+                        ui,
+                        |ui| {
+                            for (i, p) in PRESETS.iter().enumerate() {
+                                ui.selectable_value(&mut self.preset, i, p.name);
+                            }
+                        },
+                    );
+                    ui.checkbox(&mut self.adaptive, "Подстраивать битрейт под Wi-Fi автоматически (рекомендуется)");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Slider::new(&mut self.max_mbps, 6..=80).suffix(" Мбит/с"));
+                        ui.label(if self.adaptive { "старт и максимум" } else { "постоянный битрейт" });
+                    });
+                    if self.monitors.len() > 1 {
+                        ui.label(RichText::new("Какой экран показывать").font(bold(14.0)));
+                        let name = |m: &MonitorInfo, i: usize| {
+                            format!("Экран {} · {}×{}{}", i + 1, m.width, m.height, if m.primary { " (основной)" } else { "" })
+                        };
+                        egui::ComboBox::from_id_salt("monitor")
+                            .width(ui.available_width())
+                            .selected_text(name(&self.monitors[self.monitor.min(self.monitors.len() - 1)], self.monitor))
+                            .show_ui(ui, |ui| {
+                                for (i, m) in self.monitors.iter().enumerate() {
+                                    ui.selectable_value(&mut self.monitor, i, name(m, i));
+                                }
+                            });
+                    }
+                    ui.checkbox(&mut self.audio, "Передавать звук компьютера");
+                    ui.label(RichText::new("Звук и картинка не совпадают? Сдвиг звука (мс, «+» — звук позже):").size(13.0).color(MUTED));
+                    ui.add(egui::Slider::new(&mut self.av_offset_ms, -300..=300).suffix(" мс"));
+                    if ui.small_button("Сбросить настройки").clicked() {
+                        self.preset = 0;
+                        self.max_mbps = DEFAULT_MAX_MBPS;
+                        self.adaptive = true;
+                        self.audio = true;
+                        self.av_offset_ms = 0;
+                    }
+                });
+                ui.label(RichText::new("Не находит проектор? Введите его IP (он написан на экране проектора):").size(13.0).color(MUTED));
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.manual_ip).hint_text("192.168.1.50").desired_width(180.0));
+                    if ui.button("Добавить").clicked() {
+                        match self.manual_ip.trim().parse::<Ipv4Addr>() {
+                            Ok(ip) => {
+                                self.discovery.add_manual(ip);
+                                self.manual_err = None;
+                            }
+                            Err(_) => self.manual_err = Some("Это не похоже на IP-адрес".into()),
+                        }
+                    }
+                });
+                if let Some(e) = &self.manual_err {
+                    ui.label(RichText::new(e).color(RED));
+                }
+            });
+            ui.add_space(6.0);
             ui.label(
-                RichText::new("При первом запуске Windows спросит про доступ к сети — нажмите «Разрешить», иначе проектор не найдётся.")
+                RichText::new("При первом запуске Windows спросит про доступ к сети — нажмите «Разрешить», иначе проектор не найдётся. Для лучшей картинки: ПК — кабелем к роутеру, проектор — поближе к роутеру.")
                     .color(MUTED)
                     .size(12.0),
             );

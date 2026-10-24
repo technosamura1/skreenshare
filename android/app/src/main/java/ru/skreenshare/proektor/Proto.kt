@@ -73,16 +73,19 @@ object Proto {
     /** Reply port of a PROBE, or -1. */
     fun parseProbe(b: ByteArray, len: Int): Int = if (len >= HEADER_LEN + 2) u16(b, HEADER_LEN) else -1
 
-    class Start(val width: Int, val height: Int, val fps: Int, val vcodec: Int, val audioRate: Int, val audioChannels: Int)
+    class Start(val width: Int, val height: Int, val fps: Int, val vcodec: Int, val audioRate: Int, val audioChannels: Int,
+                /** 1: audio timestamps share the video clock (lip-sync possible). */
+                val clockSync: Int = 0)
 
     fun writeStart(session: Int, s: Start): ByteArray =
         header(T_START, session).u16(s.width).u16(s.height).u8(s.fps).u8(s.vcodec).i32(s.audioRate)
-            .u8(s.audioChannels).toByteArray()
+            .u8(s.audioChannels).u8(s.clockSync).toByteArray()
 
     fun parseStart(b: ByteArray, len: Int): Start? {
         val o = HEADER_LEN
         if (len < o + 11) return null
-        return Start(u16(b, o), u16(b, o + 2), u8(b, o + 4), u8(b, o + 5), i32(b, o + 6), u8(b, o + 10))
+        return Start(u16(b, o), u16(b, o + 2), u8(b, o + 4), u8(b, o + 5), i32(b, o + 6), u8(b, o + 10),
+            if (len >= o + 12) u8(b, o + 11) else 0)
     }
 
     fun simple(type: Int, session: Int): ByteArray = header(type, session).toByteArray()

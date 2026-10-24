@@ -4,6 +4,7 @@ use crate::capture::{self, Capturer, Event};
 use crate::video::{Encoder, EncoderConfig, Scaler};
 use anyhow::{anyhow, bail, Result};
 use proto as p;
+use proto::rate::{RateController, Sample};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -17,7 +18,12 @@ pub struct Settings {
     /// Index into the monitor list (None = primary).
     pub monitor: Option<usize>,
     pub fps: u32,
+    /// Bitrate (Mbit/s): fixed value, or with `adaptive` the starting point and the ceiling (it drops on loss and recovers slowly).
     pub bitrate_mbps: u32,
+    /// Lower the bitrate when the receiver reports loss, raise it slowly again when it is clean.
+    pub adaptive: bool,
+    /// Shifts the sound relative to the picture (ms, + = sound later) to trim lip-sync for a particular projector.
+    pub av_offset_ms: i32,
     /// Upper bound for the picture size (the desktop is scaled down to fit, keeping its aspect ratio).
     pub max_w: u32,
     pub max_h: u32,
@@ -48,6 +54,9 @@ struct Shared {
     sent_bytes: AtomicU64,
     rtt_us: AtomicU32,
     report: Mutex<Option<p::Report>>,
+    report_seq: AtomicU64,
+    /// Current encoder target, kbit/s (the paced sender follows it).
+    target_kbps: AtomicU32,
     status: Mutex<Status>,
     repaint: Box<dyn Fn() + Send + Sync>,
 }
@@ -55,6 +64,9 @@ struct Shared {
 impl Shared {
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+    fn now_ms_f(&self) -> f64 {
+        self.start.elapsed().as_secs_f64() * 1000.0
     }
     fn set(&self, f: impl FnOnce(&mut Status)) {
         f(&mut self.status.lock().unwrap());
@@ -78,6 +90,8 @@ impl Stream {
             sent_bytes: AtomicU64::new(0),
             rtt_us: AtomicU32::new(0),
             report: Mutex::new(None),
+            report_seq: AtomicU64::new(0),
+            target_kbps: AtomicU32::new(20_000),
             status: Mutex::new(Status {
                 phase: Phase::Connecting,
                 text: "Соединяюсь с проектором...".into(),
@@ -189,6 +203,7 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
         vcodec: p::VCODEC_H264,
         audio_rate,
         audio_channels: 2,
+        clock_sync: 1, // audio and video are stamped from the same clock (sh.start)
     };
 
     // ---- handshake: START until START_ACK
@@ -240,8 +255,7 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
     let sender = {
         let sock = sock.clone();
         let sh = sh.clone();
-        let rate = (o.bitrate_mbps as f64 * 4.0).max(40.0) * 125_000.0; // bytes per second
-        std::thread::spawn(move || video_sender(sock, sh, peer, session, rate, rx))
+        std::thread::spawn(move || video_sender(sock, sh, peer, session, rx))
     };
 
     // ---- audio
@@ -253,13 +267,28 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
         let mut pending: Vec<i16> = Vec::new();
         let mut pkt = Vec::with_capacity(1200);
         let chunk = ((audio_rate / 200).min(280) * 2) as usize; // 5 ms of stereo
+        let chunk_ms = (chunk / 2) as f64 * 1000.0 / audio_rate as f64;
+        let ms_per_frame = 1000.0 / audio_rate as f64;
+        let offset = o.av_offset_ms as f64;
+        // Capture time (ms on the stream clock) of pending[0]. Advances by sample count, so it is exact;
+        // it is re-anchored on the wall clock only when it drifts or after a silent gap (loopback sends nothing then).
+        let mut anchor: Option<f64> = None;
         match crate::audio::start_capture(move |samples, _rate| {
+            let now = sh2.now_ms_f();
+            let new_start = now - (samples.len() / 2) as f64 * ms_per_frame;
+            let pending_ms = (pending.len() / 2) as f64 * ms_per_frame;
+            match anchor {
+                Some(a) if (a + pending_ms - new_start).abs() < 30.0 => {}
+                _ => anchor = Some(new_start - pending_ms),
+            }
             pending.extend_from_slice(samples);
             while pending.len() >= chunk {
-                p::write_audio_header(session, seq.fetch_add(1, Ordering::Relaxed), sh2.now_ms() as u32, &mut pkt);
+                let a = anchor.unwrap_or(0.0);
+                p::write_audio_header(session, seq.fetch_add(1, Ordering::Relaxed), (a + offset).max(0.0) as u32, &mut pkt);
                 for s in pending.drain(..chunk) {
                     pkt.extend_from_slice(&s.to_le_bytes());
                 }
+                anchor = Some(a + chunk_ms);
                 let _ = sock.send_to(&pkt, peer);
                 sh2.sent_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
             }
@@ -277,7 +306,13 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
     }
 
     // ---- capture + encode loop
-    let result = capture_loop(sh, &mut cap, &tx, (cw, ch), (ow, oh), fps, o.bitrate_mbps);
+    let max_mbps = o.bitrate_mbps.clamp(2, 80) as f64;
+    let area = (ow as f64 * oh as f64) / (1920.0 * 1080.0);
+    let min_mbps = (6.0 * area).max(2.5).min(max_mbps);
+    let start_mbps = if o.adaptive { (max_mbps * area.clamp(0.45, 1.0)).clamp(min_mbps, max_mbps) } else { max_mbps };
+    let rate_ctl = RateController::new(start_mbps, min_mbps, max_mbps);
+    sh.target_kbps.store((start_mbps * 1000.0) as u32, Ordering::Relaxed);
+    let result = capture_loop(sh, &mut cap, &tx, (cw, ch), (ow, oh), fps, rate_ctl, o.adaptive);
     drop(_audio_stream);
     drop(tx);
     let _ = sender.join();
@@ -306,14 +341,15 @@ fn capture_loop(
     (cw, ch): (u32, u32),
     (ow, oh): (u32, u32),
     fps: u32,
-    bitrate_mbps: u32,
+    mut ctl: RateController,
+    adaptive: bool,
 ) -> Result<End> {
     let period = Duration::from_secs_f64(1.0 / fps as f64);
     let mut enc = Encoder::new(&EncoderConfig {
         width: ow,
         height: oh,
         fps,
-        bitrate: bitrate_mbps as u64 * 1_000_000,
+        bitrate: (ctl.mbps() * 1e6) as u64,
         preset: "p3".into(),
         gop: fps * 2,
     })?;
@@ -329,6 +365,8 @@ fn capture_loop(
     let mut stat_enc = Duration::ZERO;
     let mut stat_bytes0 = 0u64;
     let mut started = false;
+    let mut last_adapt = Instant::now();
+    let mut last_seq = 0u64;
 
     while sh.running.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -348,6 +386,21 @@ fn capture_loop(
             sh.keyreq.store(false, Ordering::Relaxed);
             force_key = true;
             dirty = true;
+        }
+        // Adaptive bitrate: once a second look at what the projector reported (also while the screen is static).
+        if adaptive && last_adapt.elapsed() >= Duration::from_secs(1) {
+            last_adapt = Instant::now();
+            let seq = sh.report_seq.load(Ordering::Relaxed);
+            let rep = sh.report.lock().unwrap().clone();
+            if let (true, Some(r)) = (seq != last_seq, rep) {
+                last_seq = seq;
+                let rtt_ms = sh.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0;
+                let sample = Sample { lost_frames: r.lost_frames as u32, dropped_frames: r.dropped_frames as u32, rtt_ms };
+                if let Some(mbps) = ctl.on_sample(sample) {
+                    enc.set_bitrate((mbps * 1e6) as u64, fps); // NVENC reconfigures itself (with a keyframe)
+                    sh.target_kbps.store((mbps * 1000.0) as u32, Ordering::Relaxed);
+                }
+            }
         }
         let now = Instant::now();
         if !dirty || now < next_due {
@@ -387,7 +440,7 @@ fn capture_loop(
             started = true;
             sh.set(|s| {
                 s.phase = Phase::Streaming;
-                s.text = format!("Идёт трансляция · {ow}×{oh} · {fps} к/с · {bitrate_mbps} Мбит/с");
+                s.text = format!("Идёт трансляция · {ow}×{oh} · {fps} к/с");
             });
         }
 
@@ -397,9 +450,10 @@ fn capture_loop(
             let rtt = sh.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0;
             let rep = sh.report.lock().unwrap().clone();
             let mut st = format!(
-                "{:.0} к/с · {:.1} Мбит/с · кодирование {:.1} мс · пинг {:.0} мс",
+                "{:.0} к/с · {:.1} Мбит/с (цель {:.0}) · кодирование {:.1} мс · пинг {:.0} мс",
                 stat_frames as f64 / secs,
                 (bytes - stat_bytes0) as f64 * 8.0 / secs / 1e6,
+                sh.target_kbps.load(Ordering::Relaxed) as f64 / 1000.0,
                 if stat_frames > 0 { stat_enc.as_secs_f64() * 1000.0 / stat_frames as f64 } else { 0.0 },
                 rtt,
             );
@@ -419,8 +473,10 @@ fn capture_loop(
     Ok(End::Stopped)
 }
 
-fn video_sender(sock: Arc<UdpSocket>, sh: Arc<Shared>, peer: SocketAddr, session: u32, rate: f64, rx: mpsc::Receiver<Frame>) {
-    let burst = 32.0 * 1300.0;
+fn video_sender(sock: Arc<UdpSocket>, sh: Arc<Shared>, peer: SocketAddr, session: u32, rx: mpsc::Receiver<Frame>) {
+    // Smooth, not bursty: weak Wi-Fi drops packets when 100 of them arrive at once. Pace at 1.5x the encoder target
+    // (a frame takes ~2/3 of its slot to send), with a bucket of ~3 ms worth of packets.
+    let burst = 16.0 * 1300.0;
     let mut tokens = burst;
     let mut last = Instant::now();
     let mut pkt = Vec::with_capacity(p::VIDEO_HEADER_LEN + p::MAX_PAYLOAD);
@@ -432,17 +488,14 @@ fn video_sender(sock: Arc<UdpSocket>, sh: Arc<Shared>, peer: SocketAddr, session
             pkt.extend_from_slice(chunk);
             let need = pkt.len() as f64;
             loop {
+                let rate = (sh.target_kbps.load(Ordering::Relaxed) as f64 * 125.0 * 1.5).max(250_000.0); // bytes/s
                 let now = Instant::now();
                 tokens = (tokens + now.duration_since(last).as_secs_f64() * rate).min(burst);
                 last = now;
-                if tokens >= need {
+                if tokens >= need || !sh.running.load(Ordering::Relaxed) {
                     break;
                 }
-                if (need - tokens) / rate > 0.002 {
-                    std::thread::sleep(Duration::from_millis(1));
-                } else {
-                    std::thread::yield_now();
-                }
+                std::thread::sleep(Duration::from_millis(1)); // timer resolution is 1 ms (timeBeginPeriod)
             }
             tokens -= need;
             let _ = sock.send_to(&pkt, peer);
@@ -501,6 +554,7 @@ fn control(sock: Arc<UdpSocket>, sh: Arc<Shared>, stop: Arc<AtomicBool>, peer: S
             p::T_REPORT => {
                 if let Some(r) = p::parse_report(body) {
                     *sh.report.lock().unwrap() = Some(r);
+                    sh.report_seq.fetch_add(1, Ordering::Relaxed);
                 }
             }
             p::T_BYE => {

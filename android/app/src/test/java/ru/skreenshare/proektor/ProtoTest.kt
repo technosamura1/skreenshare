@@ -15,11 +15,18 @@ class ProtoTest {
     }
 
     @Test fun goldenStart() {
-        val b = Proto.writeStart(0x01020304, Proto.Start(1920, 1080, 30, 1, 48000, 2))
-        assertEquals("d70304030201" + "8007" + "3804" + "1e" + "01" + "80bb0000" + "02", hex(b))
+        val b = Proto.writeStart(0x01020304, Proto.Start(1920, 1080, 30, 1, 48000, 2, 1))
+        assertEquals("d70304030201" + "8007" + "3804" + "1e" + "01" + "80bb0000" + "02" + "01", hex(b))
         assertEquals(0x01020304, Proto.session(b))
         val s = Proto.parseStart(b, b.size)!!
-        assertEquals(1920, s.width); assertEquals(48000, s.audioRate)
+        assertEquals(1920, s.width); assertEquals(48000, s.audioRate); assertEquals(1, s.clockSync)
+    }
+
+    @Test fun startFromV01SenderHasNoClockSync() {
+        // 11-byte START as sent by v0.1.0 (same bytes as the Rust test).
+        val legacy = Proto.writeStart(1, Proto.Start(1920, 1080, 30, 1, 48000, 2, 1)).copyOf(6 + 11)
+        val s = Proto.parseStart(legacy, legacy.size)!!
+        assertEquals(1920, s.width); assertEquals(48000, s.audioRate); assertEquals(0, s.clockSync)
     }
 
     @Test fun goldenVideoAudio() {

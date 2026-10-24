@@ -113,6 +113,16 @@ impl Encoder {
         }
     }
 
+    /// Changes the target bitrate of the running encoder (NVENC reconfigures itself on the next frame, with an IDR).
+    pub fn set_bitrate(&mut self, bitrate: u64, fps: u32) {
+        unsafe {
+            let c = &mut *self.ctx;
+            c.bit_rate = bitrate as i64;
+            c.rc_max_rate = bitrate as i64;
+            c.rc_buffer_size = (bitrate / fps.max(1) as u64 * 2) as i32;
+        }
+    }
+
     /// The BGRA input buffer for the next frame and its row stride.
     pub fn input(&mut self) -> Result<(&mut [u8], usize)> {
         unsafe {

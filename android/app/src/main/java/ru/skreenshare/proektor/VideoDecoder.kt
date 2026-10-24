@@ -10,8 +10,10 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * H.264 -> Surface through MediaCodec, tuned for latency: no timestamps-based scheduling (every decoded frame
- * is shown as soon as it comes out), a tiny input queue, and "drop and ask for a keyframe" when behind.
+ * H.264 -> Surface through MediaCodec, tuned for latency: a tiny input queue and "drop and ask for a keyframe"
+ * when the decoder is behind. Decoded frames are shown against [clock] (lip-sync): held until the sound with the
+ * same timestamp is playing, dropped if more than ~100 ms late. Without a clock ([paced] = false) every decoded
+ * frame is shown at once.
  */
 class VideoDecoder(
     surface: Surface,
@@ -20,11 +22,13 @@ class VideoDecoder(
     fps: Int,
     /** Called (from the decoder thread) when frames were dropped and a keyframe is needed. */
     private val onNeedKey: () -> Unit,
+    private val clock: MediaClock? = null,
+    private val sync: SyncController? = null,
 ) {
     private class Item(val data: ByteArray, val tsUs: Long)
 
     private val codec: MediaCodec
-    private val queue = ArrayBlockingQueue<Item>(3)
+    private val queue = ArrayBlockingQueue<Item>(5)
     @Volatile private var running = true
     val decoded = AtomicInteger()
     val dropped = AtomicInteger()
@@ -58,7 +62,7 @@ class VideoDecoder(
 
     /** Queue one access unit. If the decoder is behind, everything queued is dropped and a keyframe requested. */
     fun submit(data: ByteArray, tsMs: Int): Boolean {
-        if (!queue.offer(Item(data, tsMs.toLong() * 1000))) {
+        if (!queue.offer(Item(data, (tsMs.toLong() and 0xFFFFFFFFL) * 1000))) {
             dropped.addAndGet(queue.size + 1)
             queue.clear()
             return false
@@ -95,12 +99,49 @@ class VideoDecoder(
                 val idx = codec.dequeueOutputBuffer(info, 10_000)
                 if (idx >= 0) {
                     decoded.incrementAndGet()
-                    codec.releaseOutputBuffer(idx, true) // render right now
+                    present(idx, info.presentationTimeUs / 1000.0)
                 }
             }
         } catch (e: Throwable) {
             if (running) Log.w(TAG, "drain: $e")
         }
+    }
+
+    private var consecutiveDrops = 0
+
+    /** Shows (or drops) one decoded frame at the moment the playback clock reaches its timestamp. */
+    private fun present(idx: Int, ptsMs: Double) {
+        val c = clock
+        var now = System.nanoTime() / 1_000_000
+        var clockMs = c?.nowMs(now)
+        if (c == null || clockMs == null) {
+            codec.releaseOutputBuffer(idx, true)
+            return
+        }
+        val d = VideoPacer.decide(ptsMs, clockMs, consecutiveDrops)
+        when (d.kind) {
+            VideoPacer.Kind.DROP -> {
+                dropped.incrementAndGet()
+                consecutiveDrops++
+                codec.releaseOutputBuffer(idx, false)
+            }
+            else -> {
+                if (d.kind == VideoPacer.Kind.WAIT) {
+                    val deadline = now + d.waitMs
+                    while (running) {
+                        now = System.nanoTime() / 1_000_000
+                        clockMs = c.nowMs(now) ?: break
+                        // Wait until the clock reaches the frame (it can jump when audio is re-synced), never more than the cap.
+                        if (ptsMs - clockMs <= 1.0 || now >= deadline) break
+                        Thread.sleep(minOf(4L, maxOf(1L, (ptsMs - clockMs).toLong())))
+                    }
+                }
+                consecutiveDrops = 0
+                codec.releaseOutputBuffer(idx, true)
+            }
+        }
+        val late = (clockMs ?: ptsMs) - ptsMs
+        sync?.onFrame(late, System.nanoTime() / 1_000_000)
     }
 
     fun release() {

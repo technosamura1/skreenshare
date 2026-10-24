@@ -33,7 +33,10 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
     // Only touched from the network thread (except where marked).
     private var session: Session? = null
     private var decoder: VideoDecoder? = null
-    private var audio: AudioPlayer? = null
+    @Volatile private var audio: AudioPlayer? = null
+    private var clock: MediaClock? = null
+    private var lastAudioSeq = 0
+    private var haveAudioSeq = false
     private val reasm = Reassembler(this)
     private var awaitingKey = true
     private var lastKeyReq = 0L
@@ -140,7 +143,13 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
                     }
                     Proto.T_AUDIO -> {
                         val a = Proto.parseAudio(b, len) ?: return
-                        audio?.push(b.copyOfRange(a.payloadOffset, len))
+                        val pl = audio ?: return
+                        // UDP may reorder: an older chunk than one already queued is useless.
+                        if (haveAudioSeq && a.seq - lastAudioSeq <= 0) return
+                        haveAudioSeq = true; lastAudioSeq = a.seq
+                        val t = a.tsMs.toLong() and 0xFFFFFFFFL
+                        if (cur.start.clockSync != 0) clock?.arrival?.onTimestamp(t, System.nanoTime() / 1_000_000)
+                        pl.push(t, b.copyOfRange(a.payloadOffset, len))
                     }
                     Proto.T_PING -> send(sock, b.copyOf(len).also { it[1] = Proto.T_PONG.toByte() }, cur.peer)
                     Proto.T_BYE -> endSession(sendBye = false)
@@ -153,8 +162,14 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
         endSession(sendBye = false)
         val surf = surface
         if (surf == null || !surf.isValid || s.vcodec != Proto.VCODEC_H264) return // sender will retry START
+        // Lip-sync needs the sender's shared audio/video clock (v0.2+); an older sender gets "show at once".
+        val synced = s.clockSync != 0
+        val mc = if (synced) MediaClock { audio?.clockMs() } else null
+        clock = mc
+        haveAudioSeq = false
         try {
-            decoder = VideoDecoder(surf, s.width, s.height, s.fps) { needKey = true }
+            decoder = VideoDecoder(surf, s.width, s.height, s.fps, { needKey = true }, mc,
+                if (mc != null) SyncController { ms -> audio?.delayBy(ms) } else null)
         } catch (e: Throwable) {
             Log.e(TAG, "decoder: $e")
             listener.onError("Не удалось запустить видеодекодер: $e")
@@ -180,6 +195,7 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
         if (sendBye) socket?.let { send(it, Proto.simple(Proto.T_BYE, s.id), s.peer) }
         decoder?.release(); decoder = null
         audio?.release(); audio = null
+        clock = null
         reasm.reset()
         listener.onStreaming(false, "")
     }
@@ -215,6 +231,7 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
     // ---- Reassembler.Sink (called on the network thread)
     override fun onFrame(frameId: Int, tsMs: Int, key: Boolean, data: ByteArray) {
         val d = decoder ?: return
+        clock?.arrival?.onTimestamp(tsMs.toLong() and 0xFFFFFFFFL, System.nanoTime() / 1_000_000)
         if (awaitingKey) {
             if (!key) return
             awaitingKey = false
