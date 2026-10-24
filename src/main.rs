@@ -1,6 +1,10 @@
+// GUI app: no console window when started by double-click. CLI use attaches to the parent console.
+#![windows_subsystem = "windows"]
+
 mod audio;
 mod capture;
 mod client;
+mod gui;
 mod host;
 mod net;
 mod selftest;
@@ -14,10 +18,10 @@ use ui::Exchange;
 const HELP: &str = "\
 screenshare — показ экрана другу напрямую, без серверов.
 
-Без параметров — меню. Параметры (для продвинутых):
+Без параметров — окно программы. Параметры (для продвинутых):
   screenshare host   [--monitor N] [--bitrate МБИТ] [--fps N] [--preset p1..p7]
                      [--max-send МБИТ] [--no-audio] [--exchange-dir ПАПКА]
-  screenshare client [--no-audio] [--cpu-decode] [--exchange-dir ПАПКА]
+  screenshare client [--no-audio] [--cpu-decode] [--windowed] [--exchange-dir ПАПКА]
                      [--frames N --screenshot ФАЙЛ.bmp]
   screenshare monitors
   screenshare selftest [--monitor N] [--bitrate МБИТ] [--preset pN] [--cpu-decode] [--out ФАЙЛ.bmp]
@@ -73,6 +77,7 @@ fn setup_console() {
 fn exchange(a: &mut Args) -> Result<Exchange> {
     Ok(match a.value("--exchange-dir")? {
         Some(d) => Exchange::Dir(PathBuf::from(d)),
+        None if ui::ipc() => Exchange::Ipc,
         None => Exchange::Console,
     })
 }
@@ -93,35 +98,14 @@ fn client_opts(a: &mut Args) -> Result<client::ClientOpts> {
     Ok(client::ClientOpts {
         audio: !a.flag("--no-audio"),
         hw_decode: !a.flag("--cpu-decode"),
+        windowed: a.flag("--windowed"),
         screenshot: a.value("--screenshot")?.map(PathBuf::from),
         frames: a.value("--frames")?.map(|v| v.parse()).transpose().context("--frames")?,
         exchange: exchange(a)?,
     })
 }
 
-fn run() -> Result<bool> {
-    let mut a = Args(std::env::args().skip(1).collect());
-    if a.0.is_empty() {
-        println!("screenshare {} — показ экрана другу", env!("CARGO_PKG_VERSION"));
-        println!();
-        println!("  [1] Показать свой экран");
-        println!("  [2] Смотреть экран друга");
-        println!();
-        loop {
-            match ui::ask("Выбери 1 или 2 и нажми Enter: ").as_str() {
-                "1" => {
-                    host::run(host_opts(&mut a)?)?;
-                    break;
-                }
-                "2" => {
-                    client::run(client_opts(&mut a)?)?;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        return Ok(true);
-    }
+fn run(mut a: Args) -> Result<()> {
     let cmd = a.0.remove(0);
     match cmd.as_str() {
         "host" => {
@@ -154,25 +138,40 @@ fn run() -> Result<bool> {
         "-h" | "--help" | "help" => print!("{HELP}"),
         other => bail!("непонятная команда: {other}\n\n{HELP}"),
     }
-    Ok(false)
+    Ok(())
 }
 
 fn main() {
+    let mut a = Args(std::env::args().skip(1).collect());
+    if a.0.is_empty() {
+        unsafe {
+            let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+        }
+        if let Err(e) = gui::run() {
+            eprintln!("{e}");
+        }
+        return;
+    }
+    if a.flag("--ipc") {
+        ui::set_ipc();
+    } else {
+        unsafe {
+            let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS);
+        }
+    }
     setup_console();
     if let Err(e) = ffmpeg_next::init() {
         eprintln!("FFmpeg не загрузился: {e}");
     }
     video::set_log_quiet();
-    let interactive = match run() {
-        Ok(i) => i,
-        Err(e) => {
-            println!();
+    if let Err(e) = run(a) {
+        if ui::ipc() {
+            println!("@ERROR {}", format!("{e:#}").replace('\n', " "));
+        } else {
             println!("Ошибка: {e:#}");
-            std::env::args().len() <= 1
         }
-    };
-    if interactive {
-        println!();
-        ui::ask("Нажми Enter, чтобы закрыть.");
+        std::process::exit(1);
     }
 }

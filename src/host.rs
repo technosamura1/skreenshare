@@ -60,7 +60,7 @@ impl Shared {
 }
 
 pub fn run(o: HostOpts) -> Result<()> {
-    let interactive = matches!(o.exchange, Exchange::Console);
+    let interactive = matches!(o.exchange, Exchange::Console) && !ui::ipc();
     let monitor = pick_monitor(o.monitor, interactive)?;
     println!("Показываю монитор {}x{} ({})", monitor.width, monitor.height, monitor.adapter);
 
@@ -82,7 +82,8 @@ pub fn run(o: HostOpts) -> Result<()> {
     )?;
     println!("Соединяюсь...");
     let peer = net::punch(&sock, net::ROLE_HOST, token, &peer_code.cands, Duration::from_secs(30))?;
-    println!("Подключено! Идёт трансляция. Чтобы остановить — закрой это окно.");
+    println!("Подключено! Идёт трансляция.");
+    ui::connected();
     stream(sock, peer, token, monitor, &o)
 }
 
@@ -94,6 +95,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         last_seen_ms: AtomicU64::new(0),
         sent_bytes: AtomicU64::new(0),
     });
+    {
+        let sh = sh.clone();
+        ui::on_stop(move || sh.running.store(false, Ordering::Relaxed));
+    }
 
     // Control channel from the client.
     {
@@ -281,12 +286,12 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         if stat_t.elapsed() >= Duration::from_secs(5) {
             let secs = stat_t.elapsed().as_secs_f64();
             let bytes = sh.sent_bytes.load(Ordering::Relaxed);
-            println!(
-                "кадров/с: {:.0} | отправка: {:.1} Мбит/с | захват+кодирование: {:.1} мс",
+            ui::stat(&format!(
+                "{:.0} кадров/с · {:.1} Мбит/с · кодирование {:.1} мс",
                 stat_frames as f64 / secs,
                 (bytes - stat_bytes0) as f64 * 8.0 / secs / 1e6,
                 if stat_frames > 0 { stat_enc.as_secs_f64() * 1000.0 / stat_frames as f64 } else { 0.0 },
-            );
+            ));
             stat_t = Instant::now();
             stat_frames = 0;
             stat_enc = Duration::ZERO;
@@ -295,5 +300,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
     }
     drop(tx);
     let _ = sender.join();
+    let mut bye = Vec::new();
+    net::write_header(&mut bye, net::PT_BYE, token);
+    for _ in 0..3 {
+        let _ = sock.send_to(&bye, peer);
+    }
     Ok(())
 }

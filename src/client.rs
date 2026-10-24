@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -21,6 +21,8 @@ pub struct ClientOpts {
     pub exchange: Exchange,
     pub audio: bool,
     pub hw_decode: bool,
+    /// Start in a normal window instead of borderless fullscreen.
+    pub windowed: bool,
     /// Test mode: save a decoded frame as BMP and quit after this many frames.
     pub screenshot: Option<PathBuf>,
     pub frames: Option<u64>,
@@ -181,7 +183,8 @@ pub fn run(o: ClientOpts) -> Result<()> {
     ui::show_code(&o.exchange, &me.encode(), "client.code", "Твой код ответа — отправь его другу:")?;
     println!("Жду, пока друг вставит код ответа...");
     let peer = net::punch(&sock, net::ROLE_CLIENT, host.token, &host.cands, Duration::from_secs(300))?;
-    println!("Подключено! Открываю окно. F11 — полный экран.");
+    println!("Подключено! Открываю окно просмотра.");
+    ui::connected();
     view(sock, peer, host.token, o)
 }
 
@@ -200,6 +203,10 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         win_size: AtomicU64::new((1280u64 << 32) | 720),
         picture: Mutex::new(Picture { w: 0, h: 0, px: Vec::new() }),
     });
+    {
+        let sh = sh.clone();
+        ui::on_stop(move || sh.running.store(false, Ordering::Relaxed));
+    }
 
     let player = if o.audio {
         match crate::audio::start_playback() {
@@ -308,13 +315,13 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     let secs = stat_t.elapsed().as_secs_f64();
                     let b = sh.recv_bytes.load(Ordering::Relaxed);
                     let f = sh.frames_decoded.load(Ordering::Relaxed);
-                    println!(
-                        "кадров/с: {:.0} | приём: {:.1} Мбит/с | пинг: {:.0} мс | потерь кадров: {}",
+                    ui::stat(&format!(
+                        "{:.0} кадров/с · {:.1} Мбит/с · пинг {:.0} мс · потерь {}",
                         (f - f0) as f64 / secs,
                         (b - b0) as f64 * 8.0 / secs / 1e6,
                         sh.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0,
                         sh.losses.load(Ordering::Relaxed),
-                    );
+                    ));
                     (b0, f0) = (b, f);
                     stat_t = Instant::now();
                 }
@@ -389,7 +396,14 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         });
     }
 
-    let mut app = App { window: None, surface: None, sh: sh.clone(), proxy };
+    let mut app = App {
+        window: None,
+        surface: None,
+        sh: sh.clone(),
+        proxy,
+        start_fullscreen: !o.windowed,
+        last_click: None,
+    };
     event_loop.run_app(&mut app)?;
 
     sh.running.store(false, Ordering::Relaxed);
@@ -408,6 +422,18 @@ struct App {
     sh: Arc<Shared>,
     #[allow(dead_code)]
     proxy: EventLoopProxy<UserEv>,
+    start_fullscreen: bool,
+    last_click: Option<Instant>,
+}
+
+impl App {
+    fn toggle_fullscreen(&self) {
+        let Some(w) = &self.window else { return };
+        let fs = w.fullscreen().is_none();
+        w.set_fullscreen(fs.then_some(Fullscreen::Borderless(None)));
+        // The stream already shows the host's cursor; ours on top would just be in the way.
+        w.set_cursor_visible(!fs);
+    }
 }
 
 impl ApplicationHandler<UserEv> for App {
@@ -415,10 +441,15 @@ impl ApplicationHandler<UserEv> for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title("screenshare — экран друга (F11 — полный экран)")
+        let mut attrs = Window::default_attributes()
+            .with_title("screenshare — F11 или двойной клик: полный экран / окно")
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+        if self.start_fullscreen {
+            attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
         let window = Rc::new(el.create_window(attrs).expect("create window"));
+        window.set_cursor_visible(!self.start_fullscreen);
+        window.focus_window();
         let ctx = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         self.surface = Some(softbuffer::Surface::new(&ctx, window.clone()).expect("softbuffer surface"));
         let s = window.inner_size();
@@ -444,14 +475,23 @@ impl ApplicationHandler<UserEv> for App {
                 self.sh.win_size.store(((s.width as u64) << 32) | s.height as u64, Ordering::Relaxed);
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
-                let Some(w) = &self.window else { return };
                 match event.logical_key {
-                    Key::Named(NamedKey::F11) => {
-                        let fs = if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) };
-                        w.set_fullscreen(fs);
+                    Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
+                    Key::Named(NamedKey::Escape) => {
+                        if self.window.as_ref().is_some_and(|w| w.fullscreen().is_some()) {
+                            self.toggle_fullscreen();
+                        }
                     }
-                    Key::Named(NamedKey::Escape) => w.set_fullscreen(None),
                     _ => {}
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                let now = Instant::now();
+                if self.last_click.is_some_and(|t| now.duration_since(t) < Duration::from_millis(400)) {
+                    self.toggle_fullscreen();
+                    self.last_click = None;
+                } else {
+                    self.last_click = Some(now);
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),

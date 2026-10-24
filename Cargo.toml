@@ -1,6 +1,6 @@
 [package]
 name = "screenshare"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -8,6 +8,7 @@ anyhow = "1"
 arboard = { version = "3", default-features = false }
 base64 = "0.22"
 cpal = "0.18"
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
 ffmpeg-next = { version = "9.0", default-features = false, features = ["codec", "format", "software-scaling"] }
 getrandom = "0.3"
 softbuffer = "0.4"

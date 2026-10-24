@@ -270,7 +270,7 @@ impl Scaler {
                     dw as i32,
                     dh as i32,
                     AVPixelFormat::AV_PIX_FMT_BGR0,
-                    2, // SWS_BILINEAR (an enum in FFmpeg 8 bindings)
+                    4, // SWS_BICUBIC (an enum in FFmpeg 8 bindings): keeps text crisp when downscaling
                     ptr::null_mut(),
                     ptr::null_mut(),
                     ptr::null(),

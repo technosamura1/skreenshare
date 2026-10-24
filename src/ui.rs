@@ -4,14 +4,62 @@ use anyhow::{bail, Result};
 use std::io::{BufRead, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// How codes travel between the two sides: by a human (console + clipboard) or files (automated tests).
+/// How codes travel between the two sides: by a human (console + clipboard), files (automated tests),
+/// or the GUI process that spawned us (`--ipc`: `@`-prefixed lines on stdout, codes on stdin).
 #[derive(Clone)]
 pub enum Exchange {
     Console,
     Dir(PathBuf),
+    Ipc,
+}
+
+static IPC: AtomicBool = AtomicBool::new(false);
+
+pub fn set_ipc() {
+    IPC.store(true, Ordering::Relaxed);
+}
+
+pub fn ipc() -> bool {
+    IPC.load(Ordering::Relaxed)
+}
+
+/// Periodic stats line: plain text in a console, `@STATS` for the GUI.
+pub fn stat(text: &str) {
+    if ipc() {
+        println!("@STATS {text}");
+    } else {
+        println!("{text}");
+    }
+}
+
+pub fn connected() {
+    if ipc() {
+        println!("@CONNECTED");
+    }
+}
+
+/// In IPC mode the GUI stops us by writing STOP (or by closing our stdin).
+pub fn on_stop(f: impl FnOnce() + Send + 'static) {
+    if !ipc() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdin.lock().read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) if line.trim() == "STOP" => break,
+                Ok(_) => {}
+            }
+        }
+        f();
+    });
 }
 
 pub fn read_line() -> String {
@@ -39,6 +87,7 @@ pub fn show_code(ex: &Exchange, code: &str, file: &str, title: &str) -> Result<(
                 println!("(уже скопирован в буфер обмена — просто вставь его в Telegram/Discord)");
             }
         }
+        Exchange::Ipc => println!("@CODE {code}"),
         Exchange::Dir(d) => {
             std::fs::create_dir_all(d)?;
             let tmp = d.join(format!("{file}.tmp"));
@@ -96,9 +145,12 @@ pub fn read_code(
                 }
             }
         }
-        Exchange::Console => loop {
-            print!("{prompt} ");
-            let _ = std::io::stdout().flush();
+        Exchange::Console | Exchange::Ipc => loop {
+            let is_ipc = matches!(ex, Exchange::Ipc);
+            if !is_ipc {
+                print!("{prompt} ");
+                let _ = std::io::stdout().flush();
+            }
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
                 let _ = tx.send(read_line());
@@ -111,10 +163,14 @@ pub fn read_code(
                 }
             };
             if line.is_empty() {
+                if is_ipc {
+                    bail!("интерфейс закрыт");
+                }
                 continue;
             }
             match validate(&line) {
                 Ok(c) => return Ok(c),
+                Err(e) if is_ipc => println!("@BADCODE {e:#}"),
                 Err(e) => println!("Не подошло: {e:#}"),
             }
         },

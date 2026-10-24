@@ -6,6 +6,7 @@ use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, POINT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
 pub struct MonitorInfo {
@@ -65,8 +66,12 @@ pub struct Capturer {
     output: IDXGIOutput1,
     dupl: Option<IDXGIOutputDuplication>,
     staging: Option<ID3D11Texture2D>,
+    /// Desktop orientation (what the user sees); for rotated monitors the texture is tex_w x tex_h.
     pub width: u32,
     pub height: u32,
+    tex_w: u32,
+    tex_h: u32,
+    rotation: DXGI_MODE_ROTATION,
     /// Latest desktop image, tightly packed BGRA.
     desktop: Vec<u8>,
     cursor: Cursor,
@@ -109,6 +114,9 @@ impl Capturer {
                 staging: None,
                 width: 0,
                 height: 0,
+                tex_w: 0,
+                tex_h: 0,
+                rotation: DXGI_MODE_ROTATION_IDENTITY,
                 desktop: Vec::new(),
                 cursor: Cursor { visible: false, pos: POINT::default(), shape: Vec::new(), info: Default::default() },
             };
@@ -126,8 +134,12 @@ impl Capturer {
                 .DuplicateOutput(&self.device)
                 .context("DuplicateOutput (захват экрана недоступен)")?;
             let desc = dupl.GetDesc();
+            // ModeDesc is already in desktop orientation; the acquired texture is in scan-out orientation.
             self.width = desc.ModeDesc.Width;
             self.height = desc.ModeDesc.Height;
+            self.rotation = desc.Rotation;
+            let swapped = self.rotation == DXGI_MODE_ROTATION_ROTATE90 || self.rotation == DXGI_MODE_ROTATION_ROTATE270;
+            (self.tex_w, self.tex_h) = if swapped { (self.height, self.width) } else { (self.width, self.height) };
             self.dupl = Some(dupl);
         }
         self.desktop = vec![0; (self.width * self.height * 4) as usize];
@@ -178,6 +190,9 @@ impl Capturer {
                     if self.staging.is_none() {
                         let mut d = D3D11_TEXTURE2D_DESC::default();
                         tex.GetDesc(&mut d);
+                        if (d.Width, d.Height) != (self.tex_w, self.tex_h) {
+                            bail!("неожиданный размер кадра {}x{} (ждал {}x{})", d.Width, d.Height, self.tex_w, self.tex_h);
+                        }
                         d.Usage = D3D11_USAGE_STAGING;
                         d.BindFlags = 0;
                         d.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
@@ -188,16 +203,13 @@ impl Capturer {
                         self.device.CreateTexture2D(&d, None, Some(&mut st))?;
                         self.staging = st;
                     }
-                    let st = self.staging.as_ref().unwrap();
-                    self.context.CopyResource(st, &tex);
+                    let st = self.staging.clone().unwrap();
+                    self.context.CopyResource(&st, &tex);
                     let mut m = D3D11_MAPPED_SUBRESOURCE::default();
-                    self.context.Map(st, 0, D3D11_MAP_READ, 0, Some(&mut m))?;
-                    let row = (self.width * 4) as usize;
-                    for y in 0..self.height as usize {
-                        let src = std::slice::from_raw_parts((m.pData as *const u8).add(y * m.RowPitch as usize), row);
-                        self.desktop[y * row..(y + 1) * row].copy_from_slice(src);
-                    }
-                    self.context.Unmap(st, 0);
+                    self.context.Map(&st, 0, D3D11_MAP_READ, 0, Some(&mut m))?;
+                    let src = std::slice::from_raw_parts(m.pData as *const u8, m.RowPitch as usize * self.tex_h as usize);
+                    self.copy_rotated(src, m.RowPitch as usize);
+                    self.context.Unmap(&st, 0);
                 }
             }
             if info.LastMouseUpdateTime != 0 {
@@ -218,6 +230,41 @@ impl Capturer {
             }
         }
         Ok(())
+    }
+
+    /// Texture (scan-out orientation) -> desktop buffer (what the user sees).
+    fn copy_rotated(&mut self, src: &[u8], pitch: usize) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (tw, th) = (self.tex_w as usize, self.tex_h as usize);
+        let px = |tx: usize, ty: usize| -> [u8; 4] { src[ty * pitch + tx * 4..][..4].try_into().unwrap() };
+        let r = self.rotation;
+        if r == DXGI_MODE_ROTATION_ROTATE90 {
+            for dy in 0..h {
+                for dx in 0..w {
+                    let p = px(dy, th - 1 - dx);
+                    self.desktop[(dy * w + dx) * 4..][..4].copy_from_slice(&p);
+                }
+            }
+        } else if r == DXGI_MODE_ROTATION_ROTATE270 {
+            for dy in 0..h {
+                for dx in 0..w {
+                    let p = px(tw - 1 - dy, dx);
+                    self.desktop[(dy * w + dx) * 4..][..4].copy_from_slice(&p);
+                }
+            }
+        } else if r == DXGI_MODE_ROTATION_ROTATE180 {
+            for dy in 0..h {
+                for dx in 0..w {
+                    let p = px(tw - 1 - dx, th - 1 - dy);
+                    self.desktop[(dy * w + dx) * 4..][..4].copy_from_slice(&p);
+                }
+            }
+        } else {
+            let row = w * 4;
+            for y in 0..h {
+                self.desktop[y * row..(y + 1) * row].copy_from_slice(&src[y * pitch..y * pitch + row]);
+            }
+        }
     }
 
     /// Writes the current desktop plus cursor into `dst` (BGRA rows of `stride` bytes).
