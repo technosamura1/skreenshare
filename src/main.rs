@@ -6,6 +6,7 @@ mod capture;
 mod client;
 mod gui;
 mod host;
+mod loopback;
 mod net;
 mod selftest;
 mod ui;
@@ -24,6 +25,7 @@ screenshare — показ экрана другу напрямую, без се
   screenshare client [--no-audio] [--cpu-decode] [--windowed] [--exchange-dir ПАПКА]
                      [--frames N --screenshot ФАЙЛ.bmp]
   screenshare monitors
+  screenshare audiotest      проверка, что звук Discord не попадает в трансляцию
   screenshare selftest [--monitor N] [--bitrate МБИТ] [--preset pN] [--cpu-decode] [--out ФАЙЛ.bmp]
 ";
 
@@ -134,6 +136,22 @@ fn run(mut a: Args) -> Result<()> {
             selftest::color_test(bitrate, &preset, hw)?;
             let m = host::pick_monitor(mon, false)?;
             selftest::capture_test(m, bitrate, &preset, hw, &out)?;
+        }
+        "audiotest" => {
+            a.finish()?;
+            match loopback::find_voice_app() {
+                Some((pid, name)) => println!("Голосовой чат: {name} (PID {pid}) — будет исключён из звука"),
+                None => println!("Голосовой чат не запущен"),
+            }
+            println!("Проверяю исключение программы из захвата (тихий тон 440 Гц ~3 секунды)...");
+            let (excluded, included) = loopback::self_check()?;
+            println!("тон, когда программа исключена: {excluded:.5}");
+            println!("тон, когда программа включена:  {included:.5}");
+            if included > 0.002 && excluded < included / 20.0 {
+                println!("OK: исключённая программа в трансляцию не попадает");
+            } else {
+                bail!("исключение не сработало");
+            }
         }
         "-h" | "--help" | "help" => print!("{HELP}"),
         other => bail!("непонятная команда: {other}\n\n{HELP}"),

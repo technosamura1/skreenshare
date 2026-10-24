@@ -158,6 +158,7 @@ struct Session {
     code: Option<String>,
     connected: bool,
     stats: String,
+    audio: String,
     bad_code: Option<String>,
     error: Option<String>,
     ended: bool,
@@ -172,6 +173,7 @@ impl Session {
             code: None,
             connected: false,
             stats: String::new(),
+            audio: String::new(),
             bad_code: None,
             error: None,
             ended: false,
@@ -188,6 +190,8 @@ impl Session {
                 self.bad_code = None;
             } else if let Some(s) = l.strip_prefix("@STATS ") {
                 self.stats = s.to_string();
+            } else if let Some(a) = l.strip_prefix("@AUDIO ") {
+                self.audio = a.to_string();
             } else if let Some(e) = l.strip_prefix("@BADCODE ") {
                 self.bad_code = Some(e.to_string());
             } else if let Some(e) = l.strip_prefix("@ERROR ") {
@@ -507,6 +511,10 @@ impl GuiApp {
             section(ui, |ui| {
                 status_dot(ui, GREEN, "Идёт трансляция");
                 ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
+                if !s.audio.is_empty() {
+                    let warn = s.audio.starts_with("Звук выключен") || s.audio.starts_with("Звук не");
+                    ui.label(RichText::new(&s.audio).color(if warn { RED } else { TEXT }));
+                }
                 fps_hint(ui);
             });
             if big_button(ui, "Остановить", RED, true) {

@@ -59,6 +59,20 @@
 - [ ] Тест с другом.
 - [ ] Сборка zip, позже GitHub Actions + релизы.
 
+- [x] v0.3.0: звук без эха — process loopback (`ActivateAudioInterfaceAsync`, EXCLUDE_TARGET_PROCESS_TREE)
+      исключает дерево процессов Discord/PTB/Canary/Vesktop; перепроверка каждые 3 с; если исключить нельзя,
+      а Discord запущен — звук не шлём. `audiotest` доказывает исключение тоном 440 Гц (исключён 0.000, включён 0.029).
+      Грабли: у windows-rs `PROPVARIANT` есть Drop → PropVariantClear освобождал наш стековый blob (heap corruption),
+      держим его в ManuallyDrop.
+
+## Известные косяки (TODO)
+- **HDR (важно, отложено по просьбе пользователя 2026-10-24):** при включённом HDR в Windows картинка в стриме
+  засвечена — legacy `DuplicateOutput` отдаёт плохо смапленный BGRA8. Это видит и друг. План фикса: если
+  `IDXGIOutput6::GetDesc1().ColorSpace == G2084`, брать `DuplicateOutput1` в `R16G16B16A16_FLOAT` (scRGB),
+  узнать «Яркость SDR-контента» через `DisplayConfigGetDeviceInfo(GET_SDR_WHITE_LEVEL)` (scale = 1000/W),
+  компьют-шейдером (D3DCompile cs_5_0) перевести в SDR: *scale, мягкий roll-off выше ~0.8, sRGB-гамма,
+  запись в RGBA8 с перестановкой каналов в BGRA-порядок → дальше как сейчас (staging, поворот, курсор).
+
 ## Потом
 - Управление мышью/клавиатурой/геймпадом, Opus, шифрование (ChaCha20-Poly1305, ключ в коде),
   intra-refresh вместо IDR, FEC, выбор монитора, GUI вместо консоли, сервер-«сводник» по желанию.

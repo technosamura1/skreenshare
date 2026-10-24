@@ -5,7 +5,7 @@ use crate::ui::{self, Exchange};
 use crate::video::{Encoder, EncoderConfig};
 use anyhow::{bail, Result};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,6 +56,79 @@ struct Shared {
 impl Shared {
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+}
+
+enum AudioSource {
+    Off,
+    /// Process loopback: everything except the voice app (if one is running).
+    Filtered(#[allow(dead_code)] crate::loopback::Capture, Option<u32>),
+    /// Plain loopback of the whole system; only used when no voice app is running.
+    Everything(#[allow(dead_code)] cpal::Stream),
+}
+
+impl AudioSource {
+    /// PID of the voice app this source keeps out (None also for "nothing to exclude").
+    fn excluded(&self) -> Option<u32> {
+        match self {
+            AudioSource::Filtered(_, pid) => *pid,
+            _ => None,
+        }
+    }
+}
+
+type AudioSink = Box<dyn FnMut(&[i16], u32) + Send>;
+
+fn audio_sender(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, sh: Arc<Shared>, seq: Arc<AtomicU32>) -> AudioSink {
+    let mut pending: Vec<i16> = Vec::new();
+    let mut pkt = Vec::with_capacity(1100);
+    Box::new(move |samples, rate| {
+        pending.extend_from_slice(samples);
+        // 240 stereo frames (5 ms at 48 kHz) = 960 bytes per datagram.
+        while pending.len() >= 480 {
+            net::write_header(&mut pkt, net::PT_AUDIO, token);
+            pkt.extend_from_slice(&seq.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+            pkt.extend_from_slice(&rate.to_le_bytes());
+            for s in pending.drain(..480) {
+                pkt.extend_from_slice(&s.to_le_bytes());
+            }
+            let _ = sock.send_to(&pkt, peer);
+            sh.sent_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+        }
+    })
+}
+
+/// Never streams the voice chat back to the friend: if it can't be excluded, no audio at all.
+fn start_audio(make_sink: &dyn Fn() -> AudioSink) -> AudioSource {
+    use crate::loopback::{self, Mode};
+    let voice = loopback::find_voice_app();
+    // With no voice app we still use process loopback (excluding ourselves) to get the same format.
+    let target = voice.map(|v| v.0).unwrap_or(std::process::id());
+    match loopback::start(target, Mode::Exclude, make_sink()) {
+        Ok(c) => {
+            ui::audio_status(&match voice {
+                Some((_, name)) => format!("Звук: передаётся всё, кроме {name} — эха не будет"),
+                None => "Звук: передаётся весь звук компьютера (Discord не запущен)".to_string(),
+            });
+            AudioSource::Filtered(c, voice.map(|v| v.0))
+        }
+        Err(e) if voice.is_some() => {
+            ui::audio_status(&format!(
+                "Звук выключен: эта Windows не умеет исключать {} из захвата, а иначе друг слышал бы себя ({e:#})",
+                voice.unwrap().1
+            ));
+            AudioSource::Off
+        }
+        Err(_) => match crate::audio::start_capture(make_sink()) {
+            Ok(s) => {
+                ui::audio_status("Звук: передаётся весь звук компьютера");
+                AudioSource::Everything(s)
+            }
+            Err(e) => {
+                ui::audio_status(&format!("Звук не захватывается: {e:#}"));
+                AudioSource::Off
+            }
+        },
     }
 }
 
@@ -184,36 +257,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         })
     };
 
-    let _audio = if o.audio {
-        let sock = sock.clone();
-        let sh = sh.clone();
-        let mut pending: Vec<i16> = Vec::new();
-        let mut seq = 0u32;
-        let mut pkt = Vec::with_capacity(1100);
-        match crate::audio::start_capture(move |samples, rate| {
-            pending.extend_from_slice(samples);
-            // 240 stereo frames (5 ms at 48 kHz) = 960 bytes per datagram.
-            while pending.len() >= 480 {
-                net::write_header(&mut pkt, net::PT_AUDIO, token);
-                pkt.extend_from_slice(&seq.to_le_bytes());
-                pkt.extend_from_slice(&rate.to_le_bytes());
-                for s in pending.drain(..480) {
-                    pkt.extend_from_slice(&s.to_le_bytes());
-                }
-                seq = seq.wrapping_add(1);
-                let _ = sock.send_to(&pkt, peer);
-                sh.sent_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
-            }
-        }) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                println!("Звук не захватывается: {e:#}. Продолжаю без звука.");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let seq = Arc::new(AtomicU32::new(0));
+    let sender_for_audio = || audio_sender(sock.clone(), peer, token, sh.clone(), seq.clone());
+    let mut audio = if o.audio { start_audio(&sender_for_audio) } else { AudioSource::Off };
+    let mut audio_check = Instant::now();
 
     let mut cap = Capturer::new(&monitor)?;
     let period = Duration::from_secs_f64(1.0 / o.fps as f64);
@@ -229,6 +276,14 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
     let mut stat_bytes0 = 0u64;
 
     while sh.running.load(Ordering::Relaxed) {
+        // Discord started, quit or restarted: re-aim the exclusion so its voices never leak in.
+        if o.audio && audio_check.elapsed() > Duration::from_secs(3) {
+            audio_check = Instant::now();
+            if audio.excluded() != crate::loopback::find_voice_app().map(|v| v.0) {
+                drop(std::mem::replace(&mut audio, AudioSource::Off)); // release the old capture first
+                audio = start_audio(&sender_for_audio);
+            }
+        }
         let now = Instant::now();
         let timeout = if dirty { next_due.saturating_duration_since(now).as_millis() as u32 } else { 250 };
         match cap.next(timeout)? {
@@ -298,6 +353,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
             stat_bytes0 = bytes;
         }
     }
+    drop(audio);
     drop(tx);
     let _ = sender.join();
     let mut bye = Vec::new();

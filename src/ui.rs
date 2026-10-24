@@ -36,6 +36,14 @@ pub fn stat(text: &str) {
     }
 }
 
+pub fn audio_status(text: &str) {
+    if ipc() {
+        println!("@AUDIO {text}");
+    } else {
+        println!("{text}");
+    }
+}
+
 pub fn connected() {
     if ipc() {
         println!("@CONNECTED");
