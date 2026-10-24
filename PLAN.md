@@ -1,4 +1,4 @@
-# screenshare — свой Parsec для двоих
+﻿# screenshare — свой Parsec для двоих
 
 Цель: стрим экрана со звуком между двумя Windows-ПК через интернет, без серверов и настроек.
 Запустил exe → обменялись кодами → смотришь.
@@ -46,7 +46,7 @@
 ## Статус
 - [x] Инструменты: git, gh (вошёл как technosamura1), Rust 1.99, MSVC.
 - [x] Разрешение на скачивание LLVM (winget LLVM.LLVM) и FFmpeg (BtbN win64-gpl-shared) получено.
-- [ ] LLVM: установка запускалась, проверить `C:\Program Files\LLVM\bin\libclang.dll`, при необходимости поставить заново.
+- [x] LLVM установлен: `C:\Program Files\LLVM\bin\libclang.dll` (только на ПК; в CI — LLVM раннера).
 - [ ] FFmpeg: выбрать сборку BtbN под версию `ffmpeg-next` (на 2026-10-24 последняя 9.0.0 / ffmpeg-sys-next 9.0.1),
       распаковать в `third_party/ffmpeg`.
 - [ ] MVP код.
