@@ -65,6 +65,11 @@
       Грабли: у windows-rs `PROPVARIANT` есть Drop → PropVariantClear освобождал наш стековый blob (heap corruption),
       держим его в ManuallyDrop.
 
+- [x] v0.4.0: один exe (~50 МБ). avcodec/avutil/swscale/swresample сжаты zstd внутрь exe (build.rs),
+      /DELAYLOAD + распаковка в %LOCALAPPDATA%\screenshare\ffmpeg-<id> и SetDllDirectoryW до первого вызова.
+      Грабли: у BtbN GNU-библиотеки импорта, /DELAYLOAD их игнорирует (LNK4199) → tools/make-import-libs.ps1.
+- [ ] Проверить синхронизацию звука и видео (пользователь спрашивал про фильмы/аниме; не замерено).
+
 ## Известные косяки (TODO)
 - **HDR (важно, отложено по просьбе пользователя 2026-10-24):** при включённом HDR в Windows картинка в стриме
   засвечена — legacy `DuplicateOutput` отдаёт плохо смапленный BGRA8. Это видит и друг. План фикса: если

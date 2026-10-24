@@ -2,6 +2,7 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod bundle;
 mod capture;
 mod client;
 mod gui;
@@ -167,6 +168,10 @@ fn main() {
                 windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
             );
         }
+        // Unpack FFmpeg now, so the stream processes we start later find it ready.
+        std::thread::spawn(|| {
+            let _ = bundle::ensure_ffmpeg();
+        });
         if let Err(e) = gui::run() {
             eprintln!("{e}");
         }
@@ -180,6 +185,15 @@ fn main() {
         }
     }
     setup_console();
+    if let Err(e) = bundle::ensure_ffmpeg() {
+        let msg = format!("не удалось подготовить FFmpeg: {e:#}");
+        if ui::ipc() {
+            println!("@ERROR {msg}");
+        } else {
+            println!("Ошибка: {msg}");
+        }
+        std::process::exit(1);
+    }
     if let Err(e) = ffmpeg_next::init() {
         eprintln!("FFmpeg не загрузился: {e}");
     }
