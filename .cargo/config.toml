@@ -1,0 +1,4 @@
+[env]
+FFMPEG_DIR = { value = "third_party/ffmpeg", relative = true }
+# Windows default; set LIBCLANG_PATH yourself (e.g. in CI or on Linux) to override.
+LIBCLANG_PATH = { value = "C:\\Program Files\\LLVM\\bin", force = false }

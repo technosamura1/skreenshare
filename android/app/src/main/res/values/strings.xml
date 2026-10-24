@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Skreenshare проектор</string>
+    <string name="waiting">Ожидание компьютера...</string>
+    <string name="hint">На компьютере запустите skreenshare-proektor.exe и нажмите «Транслировать»</string>
+    <string name="address">Это устройство: %1$s — IP %2$s</string>
+    <string name="no_network">Нет подключения к Wi-Fi — подключите проектор к той же сети, что и компьютер</string>
+    <string name="error">Ошибка</string>
+</resources>

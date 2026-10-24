@@ -1,0 +1,11 @@
+/target
+/third_party/
+/dist/
+*.code
+target/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.iml
+.idea/
