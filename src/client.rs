@@ -1,11 +1,14 @@
 // Client side: UDP -> frame reassembly -> D3D11VA decode -> window. Audio into a jitter buffer.
 use crate::audiopkt::AudioRx;
+use crate::gpuconv::{self, GpuConv};
+use crate::gpulogic::{self, ConvPath, GpuGuard};
 use crate::net::{self, Code};
 use crate::ratectl;
 use crate::reassembly::{KeyRequester, Reassembler, Stats};
 use crate::retx;
 use crate::ui::{self, Exchange};
-use crate::video::{Decoder, OwnedFrame, Scaler};
+use crate::video::{self, Decoder, OwnedFrame, Scaler};
+use ffmpeg_next::ffi::{AVFrame, AVPixelFormat};
 use crate::viewperf::{self, Acc, CostGovernor, HwWatch, JitterMeter};
 use anyhow::Result;
 use std::net::{SocketAddr, UdpSocket};
@@ -25,6 +28,8 @@ pub struct ClientOpts {
     pub exchange: Exchange,
     pub audio: bool,
     pub hw_decode: bool,
+    /// Colour conversion and scaling on the processor (2 swscale threads) instead of the GPU video processor.
+    pub cpu_convert: bool,
     /// Start in a normal window instead of borderless fullscreen.
     pub windowed: bool,
     /// Test mode: save a decoded frame as BMP and quit after this many frames.
@@ -139,6 +144,8 @@ struct Shared {
     /// 0 = CPU decoder, 1 = GPU (D3D11VA), 2 = GPU requested but FFmpeg fell back to its CPU decoder,
     /// 3 = GPU decoder failed at run time and we switched to the CPU.
     dec_mode: AtomicU8,
+    /// ConvPath code: where colour conversion and scaling run right now.
+    conv_mode: AtomicU8,
     /// The decoder asks the receiver for a fresh keyframe (after switching decoders).
     want_resync: AtomicBool,
     /// Frames lost because the decoder queue was full / decoded but not shown while catching up.
@@ -267,6 +274,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         picture: Mutex::new(Picture { w: 0, h: 0, px: Vec::new(), flash: false, seq: 0 }),
         qdepth: AtomicUsize::new(0),
         dec_mode: AtomicU8::new(0),
+        conv_mode: AtomicU8::new(0),
         want_resync: AtomicBool::new(false),
         dropped_full: AtomicU64::new(0),
         dropped_catchup: AtomicU64::new(0),
@@ -519,8 +527,9 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     drop(d);
                     let mode = sh.dec_mode.load(Ordering::Relaxed) as usize;
                     let diag = format!(
-                        "Декодер: {} · картинка {} → {} · декод {:.1}/{:.0} мс · цвет+масштаб {:.1}/{:.0} мс · показ {:.1}/{:.0} мс · очередь {:.1}/{:.0} кадр. · пропущено: догоняя {}, переполнение {}, конвертер занят {} · разброс кадров {:.1} мс, макс. пауза {:.0} мс, пауз >0,1 с: {}",
+                        "Декодер: {} · цвет+масштаб на: {} · картинка {} → {} · декод {:.1}/{:.0} мс · цвет+масштаб {:.1}/{:.0} мс · показ {:.1}/{:.0} мс · очередь {:.1}/{:.0} кадр. · пропущено: догоняя {}, переполнение {}, конвертер занят {} · разброс кадров {:.1} мс, макс. пауза {:.0} мс, пауз >0,1 с: {}",
                         DEC_NAMES[mode.min(3)],
+                        ConvPath::from_code(sh.conv_mode.load(Ordering::Relaxed)).name(),
                         size_str(sh.video_size.load(Ordering::Relaxed)),
                         size_str(sh.shown_size.load(Ordering::Relaxed)),
                         dec_ms, dec_max, conv_ms, conv_max, pres_ms, pres_max, q_avg, q_max,
@@ -570,6 +579,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         let sh = sh.clone();
         let proxy = proxy.clone();
         let hw = o.hw_decode;
+        let cpu_convert = o.cpu_convert;
         let screenshot = o.screenshot.clone();
         let frames_limit = o.frames;
         std::thread::spawn(move || {
@@ -636,6 +646,21 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 }
                 tx
             };
+            // GPU colour conversion: only when every picture needn't be shown in order (same condition as the
+            // converter pool) and not forced off. Any failure turns it off for good and the CPU pool takes over.
+            let forced_cpu = cpu_convert || gpulogic::env_forces_cpu(std::env::var(gpulogic::FORCE_CPU_ENV).ok().as_deref());
+            let mut guard = GpuGuard::new(forced_cpu, pooled);
+            let mut gpu: Option<GpuConv> = None;
+            sh.conv_mode.store(guard.path().code(), Ordering::Relaxed);
+            {
+                let msg = match guard.path() {
+                    ConvPath::CpuForced => "Цвет и масштаб: процессор, 2 потока (принудительно: --cpu-convert или SS_CPU_CONVERT)".to_string(),
+                    ConvPath::Gpu if dec.hardware => "Цвет и масштаб: видеокарта (D3D11 video processor); при любой ошибке перейду на процессор".to_string(),
+                    _ => "Цвет и масштаб: процессор, 2 потока".to_string(),
+                };
+                println!("{msg}");
+                log_line(&msg);
+            }
             let mut watch = HwWatch::new();
             let mut gpu_failed = false;
             let mut errs = 0u32;
@@ -683,6 +708,10 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 }
                 let t0 = Instant::now();
                 let mut conv_us = 0u64;
+                if !guard.active() {
+                    gpu = None; // release the D3D objects once the GPU path is off
+                }
+                dec.hw_passthrough = guard.active();
                 let r = dec.decode(&data, show, |f| {
                     sh.video_size.store(((f.width.max(0) as u64) << 32) | f.height.max(0) as u64, Ordering::Relaxed);
                     let ws = sh.win_size.load(Ordering::Relaxed);
@@ -693,13 +722,52 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     let (fw, fh) = (f.width as u32, f.height as u32);
                     let s = (ww as f64 / fw as f64).min(wh as f64 / fh as f64);
                     let (dw, dh) = (((fw as f64 * s) as u32).max(1), ((fh as f64 * s) as u32).max(1));
-                    if pooled {
+                    let hwf = f.format == AVPixelFormat::AV_PIX_FMT_D3D11 as i32;
+                    let mut gpu_done = false;
+                    // A tiny window (minimised, being dragged very small) isn't worth the video processor and some
+                    // drivers refuse such sizes: that picture goes the CPU way, without counting as a GPU failure.
+                    if hwf && guard.active() && dw >= 64 && dh >= 64 {
+                        let before = guard.path();
+                        let tc = Instant::now();
+                        match gpuconv::step(&mut gpu, &mut guard, &mut scaler, f, dw, dh, &mut px) {
+                            Ok(diff) => {
+                                gpu_done = true; // `px` is right even if the check just turned the GPU path off
+                                conv_us = tc.elapsed().as_micros() as u64;
+                                if let Some(d) = diff {
+                                    log_line(&format!("[{}] сверка видеокарта/процессор: расхождение {d:.1} из 255 (допустимо до {})", sh.now_ms() / 1000, gpulogic::MAX_MEAN_DIFF));
+                                }
+                            }
+                            Err(e) => {
+                                guard.fail(&format!("{e:#}"));
+                            }
+                        }
+                        if guard.path() != before {
+                            let msg = format!(
+                                "Цвет и масштаб: видеокарта отказала ({}) — перехожу на процессор, 2 потока",
+                                guard.reason().unwrap_or("?")
+                            );
+                            println!("{msg}");
+                            log_line(&format!("[{}] {msg}", sh.now_ms() / 1000));
+                        }
+                    }
+                    // What the label says: GPU only while hardware frames really go through it.
+                    let shown_path = if gpu_done || (hwf && guard.active() && dw >= 64 && dh >= 64) {
+                        guard.path()
+                    } else if !hwf && guard.path() == ConvPath::Gpu {
+                        ConvPath::Cpu // the decoder gave ordinary frames in memory: nothing for the video processor
+                    } else {
+                        guard.path()
+                    };
+                    sh.conv_mode.store(shown_path.code(), Ordering::Relaxed);
+                    let mut cpu_owned: Option<OwnedFrame> = None;
+                    if !gpu_done && pooled {
                         // Hand the picture to a converter thread; if both are busy this one isn't shown.
                         if busy.load(Ordering::Relaxed) > CONVERTERS {
                             sh.dropped_busy.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
-                        if let Ok(frame) = OwnedFrame::copy_of(f) {
+                        let owned = if hwf { video::readback(f) } else { OwnedFrame::copy_of(f) };
+                        if let Ok(frame) = owned {
                             seq += 1;
                             busy.fetch_add(1, Ordering::Relaxed);
                             if job_tx.try_send(ConvJob { seq, frame, dw, dh }).is_err() {
@@ -709,14 +777,23 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         }
                         return;
                     }
-                    let tc = Instant::now();
-                    scaler.fast = gov.lock().unwrap().fast;
-                    if scaler.convert(f, dw, dh, &mut px).is_err() {
-                        return;
+                    if hwf && !gpu_done {
+                        cpu_owned = video::readback(f).ok();
+                        if cpu_owned.is_none() {
+                            return;
+                        }
                     }
-                    conv_us = tc.elapsed().as_micros() as u64;
+                    let src: &AVFrame = cpu_owned.as_ref().map_or(f, |o| o.get());
+                    if !gpu_done {
+                        let tc = Instant::now();
+                        scaler.fast = gov.lock().unwrap().fast;
+                        if scaler.convert(src, dw, dh, &mut px).is_err() {
+                            return;
+                        }
+                        conv_us = tc.elapsed().as_micros() as u64;
+                        gov.lock().unwrap().feed(conv_us as f64 / 1000.0);
+                    }
                     sh.shown_size.store(((dw as u64) << 32) | dh as u64, Ordering::Relaxed);
-                    gov.lock().unwrap().feed(conv_us as f64 / 1000.0);
                     let is_flash = crate::avsync::enabled() && {
                         let bytes = unsafe { std::slice::from_raw_parts(px.as_ptr() as *const u8, px.len() * 4) };
                         flash.rising(crate::avsync::luma(bytes, dw as usize * 4, dw as usize, dh as usize))
@@ -733,7 +810,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     if frames_limit.is_some_and(|l| n >= l) && !done {
                         if let Some(path) = &screenshot {
                             let mut img = Vec::new();
-                            if full.convert(f, fw, fh, &mut img).is_ok() {
+                            if full.convert(src, fw, fh, &mut img).is_ok() {
                                 match write_bmp(path, fw, fh, &img) {
                                     Ok(()) => println!("Снимок сохранён: {}", path.display()),
                                     Err(e) => println!("Снимок не сохранён: {e}"),

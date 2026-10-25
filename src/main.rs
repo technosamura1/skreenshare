@@ -7,6 +7,8 @@ mod avsync;
 mod bundle;
 mod capture;
 mod client;
+mod gpuconv;
+mod gpulogic;
 mod gui;
 mod host;
 mod loopback;
@@ -39,8 +41,10 @@ screenshare — показ экрана другу напрямую, без се
 Без параметров — окно программы. Параметры (для продвинутых):
   screenshare host   [--monitor N] [--window HWND] [--bitrate МБИТ] [--fps N] [--preset p1..p7]
                      [--max-send МБИТ] [--no-audio] [--exchange-dir ПАПКА]
-  screenshare client [--no-audio] [--cpu-decode] [--windowed] [--exchange-dir ПАПКА]
+  screenshare client [--no-audio] [--cpu-decode] [--cpu-convert] [--windowed] [--exchange-dir ПАПКА]
                      [--frames N --screenshot ФАЙЛ.bmp]
+                     --cpu-convert (или переменная SS_CPU_CONVERT=1) — цвет и масштаб на процессоре, не на видеокарте
+  screenshare gputest        проверка видеокарты для цвета и масштаба у зрителя (без сети)
   screenshare monitors
   screenshare windows        список окон (номер HWND для --window); --window показывает только это окно
   screenshare audiotest      проверка, что звук Discord не попадает в трансляцию
@@ -125,6 +129,7 @@ fn client_opts(a: &mut Args) -> Result<client::ClientOpts> {
     Ok(client::ClientOpts {
         audio: !a.flag("--no-audio"),
         hw_decode: !a.flag("--cpu-decode"),
+        cpu_convert: a.flag("--cpu-convert"),
         windowed: a.flag("--windowed"),
         screenshot: a.value("--screenshot")?.map(PathBuf::from),
         frames: a.value("--frames")?.map(|v| v.parse()).transpose().context("--frames")?,
@@ -176,6 +181,14 @@ fn run(mut a: Args) -> Result<()> {
             let dh = a.num::<u32>("--window-h", 1440)?;
             a.finish()?;
             video::convert_bench(w, h, dw, dh)?;
+        }
+        "gputest" => {
+            let w = a.num::<i32>("--video-w", 1920)?;
+            let h = a.num::<i32>("--video-h", 1080)?;
+            let dw = a.num::<u32>("--window-w", 1600)?;
+            let dh = a.num::<u32>("--window-h", 900)?;
+            a.finish()?;
+            gpuconv::selftest(w, h, dw, dh)?;
         }
         "opustest" => {
             a.finish()?;

@@ -438,6 +438,10 @@ pub struct Decoder {
     /// The last picture really came out of the GPU decoder. FFmpeg quietly falls back to its software decoder
     /// when the GPU can't do this stream; then this stays false although `hardware` is true.
     pub hw_active: bool,
+    /// Hand out the decoder's own GPU frames (format D3D11, no readback) instead of NV12 copies in memory; the
+    /// caller then converts them on the GPU (gpuconv.rs) or calls `readback` itself. The frame is only valid
+    /// inside the callback.
+    pub hw_passthrough: bool,
     pub codec: Codec,
 }
 
@@ -479,7 +483,7 @@ impl Decoder {
                 avcodec_free_context(&mut ctx);
                 bail!("avcodec_open2 (decoder): {}", av_err(r));
             }
-            Ok(Decoder { ctx, pkt: av_packet_alloc(), frame: av_frame_alloc(), sw: av_frame_alloc(), hardware, hw_active: false, codec: kind })
+            Ok(Decoder { ctx, pkt: av_packet_alloc(), frame: av_frame_alloc(), sw: av_frame_alloc(), hardware, hw_active: false, hw_passthrough: false, codec: kind })
         }
     }
 
@@ -505,6 +509,8 @@ impl Decoder {
                 self.hw_active = is_hw;
                 if !show {
                     // nothing to do: dropping the reference below is enough
+                } else if is_hw && self.hw_passthrough {
+                    out(&*self.frame);
                 } else if is_hw {
                     av_frame_unref(self.sw);
                     let t = av_hwframe_transfer_data(self.sw, self.frame, 0);
@@ -709,6 +715,21 @@ impl OwnedFrame {
 impl Drop for OwnedFrame {
     fn drop(&mut self) {
         unsafe { av_frame_free(&mut self.0) };
+    }
+}
+
+/// Reads a GPU frame (format D3D11) back into a normal NV12/P010 frame in memory, colour properties included.
+pub fn readback(f: &AVFrame) -> Result<OwnedFrame> {
+    unsafe {
+        let n = av_frame_alloc();
+        if n.is_null() {
+            bail!("av_frame_alloc");
+        }
+        let o = OwnedFrame(n);
+        check(av_hwframe_transfer_data(n, f, 0), "av_hwframe_transfer_data")?;
+        (*n).colorspace = f.colorspace;
+        (*n).color_range = f.color_range;
+        Ok(o)
     }
 }
 
