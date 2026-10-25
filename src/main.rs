@@ -2,6 +2,7 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod avsync;
 mod bundle;
 mod capture;
 mod client;
@@ -137,6 +138,11 @@ fn run(mut a: Args) -> Result<()> {
             selftest::color_test(bitrate, &preset, hw)?;
             let m = host::pick_monitor(mon, false)?;
             selftest::capture_test(m, bitrate, &preset, hw, &out)?;
+        }
+        "avbeacon" => {
+            let secs = a.num::<u64>("--seconds", 20)?;
+            a.finish()?;
+            avsync::run_beacon(secs)?;
         }
         "audiotest" => {
             a.finish()?;

@@ -82,7 +82,17 @@ type AudioSink = Box<dyn FnMut(&[i16], u32) + Send>;
 fn audio_sender(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, sh: Arc<Shared>, seq: Arc<AtomicU32>) -> AudioSink {
     let mut pending: Vec<i16> = Vec::new();
     let mut pkt = Vec::with_capacity(1100);
+    let mut beep = crate::avsync::BeepEdge::new(48_000);
     Box::new(move |samples, rate| {
+        if crate::avsync::enabled() {
+            let frames = samples.len() / 2;
+            let now = crate::avsync::now_us();
+            for (i, f) in samples.chunks_exact(2).enumerate() {
+                if beep.feed(f[0] as f32 / 32768.0) {
+                    crate::avsync::log("host_audio", now - ((frames - i) as i64 * 1_000_000 / rate as i64));
+                }
+            }
+        }
         pending.extend_from_slice(samples);
         // 240 stereo frames (5 ms at 48 kHz) = 960 bytes per datagram.
         while pending.len() >= 480 {
@@ -101,6 +111,16 @@ fn audio_sender(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, sh: Arc<Shar
 /// Never streams the voice chat back to the friend: if it can't be excluded, no audio at all.
 fn start_audio(make_sink: &dyn Fn() -> AudioSink) -> AudioSource {
     use crate::loopback::{self, Mode};
+    // Sync test: capture only the beacon, so the viewer's own playback on this PC isn't re-captured.
+    if let Some(pid) = std::env::var("SS_AUDIO_ONLY_PID").ok().and_then(|v| v.parse().ok()) {
+        return match loopback::start(pid, Mode::Include, make_sink()) {
+            Ok(c) => AudioSource::Filtered(c, loopback::find_voice_app().map(|v| v.0)),
+            Err(e) => {
+                ui::audio_status(&format!("Звук не захватывается: {e:#}"));
+                AudioSource::Off
+            }
+        };
+    }
     let voice = loopback::find_voice_app();
     // With no voice app we still use process loopback (excluding ourselves) to get the same format.
     let target = voice.map(|v| v.0).unwrap_or(std::process::id());
@@ -274,6 +294,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
     let mut stat_frames = 0u32;
     let mut stat_enc = Duration::ZERO;
     let mut stat_bytes0 = 0u64;
+    let mut flash = crate::avsync::FlashEdge::default();
 
     while sh.running.load(Ordering::Relaxed) {
         // Discord started, quit or restarted: re-aim the exclusion so its voices never leak in.
@@ -320,6 +341,11 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         let t0 = Instant::now();
         let (buf, stride) = e.input()?;
         cap.compose(buf, stride);
+        if crate::avsync::enabled()
+            && flash.rising(crate::avsync::luma(buf, stride, cap.width as usize, cap.height as usize))
+        {
+            crate::avsync::log("host_video", crate::avsync::now_us());
+        }
         let key_now = force_key;
         e.encode(key_now, |data, key| {
             if tx.try_send((data.to_vec(), key, fid)).is_ok() {

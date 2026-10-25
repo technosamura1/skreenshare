@@ -133,10 +133,17 @@ impl Reassembler {
     }
 }
 
+/// Typical decode + convert + present time; the frame hold is shortened by this much.
+const DECODE_TIME: Duration = Duration::from_millis(5);
+/// Never hold video longer than this, even if audio buffering balloons.
+const MAX_SYNC_HOLD: Duration = Duration::from_millis(300);
+
 struct Picture {
     w: u32,
     h: u32,
     px: Vec<u32>,
+    /// Sync test: this picture is the first bright one of a beacon flash.
+    flash: bool,
 }
 
 struct Shared {
@@ -201,7 +208,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         frames_decoded: AtomicU64::new(0),
         losses: AtomicU64::new(0),
         win_size: AtomicU64::new((1280u64 << 32) | 720),
-        picture: Mutex::new(Picture { w: 0, h: 0, px: Vec::new() }),
+        picture: Mutex::new(Picture { w: 0, h: 0, px: Vec::new(), flash: false }),
     });
     {
         let sh = sh.clone();
@@ -221,7 +228,9 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
     };
     let audio_q = player.as_ref().map(|p| p.queue.clone());
 
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, bool)>(16);
+    // Room for the lip-sync hold (up to MAX_SYNC_HOLD of frames) plus slack.
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, bool, Instant)>(48);
+    let sync_q = audio_q.clone();
 
     // Receiver: reassembly + audio.
     {
@@ -272,8 +281,8 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     Err(e) => eprintln!("сеть: {e}"),
                 }
                 re.check_timeout(&mut ready);
-                for f in ready.drain(..) {
-                    if frame_tx.try_send(f).is_err() {
+                for (data, key) in ready.drain(..) {
+                    if frame_tx.try_send((data, key, Instant::now())).is_err() {
                         // Decoder fell behind: skip ahead to a fresh keyframe.
                         re.waiting_key = true;
                         re.losses += 1;
@@ -351,7 +360,17 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             let mut full = Scaler::new();
             let mut px: Vec<u32> = Vec::new();
             let mut done = false;
-            for (data, _key) in frame_rx {
+            let mut flash = crate::avsync::FlashEdge::default();
+            for (data, _key, arrived) in frame_rx {
+                // Lip sync: sound sits in its jitter buffer for a while, so hold each frame just as long.
+                if let Some(q) = &sync_q {
+                    let hold = q.delay().saturating_sub(DECODE_TIME).min(MAX_SYNC_HOLD);
+                    let due = arrived + hold;
+                    let now = Instant::now();
+                    if due > now {
+                        std::thread::sleep(due - now);
+                    }
+                }
                 if done {
                     break;
                 }
@@ -367,8 +386,13 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     if scaler.convert(f, dw, dh, &mut px).is_err() {
                         return;
                     }
+                    let is_flash = crate::avsync::enabled() && {
+                        let bytes = unsafe { std::slice::from_raw_parts(px.as_ptr() as *const u8, px.len() * 4) };
+                        flash.rising(crate::avsync::luma(bytes, dw as usize * 4, dw as usize, dh as usize))
+                    };
                     {
                         let mut p = sh.picture.lock().unwrap();
+                        p.flash |= is_flash;
                         p.w = dw;
                         p.h = dh;
                         std::mem::swap(&mut p.px, &mut px);
@@ -510,7 +534,8 @@ impl App {
         }
         let Ok(mut buf) = surface.buffer_mut() else { return };
         let (ww, wh) = (size.width as usize, size.height as usize);
-        let p = self.sh.picture.lock().unwrap();
+        let mut p = self.sh.picture.lock().unwrap();
+        let flash = std::mem::take(&mut p.flash);
         let (pw, ph) = (p.w as usize, p.h as usize);
         if pw == 0 || pw > ww || ph > wh || p.px.len() < pw * ph {
             buf.fill(0);
@@ -527,6 +552,9 @@ impl App {
         }
         drop(p);
         let _ = buf.present();
+        if flash {
+            crate::avsync::log("client_video", crate::avsync::now_us());
+        }
     }
 }
 
