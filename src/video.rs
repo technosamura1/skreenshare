@@ -122,6 +122,15 @@ impl Encoder {
         }
     }
 
+    /// The BGRA frame given to the encoder last time (and its row stride), read-only and without touching the
+    /// frame: valid until the next `input()`. Only meaningful after a frame has been encoded.
+    pub fn last_input(&self) -> (&[u8], usize) {
+        unsafe {
+            let stride = (*self.frame).linesize[0] as usize;
+            (std::slice::from_raw_parts((*self.frame).data[0], stride * self.height as usize), stride)
+        }
+    }
+
     pub fn encode(&mut self, force_key: bool, mut out: impl FnMut(&[u8], bool)) -> Result<()> {
         unsafe {
             (*self.frame).pts = self.pts;
@@ -329,13 +338,19 @@ impl Drop for Scaler {
 pub struct BgraScaler {
     sws: *mut SwsContext,
     key: (u32, u32, u32, u32),
+    flags: i32,
 }
 
 unsafe impl Send for BgraScaler {}
 
 impl BgraScaler {
     pub fn new() -> BgraScaler {
-        BgraScaler { sws: ptr::null_mut(), key: (0, 0, 0, 0) }
+        BgraScaler { sws: ptr::null_mut(), key: (0, 0, 0, 0), flags: 4 }
+    }
+
+    /// For big downscales (the self-preview): SWS_AREA averages the covered pixels, quick and without aliasing.
+    pub fn for_preview() -> BgraScaler {
+        BgraScaler { sws: ptr::null_mut(), key: (0, 0, 0, 0), flags: 0x20 }
     }
 
     /// `src`/`dst` are BGRA with the given row strides.
@@ -354,7 +369,7 @@ impl BgraScaler {
                     dw as i32,
                     dh as i32,
                     AVPixelFormat::AV_PIX_FMT_BGRA,
-                    4, // SWS_BICUBIC: keeps text readable when scaling
+                    self.flags, // SWS_BICUBIC (4) keeps text readable when scaling; SWS_AREA for previews
                     ptr::null_mut(),
                     ptr::null_mut(),
                     ptr::null(),

@@ -5,6 +5,9 @@
 #[path = "../../../src/audiopkt.rs"]
 mod audiopkt;
 mod legacy;
+#[path = "../../../src/preview.rs"]
+#[allow(dead_code)]
+mod preview;
 #[path = "../../../src/net.rs"]
 mod net;
 #[path = "../../../src/ratectl.rs"]

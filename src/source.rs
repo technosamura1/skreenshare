@@ -51,6 +51,14 @@ pub fn window_label(w: &WinEntry) -> String {
     }
 }
 
+/// The label under the self-preview: "Окно: <заголовок>" or "Весь экран". Same wording as in the menu.
+pub fn source_label(window_title: Option<&str>) -> String {
+    match window_title {
+        Some(t) => format!("Окно: {}", ellipsize(t, 60)),
+        None => "Весь экран".into(),
+    }
+}
+
 /// `host` arguments for a choice. `primary` is the index of the primary monitor: windows are streamed on a
 /// canvas of that monitor's size, and "the whole screen" fallback is that monitor too.
 pub fn host_args(choice: Choice, primary: usize) -> Vec<String> {
@@ -212,6 +220,16 @@ mod tests {
         let l = window_label(&win(1, &"я".repeat(200), false));
         assert_eq!(l.chars().count(), "Окно: ".chars().count() + 60);
         assert!(l.ends_with('…'));
+    }
+
+    #[test]
+    fn preview_label_names_the_source() {
+        assert_eq!(source_label(None), "Весь экран");
+        assert_eq!(source_label(Some("  Блокнот \t — a.txt ")), "Окно: Блокнот — a.txt");
+        assert_eq!(source_label(Some(&"x".repeat(100))).chars().count(), "Окно: ".chars().count() + 60);
+        // the same text as the menu entry for that window
+        let w = WinEntry { hwnd: 1, title: "Игра".into(), minimized: false };
+        assert_eq!(source_label(Some(&w.title)), window_label(&w));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::retx::{self, pacer_rate, KeyGate, Poll};
 use crate::ui::{self, Exchange};
 use crate::video::{BgraScaler, Encoder, EncoderConfig};
 use crate::wincap::WindowCapturer;
+use crate::preview;
 use anyhow::{bail, Result};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -169,7 +170,84 @@ fn open_window(h: isize) -> Result<Cap> {
 /// Switch to the full screen after the window was lost: a visible message and a fresh keyframe.
 fn fall_back_to_screen(why: &str, monitor: &MonitorInfo) -> Result<Cap> {
     ui::source_status(&format!("{why} — показываю весь экран"), true);
+    ui::source_label(&crate::source::source_label(None));
     Ok(Cap::Screen(Capturer::new(monitor)?))
+}
+
+/// The micro self-preview for the GUI. Works from the frame the encoder was just given, so it shows exactly
+/// what is sent. Cheap by design: nothing at all unless the GUI is looking (heartbeat), at most ~6.7 pictures a
+/// second, area-downscale of the frame (~ms), RGB packing, and the heavy part (compression, base64, the pipe
+/// write) on its own thread, with a one-slot queue that drops the picture when that thread is busy.
+struct Preview {
+    gate: preview::Gate,
+    scaler: BgraScaler,
+    small: Vec<u8>,
+    rgb: Vec<u8>,
+    tx: mpsc::SyncSender<(u32, u32, Vec<u8>)>,
+    /// A frame was encoded since the last picture (a static screen is not re-sent).
+    stale: bool,
+    /// The encoder holds a real frame (not the blank buffer of a just-created encoder).
+    has_frame: bool,
+    was_on: bool,
+}
+
+impl Preview {
+    fn new() -> (Preview, std::thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::sync_channel::<(u32, u32, Vec<u8>)>(1);
+        let th = std::thread::spawn(move || {
+            for (w, h, rgb) in rx {
+                if let Ok(packed) = zstd::bulk::compress(&rgb, 1) {
+                    ui::preview_line(&preview::encode_line(w, h, &packed));
+                }
+            }
+        });
+        let p = Preview {
+            gate: preview::Gate::new(),
+            scaler: BgraScaler::for_preview(),
+            small: Vec::new(),
+            rgb: Vec::new(),
+            tx,
+            stale: false,
+            has_frame: false,
+            was_on: false,
+        };
+        (p, th)
+    }
+
+    /// The encoder was (re)created: its buffer holds nothing to show yet.
+    fn reset(&mut self) {
+        self.has_frame = false;
+        self.stale = false;
+    }
+
+    /// A frame has just been encoded.
+    fn note_frame(&mut self) {
+        self.has_frame = true;
+        self.stale = true;
+    }
+
+    fn maybe(&mut self, enc: Option<&Encoder>, canvas: (u32, u32), now_ms: u64) {
+        let on = ui::preview_wanted();
+        if on && !self.was_on {
+            self.stale = self.has_frame; // window shown again: one fresh picture right away
+        }
+        self.was_on = on;
+        if !on || !self.stale || !self.has_frame || !self.gate.due(now_ms) {
+            return;
+        }
+        let Some(e) = enc else { return };
+        let t0 = Instant::now();
+        let (src, stride) = e.last_input();
+        let (pw, ph) = preview::preview_size(canvas.0, canvas.1);
+        self.small.resize(pw as usize * ph as usize * 4, 0);
+        if self.scaler.scale(src, canvas.0, canvas.1, stride, &mut self.small, pw, ph, pw as usize * 4).is_err() {
+            return;
+        }
+        preview::pack_rgb(&self.small, pw, ph, pw as usize * 4, &mut self.rgb);
+        let _ = self.tx.try_send((pw, ph, std::mem::take(&mut self.rgb))); // busy thread: skip this one
+        self.stale = false;
+        self.gate.done(now_ms, t0.elapsed().as_micros() as u64);
+    }
 }
 
 pub fn run(o: HostOpts) -> Result<()> {
@@ -330,6 +408,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
                         &format!("Показываю окно «{}» (в кадре {}×{})", crate::source::ellipsize(&title, 50), canvas.0, canvas.1),
                         false,
                     );
+                    ui::source_label(&crate::source::source_label(Some(&title)));
                     window_title = Some(title);
                     c
                 }
@@ -338,9 +417,11 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         }
         None => {
             ui::source_status("Показываю весь экран", false);
+            ui::source_label(&crate::source::source_label(None));
             Cap::Screen(Capturer::new(&monitor)?)
         }
     };
+    let (mut pv, pv_thread) = Preview::new();
     let mut scaler = BgraScaler::new();
     let mut scratch: Vec<u8> = Vec::new();
     let period = Duration::from_secs_f64(1.0 / o.fps as f64);
@@ -417,6 +498,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
                 }
                 dirty = true;
                 force_key = true;
+                pv.reset(); // the next frame is the full screen
             }
             Event::Timeout => {}
         }
@@ -430,6 +512,8 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         }
         let now = Instant::now();
         if !dirty || now < next_due {
+            // Idle moment: the right time for a preview of the last sent frame (never delays an encode).
+            pv.maybe(enc.as_ref(), canvas, sh.now_ms());
             continue;
         }
         if enc.is_none() {
@@ -441,6 +525,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
                 preset: o.preset.clone(),
             })?);
             force_key = true;
+            pv.reset();
         }
         let e = enc.as_mut().unwrap();
         let t0 = Instant::now();
@@ -475,6 +560,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         }
         force_key = false;
         dirty = false;
+        pv.note_frame();
         next_due = if now.duration_since(next_due) > period { now + period } else { next_due + period };
         stat_frames += 1;
 
@@ -499,6 +585,8 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         }
     }
     drop(audio);
+    drop(pv);
+    let _ = pv_thread.join();
     drop(tx);
     let _ = sender.join();
     let mut bye = Vec::new();

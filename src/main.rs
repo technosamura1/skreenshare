@@ -11,6 +11,7 @@ mod gui;
 mod host;
 mod loopback;
 mod net;
+mod preview;
 mod ratectl;
 mod reassembly;
 mod retx;

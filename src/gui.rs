@@ -1,6 +1,7 @@
 // Launcher window (egui). Streaming itself runs in child processes (`host --ipc` / `client --ipc`),
 // which keeps the fast viewer path untouched and lets the GUI stop them cleanly.
 use crate::capture;
+use crate::preview;
 use crate::source::{self, Choice, WinEntry};
 use crate::wincap;
 use eframe::egui::{
@@ -164,6 +165,12 @@ struct Session {
     /// What is shown (window / screen) and whether that is a fallback warning.
     source: String,
     source_warn: bool,
+    /// Self-preview: the newest `@PREVIEW` payload not decoded yet, the picture and its caption.
+    preview_raw: Option<String>,
+    preview_tex: Option<egui::TextureHandle>,
+    preview_label: String,
+    /// When the last "I'm looking" heartbeat went to the host.
+    preview_beat: Option<Instant>,
     bad_code: Option<String>,
     error: Option<String>,
     ended: bool,
@@ -181,6 +188,10 @@ impl Session {
             audio: String::new(),
             source: String::new(),
             source_warn: false,
+            preview_raw: None,
+            preview_tex: None,
+            preview_label: String::new(),
+            preview_beat: None,
             bad_code: None,
             error: None,
             ended: false,
@@ -199,6 +210,10 @@ impl Session {
                 self.stats = s.to_string();
             } else if let Some(a) = l.strip_prefix("@AUDIO ") {
                 self.audio = a.to_string();
+            } else if let Some(p) = l.strip_prefix("@PREVIEW ") {
+                self.preview_raw = Some(p.to_string()); // only the newest picture matters
+            } else if let Some(t) = l.strip_prefix("@PVLABEL ") {
+                self.preview_label = t.to_string();
             } else if let Some(a) = l.strip_prefix("@SOURCEWARN ") {
                 self.source = a.to_string();
                 self.source_warn = true;
@@ -219,6 +234,52 @@ impl Session {
 
     fn active(&self) -> bool {
         !self.ended
+    }
+
+    /// Tells the host the preview is being looked at (it makes no pictures without these), every ~1.5 s.
+    fn preview_heartbeat(&mut self) {
+        if self.preview_beat.is_none_or(|t| t.elapsed() >= Duration::from_millis(1500)) {
+            self.proc.send("PREVIEW");
+            self.preview_beat = Some(Instant::now());
+        }
+    }
+
+    /// Decodes the newest picture into the texture.
+    fn update_preview(&mut self, ctx: &egui::Context) {
+        let Some(raw) = self.preview_raw.take() else { return };
+        let Some((w, h, packed)) = preview::parse_line(&raw) else { return };
+        let Ok(rgb) = zstd::bulk::decompress(&packed, preview::rgb_len(w, h)) else { return };
+        if rgb.len() != preview::rgb_len(w, h) {
+            return;
+        }
+        let img = egui::ColorImage::from_rgb([w as usize, h as usize], &rgb);
+        match &mut self.preview_tex {
+            Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+            None => self.preview_tex = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
+        }
+    }
+}
+
+/// The micro preview of what is being sent: a 320x180 box, the picture centred in it, and what it shows.
+fn preview_box(ui: &mut egui::Ui, s: &Session) {
+    let scale = (ui.available_width() / preview::BOX_W as f32).min(1.0);
+    let size = Vec2::new(preview::BOX_W as f32, preview::BOX_H as f32) * scale;
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(8), FIELD);
+    match &s.preview_tex {
+        Some(t) => {
+            let ts = t.size_vec2() * scale;
+            let r = egui::Rect::from_center_size(rect.center(), ts);
+            ui.painter().image(t.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        None => {
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "предпросмотр загружается…", FontId::proportional(13.0), MUTED);
+        }
+    }
+    ui.painter().rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, CARD_HOVER), StrokeKind::Inside);
+    if !s.preview_label.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new(&s.preview_label).color(if s.source_warn { RED } else { TEXT }));
     }
 }
 
@@ -552,10 +613,21 @@ impl GuiApp {
         };
 
         if s.connected && !s.ended {
+            // The preview is made only while this window is visible (minimized = no heartbeat = host does nothing).
+            let minimized = ui.ctx().input(|i| i.viewport().minimized).unwrap_or(false);
+            if !minimized {
+                s.preview_heartbeat();
+                ui.ctx().request_repaint_after(Duration::from_millis(1000)); // keep the heartbeat going on a still screen
+                s.update_preview(ui.ctx());
+            }
+            let s = &*s;
             section(ui, |ui| {
                 status_dot(ui, GREEN, "Идёт трансляция");
                 ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
-                if !s.source.is_empty() {
+                ui.add_space(6.0);
+                preview_box(ui, s);
+                ui.add_space(6.0);
+                if !s.source.is_empty() && s.source_warn {
                     ui.label(RichText::new(&s.source).color(if s.source_warn { RED } else { TEXT }));
                 }
                 if !s.audio.is_empty() {

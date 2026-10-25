@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use std::io::{BufRead, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -54,13 +54,40 @@ pub fn source_status(text: &str, warn: bool) {
     }
 }
 
+/// What the self-preview is captioned with ("Окно: ..." / "Весь экран"); sent whenever the source changes.
+pub fn source_label(label: &str) {
+    if ipc() {
+        println!("@PVLABEL {label}");
+    }
+}
+
+/// One micro-preview picture for the GUI (a ready `@PREVIEW ...` line). Only in IPC mode.
+pub fn preview_line(line: &str) {
+    if ipc() {
+        println!("{line}");
+    }
+}
+
+static CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// Time of the GUI's latest "PREVIEW" heartbeat as ms + 1 (0 = never).
+static PREVIEW_BEAT: AtomicU64 = AtomicU64::new(0);
+
+fn clock_ms() -> u64 {
+    CLOCK.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// True while the GUI is looking at the preview (its heartbeat is fresh). Nobody asks in a console: no pictures.
+pub fn preview_wanted() -> bool {
+    ipc() && crate::preview::heartbeat_active(PREVIEW_BEAT.load(Ordering::Relaxed), clock_ms())
+}
+
 pub fn connected() {
     if ipc() {
         println!("@CONNECTED");
     }
 }
 
-/// In IPC mode the GUI stops us by writing STOP (or by closing our stdin).
+/// In IPC mode the GUI stops us by writing STOP (or by closing our stdin); `PREVIEW` lines are its heartbeat.
 pub fn on_stop(f: impl FnOnce() + Send + 'static) {
     if !ipc() {
         return;
@@ -73,6 +100,7 @@ pub fn on_stop(f: impl FnOnce() + Send + 'static) {
             match stdin.lock().read_line(&mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) if line.trim() == "STOP" => break,
+                Ok(_) if line.trim() == "PREVIEW" => PREVIEW_BEAT.store(clock_ms() + 1, Ordering::Relaxed),
                 Ok(_) => {}
             }
         }
