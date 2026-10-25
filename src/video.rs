@@ -324,3 +324,63 @@ impl Drop for Scaler {
         }
     }
 }
+
+/// BGRA -> BGRA resize (a captured window is scaled into its place in the fixed stream canvas).
+pub struct BgraScaler {
+    sws: *mut SwsContext,
+    key: (u32, u32, u32, u32),
+}
+
+unsafe impl Send for BgraScaler {}
+
+impl BgraScaler {
+    pub fn new() -> BgraScaler {
+        BgraScaler { sws: ptr::null_mut(), key: (0, 0, 0, 0) }
+    }
+
+    /// `src`/`dst` are BGRA with the given row strides.
+    pub fn scale(&mut self, src: &[u8], sw: u32, sh: u32, sstride: usize, dst: &mut [u8], dw: u32, dh: u32, dstride: usize) -> Result<()> {
+        unsafe {
+            let key = (sw, sh, dw, dh);
+            if self.sws.is_null() || key != self.key {
+                if !self.sws.is_null() {
+                    sws_freeContext(self.sws);
+                    self.sws = ptr::null_mut();
+                }
+                self.sws = sws_getContext(
+                    sw as i32,
+                    sh as i32,
+                    AVPixelFormat::AV_PIX_FMT_BGRA,
+                    dw as i32,
+                    dh as i32,
+                    AVPixelFormat::AV_PIX_FMT_BGRA,
+                    4, // SWS_BICUBIC: keeps text readable when scaling
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                );
+                if self.sws.is_null() {
+                    bail!("sws_getContext");
+                }
+                self.key = key;
+            }
+            if src.len() < sstride * sh as usize || dst.len() < dstride * dh as usize {
+                bail!("scaler: буфер слишком мал");
+            }
+            let s = [src.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
+            let ss = [sstride as i32, 0, 0, 0];
+            let d = [dst.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut()];
+            let ds = [dstride as i32, 0, 0, 0];
+            sws_scale(self.sws, s.as_ptr(), ss.as_ptr(), 0, sh as i32, d.as_ptr(), ds.as_ptr());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BgraScaler {
+    fn drop(&mut self) {
+        if !self.sws.is_null() {
+            unsafe { sws_freeContext(self.sws) };
+        }
+    }
+}

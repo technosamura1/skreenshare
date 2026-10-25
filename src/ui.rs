@@ -44,6 +44,16 @@ pub fn audio_status(text: &str) {
     }
 }
 
+/// What is being shown ("Показываю окно ..."), or `warn`: the chosen window was lost and the full screen is
+/// shown instead (the GUI paints that line red).
+pub fn source_status(text: &str, warn: bool) {
+    if ipc() {
+        println!("{} {text}", if warn { "@SOURCEWARN" } else { "@SOURCE" });
+    } else {
+        println!("{text}");
+    }
+}
+
 pub fn connected() {
     if ipc() {
         println!("@CONNECTED");

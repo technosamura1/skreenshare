@@ -5,7 +5,8 @@ use crate::net::{self, Code};
 use crate::ratectl::{RateControl, ReportTracker};
 use crate::retx::{self, pacer_rate, KeyGate, Poll};
 use crate::ui::{self, Exchange};
-use crate::video::{Encoder, EncoderConfig};
+use crate::video::{BgraScaler, Encoder, EncoderConfig};
+use crate::wincap::WindowCapturer;
 use anyhow::{bail, Result};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -15,6 +16,8 @@ use std::time::{Duration, Instant};
 
 pub struct HostOpts {
     pub monitor: Option<usize>,
+    /// Stream only this window (HWND). The stream keeps the monitor's resolution; the window is letterboxed in it.
+    pub window: Option<isize>,
     pub bitrate_mbps: u32,
     pub fps: u32,
     pub preset: String,
@@ -150,6 +153,23 @@ fn start_audio(make_sink: &dyn Fn() -> AudioSink) -> AudioSource {
             }
         },
     }
+}
+
+/// Where the picture comes from: the whole monitor or one window.
+enum Cap {
+    Screen(Capturer),
+    Window(Box<WindowCapturer>),
+}
+
+/// Opens window capture, or says why it can't be done (the caller then shows the full screen).
+fn open_window(h: isize) -> Result<Cap> {
+    Ok(Cap::Window(Box::new(WindowCapturer::new(h)?)))
+}
+
+/// Switch to the full screen after the window was lost: a visible message and a fresh keyframe.
+fn fall_back_to_screen(why: &str, monitor: &MonitorInfo) -> Result<Cap> {
+    ui::source_status(&format!("{why} — показываю весь экран"), true);
+    Ok(Cap::Screen(Capturer::new(monitor)?))
 }
 
 pub fn run(o: HostOpts) -> Result<()> {
@@ -297,7 +317,32 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
     let mut audio = if o.audio { start_audio(&sender_for_audio) } else { AudioSource::Off };
     let mut audio_check = Instant::now();
 
-    let mut cap = Capturer::new(&monitor)?;
+    // The stream canvas is the monitor's size whatever is shown, so going from a window back to the full screen
+    // (or the other way round) never changes the resolution the viewer gets.
+    let mut canvas = (monitor.width & !1, monitor.height & !1);
+    let mut window_title = None;
+    let mut cap = match o.window {
+        Some(h) => {
+            let title = crate::wincap::title_of(h);
+            match open_window(h) {
+                Ok(c) => {
+                    ui::source_status(
+                        &format!("Показываю окно «{}» (в кадре {}×{})", crate::source::ellipsize(&title, 50), canvas.0, canvas.1),
+                        false,
+                    );
+                    window_title = Some(title);
+                    c
+                }
+                Err(e) => fall_back_to_screen(&format!("Окно «{}» не удалось захватить ({e:#})", crate::source::ellipsize(&title, 40)), &monitor)?,
+            }
+        }
+        None => {
+            ui::source_status("Показываю весь экран", false);
+            Cap::Screen(Capturer::new(&monitor)?)
+        }
+    };
+    let mut scaler = BgraScaler::new();
+    let mut scratch: Vec<u8> = Vec::new();
     let period = Duration::from_secs_f64(1.0 / o.fps as f64);
     let mut enc: Option<Encoder> = None;
     let mut dirty = true;
@@ -333,13 +378,45 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         }
         let now = Instant::now();
         let timeout = if dirty { next_due.saturating_duration_since(now).as_millis() as u32 } else { 250 };
-        match cap.next(timeout)? {
+        let ev = match &mut cap {
+            Cap::Screen(c) => c.next(timeout)?,
+            Cap::Window(w) => match w.next(timeout) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    // Capture failure (device lost, ...): treated like a closed window.
+                    println!("захват окна: {e:#}");
+                    Event::Closed
+                }
+            },
+        };
+        match ev {
             Event::Updated => dirty = true,
             Event::Reset => {
                 dirty = true;
-                if enc.as_ref().is_some_and(|e| e.width != cap.width || e.height != cap.height) {
+                if let Cap::Screen(c) = &cap {
+                    canvas = (c.width, c.height);
+                    if enc.as_ref().is_some_and(|e| e.width != c.width || e.height != c.height) {
+                        enc = None;
+                    }
+                }
+            }
+            Event::Closed => {
+                let title = window_title.take().unwrap_or_default();
+                let why = if cap_window_gone(&cap) {
+                    format!("Окно «{}» закрыто", crate::source::ellipsize(&title, 40))
+                } else {
+                    format!("Захват окна «{}» не удался", crate::source::ellipsize(&title, 40))
+                };
+                cap = fall_back_to_screen(&why, &monitor)?;
+                canvas = match &cap {
+                    Cap::Screen(c) => (c.width, c.height),
+                    Cap::Window(_) => canvas,
+                };
+                if enc.as_ref().is_some_and(|e| (e.width, e.height) != canvas) {
                     enc = None;
                 }
+                dirty = true;
+                force_key = true;
             }
             Event::Timeout => {}
         }
@@ -357,8 +434,8 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         }
         if enc.is_none() {
             enc = Some(Encoder::new(&EncoderConfig {
-                width: cap.width,
-                height: cap.height,
+                width: canvas.0,
+                height: canvas.1,
                 fps: o.fps,
                 bitrate: (rc.cur * 1e6) as u64,
                 preset: o.preset.clone(),
@@ -368,9 +445,18 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         let e = enc.as_mut().unwrap();
         let t0 = Instant::now();
         let (buf, stride) = e.input()?;
-        cap.compose(buf, stride);
+        match &mut cap {
+            Cap::Screen(c) => c.compose(buf, stride),
+            Cap::Window(w) => {
+                let (src, size) = (w.pixels(), (w.width, w.height));
+                crate::source::draw_letterboxed(src, size, buf, stride, canvas, &mut scratch, |s, sw, sh, d, dw, dh| {
+                    scaler.scale(s, sw, sh, sw as usize * 4, d, dw, dh, dw as usize * 4).map_err(|e| format!("{e:#}"))
+                })
+                .map_err(|e| anyhow::anyhow!(e))?;
+            }
+        }
         if crate::avsync::enabled()
-            && flash.rising(crate::avsync::luma(buf, stride, cap.width as usize, cap.height as usize))
+            && flash.rising(crate::avsync::luma(buf, stride, canvas.0 as usize, canvas.1 as usize))
         {
             crate::avsync::log("host_video", crate::avsync::now_us());
         }
@@ -421,4 +507,12 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         let _ = sock.send_to(&bye, peer);
     }
     Ok(())
+}
+
+/// True when the window capture ended because the window is gone (not because the capture itself broke).
+fn cap_window_gone(cap: &Cap) -> bool {
+    match cap {
+        Cap::Window(w) => !w.alive(),
+        Cap::Screen(_) => false,
+    }
 }

@@ -15,8 +15,10 @@ mod ratectl;
 mod reassembly;
 mod retx;
 mod selftest;
+mod source;
 mod ui;
 mod video;
+mod wincap;
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -26,11 +28,12 @@ const HELP: &str = "\
 screenshare — показ экрана другу напрямую, без серверов.
 
 Без параметров — окно программы. Параметры (для продвинутых):
-  screenshare host   [--monitor N] [--bitrate МБИТ] [--fps N] [--preset p1..p7]
+  screenshare host   [--monitor N] [--window HWND] [--bitrate МБИТ] [--fps N] [--preset p1..p7]
                      [--max-send МБИТ] [--no-audio] [--exchange-dir ПАПКА]
   screenshare client [--no-audio] [--cpu-decode] [--windowed] [--exchange-dir ПАПКА]
                      [--frames N --screenshot ФАЙЛ.bmp]
   screenshare monitors
+  screenshare windows        список окон (номер HWND для --window); --window показывает только это окно
   screenshare audiotest      проверка, что звук Discord не попадает в трансляцию
   screenshare selftest [--monitor N] [--bitrate МБИТ] [--preset pN] [--cpu-decode] [--out ФАЙЛ.bmp]
 ";
@@ -92,6 +95,7 @@ fn exchange(a: &mut Args) -> Result<Exchange> {
 
 fn host_opts(a: &mut Args) -> Result<host::HostOpts> {
     Ok(host::HostOpts {
+        window: a.value("--window")?.map(|v| v.parse::<isize>()).transpose().context("--window")?,
         monitor: a.value("--monitor")?.map(|v| v.parse::<usize>()).transpose().context("--monitor")?,
         bitrate_mbps: a.num("--bitrate", 40)?,
         fps: a.num("--fps", 60)?,
@@ -130,6 +134,12 @@ fn run(mut a: Args) -> Result<()> {
             a.finish()?;
             for (i, m) in capture::list_monitors()?.iter().enumerate() {
                 println!("{i}: {}x{} {}{}", m.width, m.height, m.adapter, if m.primary { " (основной)" } else { "" });
+            }
+        }
+        "windows" => {
+            a.finish()?;
+            for w in wincap::list_windows() {
+                println!("{}: {}{}", w.hwnd, source::ellipsize(&w.title, 80), if w.minimized { " (свёрнуто)" } else { "" });
             }
         }
         "selftest" => {

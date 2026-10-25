@@ -84,6 +84,8 @@ pub enum Event {
     Updated,
     /// Duplication was lost (UAC prompt, mode change, ...) and recreated; size may differ.
     Reset,
+    /// Window capture only: the captured window no longer exists.
+    Closed,
 }
 
 impl Capturer {

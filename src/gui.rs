@@ -1,6 +1,8 @@
 // Launcher window (egui). Streaming itself runs in child processes (`host --ipc` / `client --ipc`),
 // which keeps the fast viewer path untouched and lets the GUI stop them cleanly.
 use crate::capture;
+use crate::source::{self, Choice, WinEntry};
+use crate::wincap;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
@@ -159,6 +161,9 @@ struct Session {
     connected: bool,
     stats: String,
     audio: String,
+    /// What is shown (window / screen) and whether that is a fallback warning.
+    source: String,
+    source_warn: bool,
     bad_code: Option<String>,
     error: Option<String>,
     ended: bool,
@@ -174,6 +179,8 @@ impl Session {
             connected: false,
             stats: String::new(),
             audio: String::new(),
+            source: String::new(),
+            source_warn: false,
             bad_code: None,
             error: None,
             ended: false,
@@ -192,6 +199,12 @@ impl Session {
                 self.stats = s.to_string();
             } else if let Some(a) = l.strip_prefix("@AUDIO ") {
                 self.audio = a.to_string();
+            } else if let Some(a) = l.strip_prefix("@SOURCEWARN ") {
+                self.source = a.to_string();
+                self.source_warn = true;
+            } else if let Some(a) = l.strip_prefix("@SOURCE ") {
+                self.source = a.to_string();
+                self.source_warn = false;
             } else if let Some(e) = l.strip_prefix("@BADCODE ") {
                 self.bad_code = Some(e.to_string());
             } else if let Some(e) = l.strip_prefix("@ERROR ") {
@@ -222,7 +235,12 @@ enum Page {
 struct GuiApp {
     page: Page,
     monitors: Vec<String>,
-    monitor: usize,
+    /// Index of the primary monitor ("Весь экран"; also the canvas size when one window is shown).
+    primary: usize,
+    /// "Что показывать": the choice, its text (kept in case the window vanished from the list) and the windows.
+    choice: Choice,
+    choice_label: String,
+    windows: Vec<WinEntry>,
     bitrate: u32,
     audio: bool,
     fullscreen: bool,
@@ -247,7 +265,10 @@ impl GuiApp {
         GuiApp {
             page: Page::Home,
             monitors,
-            monitor,
+            primary: monitor,
+            choice: Choice::Screen,
+            choice_label: "Весь экран".into(),
+            windows: wincap::list_windows(),
             bitrate: 40,
             audio: true,
             fullscreen: true,
@@ -270,7 +291,9 @@ impl GuiApp {
     }
 
     fn host_args(&self, sub: &str) -> Vec<String> {
-        let mut a = vec![sub.to_string(), "--monitor".into(), self.monitor.to_string(), "--bitrate".into(), self.bitrate.to_string()];
+        let mut a = vec![sub.to_string()];
+        a.extend(source::host_args(self.choice, self.primary));
+        a.extend(["--bitrate".to_string(), self.bitrate.to_string()]);
         if !self.audio {
             a.push("--no-audio".into());
         }
@@ -441,16 +464,35 @@ fn spinner_line(ui: &mut egui::Ui, text: &str) {
 impl GuiApp {
     fn settings(&mut self, ui: &mut egui::Ui, with_audio: bool) {
         section(ui, |ui| {
-            ui.label(RichText::new("Монитор").font(bold(15.0)));
+            ui.label(RichText::new("Что показывать").font(bold(15.0)));
             if self.monitors.is_empty() {
                 error_text(ui, "Мониторы не найдены");
             } else {
-                let sel = self.monitors[self.monitor.min(self.monitors.len() - 1)].clone();
-                egui::ComboBox::from_id_salt("monitor").width(ui.available_width()).selected_text(sel).show_ui(ui, |ui| {
-                    for (i, m) in self.monitors.iter().enumerate() {
-                        ui.selectable_value(&mut self.monitor, i, m);
+                let items = source::build_menu(&self.monitors, &self.windows);
+                let sel = items.iter().find(|i| i.choice == self.choice).map_or_else(|| self.choice_label.clone(), |i| i.label.clone());
+                let r = egui::ComboBox::from_id_salt("source").width(ui.available_width()).selected_text(sel).show_ui(ui, |ui| {
+                    for it in &items {
+                        if ui.selectable_label(self.choice == it.choice, &it.label).clicked() {
+                            self.choice = it.choice;
+                            self.choice_label = it.label.clone();
+                        }
                     }
                 });
+                if r.response.clicked() {
+                    // The list of windows is refreshed every time the dropdown is opened.
+                    self.windows = wincap::list_windows();
+                    ui.ctx().request_repaint();
+                }
+                if matches!(self.choice, Choice::Window(_)) {
+                    ui.label(
+                        RichText::new(
+                            "Друг увидит только это окно (картинка вписывается в кадр с чёрными полосами). \
+                             Если окно закроется — покажу весь экран.",
+                        )
+                        .color(MUTED)
+                        .size(13.0),
+                    );
+                }
             }
             ui.add_space(8.0);
             ui.label(RichText::new("Качество").font(bold(15.0)));
@@ -472,13 +514,15 @@ impl GuiApp {
         ui.label(RichText::new("screenshare").font(bold(34.0)));
         ui.label(RichText::new("Экран другу — напрямую, без серверов и регистрации").color(MUTED).size(15.0));
         ui.add_space(26.0);
-        if card_button(ui, "Показать мой экран", "Друг увидит твой экран и услышит звук") {
+        if card_button(ui, "Показать мой экран", "Весь экран или одно окно — и звук компьютера") {
+            self.windows = wincap::list_windows();
             self.page = Page::Host;
         }
         if card_button(ui, "Смотреть экран друга", "Понадобится код, который пришлёт друг") {
             self.page = Page::Join;
         }
         if card_button(ui, "Проверить на этом ПК", "Увидишь то же самое, что увидит друг") {
+            self.windows = wincap::list_windows();
             self.page = Page::Test;
         }
         ui.add_space(18.0);
@@ -511,6 +555,9 @@ impl GuiApp {
             section(ui, |ui| {
                 status_dot(ui, GREEN, "Идёт трансляция");
                 ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
+                if !s.source.is_empty() {
+                    ui.label(RichText::new(&s.source).color(if s.source_warn { RED } else { TEXT }));
+                }
                 if !s.audio.is_empty() {
                     let warn = s.audio.starts_with("Звук выключен") || s.audio.starts_with("Звук не");
                     ui.label(RichText::new(&s.audio).color(if warn { RED } else { TEXT }));

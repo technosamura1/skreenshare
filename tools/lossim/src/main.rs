@@ -14,6 +14,9 @@ mod reassembly;
 #[path = "../../../src/retx.rs"]
 mod retx;
 mod sim;
+#[path = "../../../src/source.rs"]
+#[allow(dead_code)]
+mod source;
 use sim::{Cfg, Loss, Out};
 
 fn row(label: &str, tag: &str, o: &Out) {
