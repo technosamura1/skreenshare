@@ -137,8 +137,23 @@ pub fn control_line(l: &str) -> bool {
             PREVIEW_BEAT.store(clock_ms() + 1, Ordering::Relaxed);
             false
         }
-        _ => false,
+        l => {
+            // `SOURCE ...`: change what is streamed. Only the newest request matters.
+            if let Some(r) = crate::source::SourceReq::parse(l) {
+                if let Ok(mut g) = SOURCE_REQ.lock() {
+                    *g = Some(r);
+                }
+            }
+            false
+        }
     }
+}
+
+static SOURCE_REQ: std::sync::Mutex<Option<crate::source::SourceReq>> = std::sync::Mutex::new(None);
+
+/// The newest "show something else" request from the GUI, if one arrived since the last call.
+pub fn take_source_request() -> Option<crate::source::SourceReq> {
+    SOURCE_REQ.lock().ok().and_then(|mut g| g.take())
 }
 
 /// In IPC mode the GUI stops us by writing STOP (or by closing our stdin); `PREVIEW` lines are its heartbeat.

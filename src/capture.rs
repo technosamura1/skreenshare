@@ -18,6 +18,13 @@ pub struct MonitorInfo {
     output_idx: u32,
 }
 
+impl MonitorInfo {
+    /// The same physical output (the list is re-read on every call, so compare by position, not identity).
+    pub fn same_output(&self, o: &MonitorInfo) -> bool {
+        self.adapter_idx == o.adapter_idx && self.output_idx == o.output_idx
+    }
+}
+
 fn wide_to_string(w: &[u16]) -> String {
     let end = w.iter().position(|&c| c == 0).unwrap_or(w.len());
     String::from_utf16_lossy(&w[..end])

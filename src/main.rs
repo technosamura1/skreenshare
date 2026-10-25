@@ -42,6 +42,8 @@ screenshare — показ экрана другу напрямую, без се
 Без параметров — окно программы. Параметры (для продвинутых):
   screenshare host   [--monitor N] [--window HWND] [--bitrate МБИТ] [--fps N] [--preset p1..p7]
                      [--max-send МБИТ] [--no-audio] [--exchange-dir ПАПКА]
+                     --bitrate по умолчанию 30 (окно программы даёт 30 «Стандарт» и 60 «Высокое качество»), --max-send 100.
+                     Во время показа окно программы может сменить источник: строка «SOURCE monitor N» / «SOURCE window HWND» в stdin.
   screenshare client [--no-audio] [--cpu-decode] [--cpu-convert] [--windowed] [--exchange-dir ПАПКА]
                      [--frames N --screenshot ФАЙЛ.bmp]
                      --cpu-convert (или переменная SS_CPU_CONVERT=1) — цвет и масштаб на процессоре, не на видеокарте
@@ -117,10 +119,10 @@ fn host_opts(a: &mut Args) -> Result<host::HostOpts> {
     Ok(host::HostOpts {
         window: a.value("--window")?.map(|v| v.parse::<isize>()).transpose().context("--window")?,
         monitor: a.value("--monitor")?.map(|v| v.parse::<usize>()).transpose().context("--monitor")?,
-        bitrate_mbps: a.num("--bitrate", 15)?,
+        bitrate_mbps: a.num("--bitrate", 30)?,
         fps: a.num("--fps", 60)?,
         preset: a.value("--preset")?.unwrap_or_else(|| "p4".into()),
-        max_send_mbps: a.num("--max-send", 80)?,
+        max_send_mbps: a.num("--max-send", 100)?,
         audio: !a.flag("--no-audio"),
         exchange: exchange(a)?,
     })

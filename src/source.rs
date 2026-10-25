@@ -72,6 +72,50 @@ pub fn host_args(choice: Choice, primary: usize) -> Vec<String> {
     }
 }
 
+/// A request to change what is streamed while the stream is running (GUI -> host, one stdin line).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceReq {
+    /// A monitor by its index (the "whole screen" is the primary monitor's index).
+    Monitor(usize),
+    Window(isize),
+}
+
+impl SourceReq {
+    /// The GUI's menu choice as a request; `primary` is the index of the primary monitor.
+    pub fn from_choice(c: Choice, primary: usize) -> SourceReq {
+        match c {
+            Choice::Screen => SourceReq::Monitor(primary),
+            Choice::Monitor(i) => SourceReq::Monitor(i),
+            Choice::Window(h) => SourceReq::Window(h),
+        }
+    }
+
+    /// `SOURCE monitor 1` / `SOURCE window 65814`
+    pub fn to_line(self) -> String {
+        match self {
+            SourceReq::Monitor(i) => format!("SOURCE monitor {i}"),
+            SourceReq::Window(h) => format!("SOURCE window {h}"),
+        }
+    }
+
+    pub fn parse(line: &str) -> Option<SourceReq> {
+        let mut it = line.split_whitespace();
+        if it.next()? != "SOURCE" {
+            return None;
+        }
+        let kind = it.next()?;
+        let v = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        match kind {
+            "monitor" => v.parse().ok().map(SourceReq::Monitor),
+            "window" => v.parse().ok().filter(|&h| h != 0).map(SourceReq::Window),
+            _ => None,
+        }
+    }
+}
+
 /// Shortens a window title for a menu: whitespace is collapsed, long titles end with an ellipsis.
 pub fn ellipsize(title: &str, max_chars: usize) -> String {
     let t = title.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -148,6 +192,19 @@ pub fn draw_letterboxed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_request_round_trips() {
+        for r in [SourceReq::Monitor(0), SourceReq::Monitor(2), SourceReq::Window(65814), SourceReq::Window(-5)] {
+            assert_eq!(SourceReq::parse(&r.to_line()), Some(r));
+        }
+        assert_eq!(SourceReq::parse("  SOURCE   window  12 \r\n"), Some(SourceReq::Window(12)));
+        for bad in ["", "STOP", "SOURCE", "SOURCE monitor", "SOURCE monitor x", "SOURCE window 0", "SOURCE screen 1", "SOURCE monitor 1 2", "source monitor 1"] {
+            assert_eq!(SourceReq::parse(bad), None, "{bad:?}");
+        }
+        assert_eq!(SourceReq::from_choice(Choice::Screen, 1), SourceReq::Monitor(1));
+        assert_eq!(SourceReq::from_choice(Choice::Window(7), 1), SourceReq::Window(7));
+    }
 
     #[test]
     fn same_aspect_fills_canvas() {

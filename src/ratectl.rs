@@ -223,4 +223,32 @@ mod tests {
         }
         assert_eq!(rc.cur, RateControl::MIN);
     }
+
+    /// The two presets of the GUI (30 "Стандарт", 60 "Высокое"): loss cuts the rate, a clean link brings it back to
+    /// exactly the preset and never above it.
+    #[test]
+    fn both_presets_cut_on_loss_and_recover_to_their_cap() {
+        for max in [30.0_f64, 60.0] {
+            let t = Instant::now();
+            let mut rc = RateControl::new(max, t);
+            assert_eq!(rc.cur, max);
+            let mut now = t;
+            let mut tick = |rc: &mut RateControl, dd: ReportDelta| {
+                now += Duration::from_millis(500);
+                rc.update(now, dd)
+            };
+            assert!(tick(&mut rc, d(900, 100, 40, 0)).is_some(), "loss must lower {max}");
+            assert!(rc.cur < max * 0.75, "max {max}: {}", rc.cur);
+            for _ in 0..2000 {
+                tick(&mut rc, d(1000, 0, 0, 0));
+                assert!(rc.cur <= max + 1e-9);
+            }
+            assert_eq!(rc.cur, max);
+            // a long bad spell never goes under the soft floor of the preset by much, and never under MIN
+            for _ in 0..300 {
+                tick(&mut rc, d(950, 50, 0, 0));
+            }
+            assert!(rc.cur >= max * SOFT_FLOOR * 0.85 - 1e-9 && rc.cur >= RateControl::MIN, "max {max}: {}", rc.cur);
+        }
+    }
 }

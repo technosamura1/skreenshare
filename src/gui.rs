@@ -380,7 +380,7 @@ impl GuiApp {
             choice: Choice::Screen,
             choice_label: "Весь экран".into(),
             windows: wincap::list_windows(),
-            bitrate: 15,
+            bitrate: 30,
             audio: true,
             fullscreen: true,
             host: None,
@@ -597,6 +597,50 @@ fn code_input(ui: &mut egui::Ui, input: &mut String, hint: &str) {
     );
 }
 
+/// "Что показывать" while streaming: picking another entry sends `SOURCE ...` to the host, which switches
+/// without stopping (the preview and the friend's picture follow).
+fn live_source_picker(
+    ui: &mut egui::Ui,
+    s: &mut Session,
+    choice: &mut Choice,
+    choice_label: &mut String,
+    windows: &mut Vec<WinEntry>,
+    monitors: &[String],
+    primary: usize,
+) {
+    if monitors.is_empty() {
+        return;
+    }
+    section(ui, |ui| {
+        ui.label(RichText::new("Что показывать сейчас").font(bold(15.0)));
+        let items = source::build_menu(monitors, windows);
+        // What the host really shows (it may have fallen back to the screen) beats what was clicked last.
+        let sel = if s.preview_label.is_empty() { choice_label.clone() } else { s.preview_label.clone() };
+        let mut picked = None;
+        let r = egui::ComboBox::from_id_salt("live_source").width(ui.available_width()).selected_text(sel).show_ui(ui, |ui| {
+            for it in &items {
+                if ui.selectable_label(*choice == it.choice, &it.label).clicked() {
+                    picked = Some(it.clone());
+                }
+            }
+        });
+        if r.response.clicked() {
+            *windows = wincap::list_windows(); // fresh list every time the dropdown is opened
+            ui.ctx().request_repaint();
+        }
+        if let Some(it) = picked {
+            *choice = it.choice;
+            *choice_label = it.label.clone();
+            s.proc.send(&source::SourceReq::from_choice(it.choice, primary).to_line());
+        }
+        ui.label(
+            RichText::new("Можно менять, не останавливая показ: другое окно, монитор или весь экран.")
+                .color(MUTED)
+                .size(12.5),
+        );
+    });
+}
+
 fn fps_hint(ui: &mut egui::Ui) {
     ui.label(
         RichText::new("Кадр отправляется только когда картинка меняется, поэтому на спокойном экране кадров/с меньше 60 — это нормально.")
@@ -652,17 +696,16 @@ impl GuiApp {
             ui.add_space(8.0);
             ui.label(RichText::new("Качество").font(bold(15.0)));
             ui.horizontal(|ui| {
-                for (name, v) in [("Для друга по интернету · 15", 15), ("Хороший интернет · 40", 40), ("Одна сеть · 60", 60)] {
+                for (name, v) in [("Стандарт · 30 Мбит/с", 30), ("Высокое качество · 60 Мбит/с", 60)] {
                     if ui.selectable_label(self.bitrate == v, name).clicked() {
                         self.bitrate = v;
                     }
                 }
             });
-            ui.add(egui::Slider::new(&mut self.bitrate, 8..=80).suffix(" Мбит/с"));
             ui.label(
                 RichText::new(
-                    "Это потолок: программа сама снижает качество, если у друга не успевает интернет. \
-                     Если у друга лагает — поставь 10–15. 40 и больше — только когда у обоих быстрый интернет.",
+                    "Это потолок: если у друга не успевает интернет, программа сама снижает качество, а потом возвращает. \
+                     «Высокое» — когда у обоих быстрый интернет или вы в одной сети.",
                 )
                 .color(MUTED)
                 .size(13.0),
@@ -735,6 +778,7 @@ impl GuiApp {
         if s.connected && !s.ended {
             // The preview is made only while this window is visible and the switch is on.
             drive_preview(ui.ctx(), self.show_preview, s);
+            live_source_picker(ui, s, &mut self.choice, &mut self.choice_label, &mut self.windows, &self.monitors, self.primary);
             let s = &*s;
             section(ui, |ui| {
                 status_dot(ui, GREEN, "Идёт трансляция");

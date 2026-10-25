@@ -268,6 +268,14 @@ pub fn pacer_rate(bitrate_mbps: f64, max_send_mbps: u32) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pacer_gives_both_gui_presets_their_headroom_under_the_default_cap() {
+        // default --max-send is 100: 30 -> 48 Мбит/с, 60 -> 96 Мбит/с (1.6x), nothing is clipped
+        assert_eq!(pacer_rate(30.0, 100), 48 * 125_000);
+        assert_eq!(pacer_rate(60.0, 100), 96 * 125_000);
+        assert_eq!(pacer_rate(2.0, 100), 10 * 125_000);
+    }
+
     fn drain(s: &mut Sender, mut now: Instant, rate: f64) -> (Vec<Vec<u8>>, Instant) {
         let mut out = Vec::new();
         loop {

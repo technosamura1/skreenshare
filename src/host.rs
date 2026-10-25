@@ -208,6 +208,63 @@ fn fall_back_to_screen(why: &str, monitor: &MonitorInfo) -> Result<Cap> {
     Ok(Cap::Screen(Capturer::new(monitor)?))
 }
 
+/// What a live source switch produced.
+struct Switched {
+    cap: Cap,
+    /// Set when another monitor was chosen (its size is the new canvas).
+    monitor: Option<MonitorInfo>,
+    /// The window title when a window is shown now.
+    title: Option<String>,
+    status: String,
+    label: String,
+}
+
+/// Opens the requested source *before* the running one is touched: on an error the caller just keeps streaming
+/// what it had. `current` is the monitor being streamed (the canvas of every window).
+fn open_requested(req: crate::source::SourceReq, current: &MonitorInfo, showing_screen: bool) -> Result<Option<Switched>> {
+    use crate::source::SourceReq;
+    match req {
+        SourceReq::Window(h) => {
+            let title = crate::wincap::title_of(h);
+            let c = open_window(h)?;
+            let note = match &c {
+                Cap::Window(w) if w.border == crate::wincap::BorderState::Unavailable => crate::source::BORDER_NOTE,
+                _ => "",
+            };
+            Ok(Some(Switched {
+                status: format!(
+                    "Показываю окно «{}» (в кадре {}×{}){note}",
+                    crate::source::ellipsize(&title, 50),
+                    current.width & !1,
+                    current.height & !1
+                ),
+                label: crate::source::source_label(Some(&title)),
+                cap: c,
+                monitor: None,
+                title: Some(title),
+            }))
+        }
+        SourceReq::Monitor(i) => {
+            let mut mons = capture::list_monitors()?;
+            if i >= mons.len() {
+                bail!("монитора {} нет (есть {})", i + 1, mons.len());
+            }
+            let multi = mons.len() > 1;
+            let m = mons.swap_remove(i);
+            if showing_screen && m.same_output(current) {
+                return Ok(None); // already showing exactly this
+            }
+            let c = Cap::Screen(Capturer::new(&m)?);
+            let (status, label) = if m.primary || !multi {
+                ("Показываю весь экран".to_string(), crate::source::source_label(None))
+            } else {
+                (format!("Показываю монитор {} ({}×{})", i + 1, m.width, m.height), format!("Монитор {}", i + 1))
+            };
+            Ok(Some(Switched { cap: c, monitor: Some(m), title: None, status, label }))
+        }
+    }
+}
+
 /// The micro self-preview for the GUI. Works from the frame the encoder was just given, so it shows exactly
 /// what is sent. Cheap by design: nothing at all unless the GUI is looking (heartbeat), at most ~6.7 pictures a
 /// second, area-downscale of the frame (~ms), RGB packing, and the heavy part (compression, base64, the pipe
@@ -326,7 +383,7 @@ pub fn run(o: HostOpts) -> Result<()> {
     stream(sock, peer, token, monitor, &o)
 }
 
-fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorInfo, o: &HostOpts) -> Result<()> {
+fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: MonitorInfo, o: &HostOpts) -> Result<()> {
     let sh = Arc::new(Shared {
         running: AtomicBool::new(true),
         keyreq: AtomicBool::new(true),
@@ -590,6 +647,35 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
                 pv.reset(); // the next frame is the full screen
             }
             Event::Timeout => {}
+        }
+        // The GUI asked to show something else while streaming.
+        if let Some(req) = ui::take_source_request() {
+            match open_requested(req, &monitor, matches!(cap, Cap::Screen(_))) {
+                Ok(Some(n)) => {
+                    // The old capture is released only now, after the new one works.
+                    cap = n.cap;
+                    window_title = n.title;
+                    if let Some(m) = n.monitor {
+                        monitor = m;
+                    }
+                    canvas = match &cap {
+                        // A different-size monitor changes the stream size: new encoder, the viewer follows the new SPS.
+                        Cap::Screen(c) => (c.width & !1, c.height & !1),
+                        // A window is letterboxed into the canvas of the monitor, so the size stays.
+                        Cap::Window(_) => (monitor.width & !1, monitor.height & !1),
+                    };
+                    if enc.as_ref().is_some_and(|e| (e.width, e.height) != canvas) {
+                        enc = None;
+                    }
+                    ui::source_status(&n.status, false);
+                    ui::source_label(&n.label);
+                    dirty = true;
+                    force_key = true; // the picture changes completely: a fresh reference for the viewer
+                    pv.reset();
+                }
+                Ok(None) => ui::source_status("Этот экран уже показывается", false),
+                Err(e) => ui::source_status(&format!("Не удалось переключить ({e:#}) — продолжаю показывать прежнее"), true),
+            }
         }
         // Keyframe requests are a last resort on the client now; still served at most every 500 ms.
         if sh.keyreq.swap(false, Ordering::Relaxed) {
