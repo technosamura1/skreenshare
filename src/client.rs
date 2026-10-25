@@ -1,9 +1,12 @@
 // Client side: UDP -> frame reassembly -> D3D11VA decode -> window. Audio into a jitter buffer.
+use crate::audiopkt::AudioRx;
 use crate::net::{self, Code};
+use crate::ratectl;
+use crate::reassembly::{KeyRequester, Reassembler, Stats};
+use crate::retx;
 use crate::ui::{self, Exchange};
 use crate::video::{Decoder, Scaler};
 use anyhow::Result;
-use std::collections::BTreeMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -28,206 +31,10 @@ pub struct ClientOpts {
     pub frames: Option<u64>,
 }
 
-struct Partial {
-    /// 0 = placeholder for a frame we haven't seen a single packet of yet.
-    count: u16,
-    got: u16,
-    key: bool,
-    frags: Vec<Option<Vec<u8>>>,
-    first: Instant,
-    /// Highest fragment index received: anything missing below it was lost on the way.
-    max_idx: u16,
-    last_nack: Option<Instant>,
-    nacks: u8,
-}
-
-impl Partial {
-    fn new(count: u16, key: bool) -> Partial {
-        Partial {
-            count,
-            got: 0,
-            key,
-            frags: vec![None; count as usize],
-            first: Instant::now(),
-            max_idx: 0,
-            last_nack: None,
-            nacks: 0,
-        }
-    }
-}
-
-/// Retransmission requests per missing packet before the frame is given up on.
-const MAX_NACKS: u8 = 6;
-/// Give up on a frame after this long no matter what.
-const FRAME_DEADLINE: Duration = Duration::from_millis(1000);
-
-/// Puts fragments back together and hands out frames strictly in order.
-/// Lost packets are asked for again (NACK); only if that fails it waits for the next keyframe,
-/// since later frames reference the lost one.
-pub struct Reassembler {
-    partial: BTreeMap<u32, Partial>,
-    done: BTreeMap<u32, (Vec<u8>, bool)>,
-    next: Option<u32>,
-    newest: Option<u32>,
-    pub waiting_key: bool,
-    pub losses: u64,
-    /// Fragments received / first-time missing (for the sender's bitrate control).
-    pub received: u64,
-    pub missed: u64,
-}
-
-impl Reassembler {
-    pub fn new() -> Self {
-        Reassembler {
-            partial: BTreeMap::new(),
-            done: BTreeMap::new(),
-            next: None,
-            newest: None,
-            waiting_key: true,
-            losses: 0,
-            received: 0,
-            missed: 0,
-        }
-    }
-
-    pub fn on_fragment(&mut self, fid: u32, idx: u16, count: u16, key: bool, data: &[u8], out: &mut Vec<(Vec<u8>, bool)>) {
-        if self.next.is_some_and(|n| fid < n) || self.done.contains_key(&fid) || count == 0 || idx >= count {
-            return;
-        }
-        // Frames far older than the newest are stale (e.g. a late retransmit of something given up on).
-        if self.newest.is_some_and(|nw| fid + 120 < nw) {
-            return;
-        }
-        self.newest = Some(self.newest.map_or(fid, |nw| nw.max(fid)));
-        let p = self.partial.entry(fid).or_insert_with(|| Partial::new(count, key));
-        if p.count == 0 {
-            *p = Partial { first: p.first, last_nack: p.last_nack, nacks: p.nacks, ..Partial::new(count, key) };
-        }
-        if p.count != count || p.frags[idx as usize].is_some() {
-            return;
-        }
-        p.frags[idx as usize] = Some(data.to_vec());
-        p.got += 1;
-        p.max_idx = p.max_idx.max(idx);
-        self.received += 1;
-        if p.got == p.count {
-            let p = self.partial.remove(&fid).unwrap();
-            let mut buf = Vec::with_capacity(p.count as usize * net::MAX_PAYLOAD);
-            for f in p.frags {
-                buf.extend_from_slice(&f.unwrap());
-            }
-            self.done.insert(fid, (buf, p.key));
-        }
-        // Bound memory if the stream is badly broken.
-        while self.partial.len() > 120 {
-            self.partial.pop_first();
-        }
-        self.drain(out);
-    }
-
-    /// Which packets to ask for again: (frame, fragment indices; empty = the whole frame).
-    /// Each request is repeated after a round trip if the packet still hasn't come.
-    pub fn nacks(&mut self, rtt: Duration) -> Vec<(u32, Vec<u16>)> {
-        let mut out = Vec::new();
-        let Some(newest) = self.newest else { return out };
-        let from = self.next.unwrap_or_else(|| self.partial.keys().next().copied().unwrap_or(newest));
-        let from = from.max(newest.saturating_sub(120));
-        // Frames we've never seen a packet of, while later ones are arriving: lost entirely.
-        for fid in from..newest {
-            if !self.done.contains_key(&fid) && !self.partial.contains_key(&fid) {
-                self.partial.insert(fid, Partial::new(0, false));
-            }
-        }
-        let retry = rtt + Duration::from_millis(15);
-        let now = Instant::now();
-        for (&fid, p) in self.partial.range_mut(from..) {
-            if p.nacks >= MAX_NACKS || p.last_nack.is_some_and(|t| now.duration_since(t) < retry) {
-                continue;
-            }
-            if p.count == 0 {
-                if fid < newest {
-                    out.push((fid, Vec::new()));
-                    p.last_nack = Some(now);
-                    p.nacks += 1;
-                }
-                continue;
-            }
-            // Packets go out in order, so a hole below the highest received index (or below the end,
-            // once a later frame has started) is a loss, not a packet still on its way.
-            let limit = if fid < newest { p.count } else { p.max_idx };
-            let missing: Vec<u16> = (0..limit).filter(|&i| p.frags[i as usize].is_none()).collect();
-            if !missing.is_empty() {
-                if p.nacks == 0 {
-                    self.missed += missing.len() as u64;
-                }
-                out.push((fid, missing));
-                p.last_nack = Some(now);
-                p.nacks += 1;
-            }
-        }
-        out
-    }
-
-    /// A frame that can't be completed (retransmissions failed) must not stall the stream forever.
-    pub fn check_timeout(&mut self, rtt: Duration, out: &mut Vec<(Vec<u8>, bool)>) {
-        if self.waiting_key {
-            return;
-        }
-        if let Some(n) = self.next {
-            let gave_up = self.partial.get(&n).is_some_and(|p| {
-                p.first.elapsed() > FRAME_DEADLINE
-                    || (p.nacks >= MAX_NACKS
-                        && p.last_nack.is_some_and(|t| t.elapsed() > rtt + Duration::from_millis(30)))
-            });
-            if gave_up {
-                self.lose();
-                self.drain(out);
-            }
-        }
-    }
-
-    fn lose(&mut self) {
-        self.waiting_key = true;
-        self.losses += 1;
-    }
-
-    fn drain(&mut self, out: &mut Vec<(Vec<u8>, bool)>) {
-        loop {
-            if self.waiting_key {
-                let Some(k) = self.done.iter().find(|(_, (_, key))| *key).map(|(f, _)| *f) else {
-                    // Keep only what could follow a keyframe that is still arriving.
-                    match self.partial.iter().find(|(_, p)| p.key).map(|(f, _)| *f) {
-                        Some(kp) => self.done.retain(|&f, _| f > kp),
-                        None => self.done.clear(),
-                    }
-                    return;
-                };
-                self.done = self.done.split_off(&k);
-                self.partial = self.partial.split_off(&k);
-                self.next = Some(k);
-                self.waiting_key = false;
-            }
-            let n = self.next.unwrap();
-            if let Some(f) = self.done.remove(&n) {
-                out.push(f);
-                self.next = Some(n + 1);
-                self.partial = self.partial.split_off(&(n + 1));
-                continue;
-            }
-            // Missing frames get retransmitted; only if we're a whole second ahead is it hopeless.
-            if self.done.last_key_value().is_some_and(|(&last, _)| last >= n + 60) {
-                self.lose();
-                continue;
-            }
-            return;
-        }
-    }
-}
-
-/// Audio datagram: seq u32 | rate u32 | n u16 | n samples | the previous datagram's samples (redundancy).
-/// A single lost datagram is rebuilt from the next one's copy; longer gaps become silence of the right
-/// length, so the playback buffer keeps its timing instead of jerking.
-fn receive_audio(body: &[u8], q: &crate::audio::AudioQueue, next: &mut Option<u32>, buf: &mut Vec<i16>) {
+/// Old (v0.5.0 and earlier) audio datagram, PT_AUDIO: seq u32 | rate u32 | n u16 | n samples | previous datagram's samples.
+/// Kept so a newer viewer still plays sound from an older host. A single lost datagram is rebuilt from the next
+/// one's copy; longer gaps become silence of the right length.
+fn receive_legacy_audio(body: &[u8], q: &crate::audio::AudioQueue, next: &mut Option<u32>, buf: &mut Vec<i16>) {
     let seq = u32::from_le_bytes(body[0..4].try_into().unwrap());
     let rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
     let n = u16::from_le_bytes([body[8], body[9]]) as usize;
@@ -260,6 +67,12 @@ fn receive_audio(body: &[u8], q: &crate::audio::AudioQueue, next: &mut Option<u3
     *next = Some(seq + 1);
 }
 
+fn send_ping(sock: &UdpSocket, peer: SocketAddr, token: u32, sh: &Shared, out: &mut Vec<u8>) {
+    net::write_header(out, net::PT_PING, token);
+    out.extend_from_slice(&(sh.start.elapsed().as_micros() as u64).to_le_bytes());
+    let _ = sock.send_to(out, peer);
+}
+
 /// Typical decode + convert + present time; the frame hold is shortened by this much.
 const DECODE_TIME: Duration = Duration::from_millis(5);
 /// Never hold video longer than this, even if audio buffering balloons.
@@ -281,9 +94,16 @@ struct Shared {
     rtt_us: AtomicU64,
     recv_bytes: AtomicU64,
     frames_decoded: AtomicU64,
-    losses: AtomicU64,
-    frags_received: AtomicU64,
-    frags_missed: AtomicU64,
+    /// Reassembly counters (see reassembly::Stats), mirrored for the control thread.
+    rx_received: AtomicU64,
+    rx_missed: AtomicU64,
+    rx_recovered: AtomicU64,
+    rx_residual: AtomicU64,
+    rx_gave_up: AtomicU64,
+    keyreqs: AtomicU64,
+    audio_received: AtomicU64,
+    audio_recovered: AtomicU64,
+    audio_concealed: AtomicU64,
     /// Window client size, (w << 32) | h.
     win_size: AtomicU64,
     picture: Mutex<Picture>,
@@ -335,9 +155,15 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         rtt_us: AtomicU64::new(0),
         recv_bytes: AtomicU64::new(0),
         frames_decoded: AtomicU64::new(0),
-        losses: AtomicU64::new(0),
-        frags_received: AtomicU64::new(0),
-        frags_missed: AtomicU64::new(0),
+        rx_received: AtomicU64::new(0),
+        rx_missed: AtomicU64::new(0),
+        rx_recovered: AtomicU64::new(0),
+        rx_residual: AtomicU64::new(0),
+        rx_gave_up: AtomicU64::new(0),
+        keyreqs: AtomicU64::new(0),
+        audio_received: AtomicU64::new(0),
+        audio_recovered: AtomicU64::new(0),
+        audio_concealed: AtomicU64::new(0),
         win_size: AtomicU64::new((1280u64 << 32) | 720),
         picture: Mutex::new(Picture { w: 0, h: 0, px: Vec::new(), flash: false }),
     });
@@ -372,9 +198,9 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             let mut buf = [0u8; 2048];
             let mut re = Reassembler::new();
             let mut ready = Vec::new();
+            let mut arx = AudioRx::new();
+            let mut legacy_next: Option<u32> = None;
             let mut samples: Vec<i16> = Vec::with_capacity(960);
-            let mut audio_next: Option<u32> = None;
-            let mut nack_pkt = Vec::with_capacity(1100);
             while sh.running.load(Ordering::Relaxed) {
                 match sock.recv_from(&mut buf) {
                     Ok((n, from)) => {
@@ -386,11 +212,17 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                                     let fid = u32::from_le_bytes(body[0..4].try_into().unwrap());
                                     let idx = u16::from_le_bytes([body[4], body[5]]);
                                     let count = u16::from_le_bytes([body[6], body[7]]);
-                                    re.on_fragment(fid, idx, count, body[8] & 1 != 0, &body[9..], &mut ready);
+                                    re.on_fragment(Instant::now(), fid, idx, count, body[8] & 1 != 0, &body[9..], &mut ready);
+                                }
+                                // 0x92: redundant-copy audio (v0.5.1+); 0x91: the old format, no repair possible.
+                                net::PT_AUDIO2 => {
+                                    if let Some(q) = &audio_q {
+                                        arx.on_packet(body, |s, rate| q.push(s, rate));
+                                    }
                                 }
                                 net::PT_AUDIO if body.len() >= 10 => {
                                     if let Some(q) = &audio_q {
-                                        receive_audio(body, q, &mut audio_next, &mut samples);
+                                        receive_legacy_audio(body, q, &mut legacy_next, &mut samples);
                                     }
                                 }
                                 net::PT_PONG if body.len() >= 8 => {
@@ -407,34 +239,39 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                             }
                         }
                     }
-                    Err(e) if net::is_benign(&e) => {}
+                    Err(e) if net::is_benign(&e) => {
+                        // Quiet moment: release audio packets held back for reordering.
+                        if let Some(q) = &audio_q {
+                            arx.flush(|s, rate| q.push(s, rate));
+                        }
+                    }
                     Err(e) => eprintln!("сеть: {e}"),
                 }
+                let now = Instant::now();
                 let rtt = Duration::from_micros(sh.rtt_us.load(Ordering::Relaxed));
-                for (fid, idxs) in re.nacks(rtt) {
-                    // One request per frame; a huge list is split so each datagram stays small.
-                    for part in idxs.chunks(500).map(|c| c.to_vec()).chain(idxs.is_empty().then(Vec::new)) {
-                        net::write_header(&mut nack_pkt, net::PT_NACK, token);
-                        nack_pkt.extend_from_slice(&fid.to_le_bytes());
-                        nack_pkt.extend_from_slice(&(part.len() as u16).to_le_bytes());
-                        for i in part {
-                            nack_pkt.extend_from_slice(&i.to_le_bytes());
-                        }
-                        let _ = sock.send_to(&nack_pkt, peer);
+                for (fid, idxs) in re.nacks(now, rtt) {
+                    // One request per frame (a huge list is split so each datagram stays small).
+                    for pkt in retx::nack_packets(token, fid, &idxs) {
+                        let _ = sock.send_to(&pkt, peer);
                     }
                 }
-                sh.frags_received.store(re.received, Ordering::Relaxed);
-                sh.frags_missed.store(re.missed, Ordering::Relaxed);
-                re.check_timeout(rtt, &mut ready);
+                re.check_timeout(now, rtt, &mut ready);
                 for (data, key) in ready.drain(..) {
                     if frame_tx.try_send((data, key, Instant::now())).is_err() {
                         // Decoder fell behind: skip ahead to a fresh keyframe.
-                        re.waiting_key = true;
-                        re.losses += 1;
+                        re.force_resync();
                     }
                 }
                 sh.waiting_key.store(re.waiting_key, Ordering::Relaxed);
-                sh.losses.store(re.losses, Ordering::Relaxed);
+                let st = re.stats;
+                sh.rx_received.store(st.received, Ordering::Relaxed);
+                sh.rx_missed.store(st.missed, Ordering::Relaxed);
+                sh.rx_recovered.store(st.recovered, Ordering::Relaxed);
+                sh.rx_residual.store(st.residual, Ordering::Relaxed);
+                sh.rx_gave_up.store(st.gave_up, Ordering::Relaxed);
+                sh.audio_received.store(arx.stats.received, Ordering::Relaxed);
+                sh.audio_recovered.store(arx.stats.recovered, Ordering::Relaxed);
+                sh.audio_concealed.store(arx.stats.concealed, Ordering::Relaxed);
             }
         });
     }
@@ -449,21 +286,30 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             let mut tick = 0u64;
             let mut stat_t = Instant::now();
             let (mut b0, mut f0) = (0u64, 0u64);
+            let mut keyreq = KeyRequester::new();
+            // Ping right away: the first round-trip time sets the retry timing for lost packets.
+            send_ping(&sock, peer, token, &sh, &mut out);
             while sh.running.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
                 tick += 1;
-                if sh.waiting_key.load(Ordering::Relaxed) && tick % 3 == 0 {
+                // Keyframe request: last resort, with a backoff so a bad moment doesn't become a request storm.
+                if keyreq.poll(Instant::now(), sh.waiting_key.load(Ordering::Relaxed)) {
                     net::write_header(&mut out, net::PT_KEYREQ, token);
                     let _ = sock.send_to(&out, peer);
+                    sh.keyreqs.store(keyreq.sent, Ordering::Relaxed);
                 }
                 if tick % 5 == 0 {
-                    net::write_header(&mut out, net::PT_PING, token);
-                    out.extend_from_slice(&(sh.start.elapsed().as_micros() as u64).to_le_bytes());
-                    let _ = sock.send_to(&out, peer);
+                    send_ping(&sock, peer, token, &sh, &mut out);
                     // Loss report for the sender's bitrate control (totals; the host takes differences).
-                    net::write_header(&mut out, net::PT_REPORT, token);
-                    out.extend_from_slice(&sh.frags_received.load(Ordering::Relaxed).to_le_bytes());
-                    out.extend_from_slice(&sh.frags_missed.load(Ordering::Relaxed).to_le_bytes());
+                    let st = Stats {
+                        received: sh.rx_received.load(Ordering::Relaxed),
+                        missed: sh.rx_missed.load(Ordering::Relaxed),
+                        recovered: sh.rx_recovered.load(Ordering::Relaxed),
+                        residual: sh.rx_residual.load(Ordering::Relaxed),
+                        gave_up: sh.rx_gave_up.load(Ordering::Relaxed),
+                        requested: 0,
+                    };
+                    ratectl::encode_report(&st, &mut out);
                     let _ = sock.send_to(&out, peer);
                 }
                 if sh.now_ms().saturating_sub(sh.last_seen_ms.load(Ordering::Relaxed)) > 10_000 {
@@ -474,12 +320,21 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     let secs = stat_t.elapsed().as_secs_f64();
                     let b = sh.recv_bytes.load(Ordering::Relaxed);
                     let f = sh.frames_decoded.load(Ordering::Relaxed);
+                    let (rx, miss, rec) = (
+                        sh.rx_received.load(Ordering::Relaxed),
+                        sh.rx_missed.load(Ordering::Relaxed),
+                        sh.rx_recovered.load(Ordering::Relaxed),
+                    );
                     ui::stat(&format!(
-                        "{:.0} кадров/с · {:.1} Мбит/с · пинг {:.0} мс · потерь {}",
+                        "{:.0} кадров/с · {:.1} Мбит/с · пинг {:.0} мс · потери сети {:.1}% (докачано {}, ключевых запросов {}) · звук: восст. {}, заглушено {}",
                         (f - f0) as f64 / secs,
                         (b - b0) as f64 * 8.0 / secs / 1e6,
                         sh.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0,
-                        sh.losses.load(Ordering::Relaxed),
+                        miss as f64 * 100.0 / (rx + miss).max(1) as f64,
+                        rec,
+                        sh.keyreqs.load(Ordering::Relaxed),
+                        sh.audio_recovered.load(Ordering::Relaxed),
+                        sh.audio_concealed.load(Ordering::Relaxed),
                     ));
                     (b0, f0) = (b, f);
                     stat_t = Instant::now();
@@ -728,68 +583,4 @@ pub fn write_bmp(path: &std::path::Path, w: u32, h: u32, px: &[u32]) -> std::io:
         f.extend_from_slice(&p.to_le_bytes());
     }
     std::fs::write(path, f)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn feed(r: &mut Reassembler, fid: u32, key: bool, n: u16, out: &mut Vec<(Vec<u8>, bool)>) {
-        for i in 0..n {
-            r.on_fragment(fid, i, n, key, &[fid as u8], out);
-        }
-    }
-
-    #[test]
-    fn in_order_after_key() {
-        let mut r = Reassembler::new();
-        let mut out = Vec::new();
-        feed(&mut r, 0, false, 2, &mut out); // non-key before any keyframe is useless
-        assert!(out.is_empty());
-        feed(&mut r, 1, true, 3, &mut out);
-        feed(&mut r, 2, false, 2, &mut out);
-        assert_eq!(out.len(), 2);
-        assert!(out[0].1);
-        assert_eq!(out[0].0, vec![1, 1, 1]);
-    }
-
-    #[test]
-    fn loss_waits_for_key() {
-        let mut r = Reassembler::new();
-        let mut out = Vec::new();
-        feed(&mut r, 0, true, 1, &mut out);
-        r.on_fragment(1, 0, 2, false, &[1], &mut out); // frame 1 never completes
-        for f in 2..62 {
-            feed(&mut r, f, false, 1, &mut out);
-        }
-        // A whole second of newer frames and still no frame 1: give up, wait for a keyframe.
-        assert_eq!(out.len(), 1);
-        assert!(r.waiting_key);
-        feed(&mut r, 62, false, 1, &mut out);
-        feed(&mut r, 63, true, 1, &mut out);
-        feed(&mut r, 64, false, 1, &mut out);
-        assert_eq!(out.len(), 3);
-        assert!(out[1].1);
-        assert!(!r.waiting_key);
-    }
-
-    #[test]
-    fn nacks_holes_and_missing_frames_then_recovers() {
-        let mut r = Reassembler::new();
-        let mut out = Vec::new();
-        feed(&mut r, 0, true, 1, &mut out);
-        r.on_fragment(1, 0, 3, false, &[1], &mut out);
-        r.on_fragment(1, 2, 3, false, &[1], &mut out); // fragment 1 of frame 1 lost
-        feed(&mut r, 3, false, 1, &mut out); // frame 2 lost entirely
-        let mut n = r.nacks(Duration::ZERO);
-        n.sort();
-        assert_eq!(n, vec![(1, vec![1]), (2, vec![])]);
-        assert!(r.nacks(Duration::ZERO).is_empty(), "no repeat before a round trip has passed");
-        // Retransmissions arrive: everything comes out in order, no keyframe needed.
-        r.on_fragment(1, 1, 3, false, &[1], &mut out);
-        feed(&mut r, 2, false, 2, &mut out);
-        assert_eq!(out.len(), 4);
-        assert!(!r.waiting_key);
-        assert_eq!(r.losses, 0);
-    }
 }

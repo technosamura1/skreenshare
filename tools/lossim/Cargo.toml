@@ -1,0 +1,17 @@
+# Protocol simulator for packet-loss resilience. Runs on any OS (no Windows APIs):
+#   cd tools/lossim && cargo test --release && cargo run --release -- table
+[package]
+name = "lossim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+getrandom = "0.3"
+socket2 = "0.6"
+
+[workspace]
+
+[profile.release]
+debug = false

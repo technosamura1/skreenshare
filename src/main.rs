@@ -2,6 +2,7 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod audiopkt;
 mod avsync;
 mod bundle;
 mod capture;
@@ -10,6 +11,9 @@ mod gui;
 mod host;
 mod loopback;
 mod net;
+mod ratectl;
+mod reassembly;
+mod retx;
 mod selftest;
 mod ui;
 mod video;

@@ -12,14 +12,17 @@ pub const MAX_PAYLOAD: usize = 1200;
 pub const PT_PUNCH: u8 = 0x81;
 pub const PT_PUNCH_ACK: u8 = 0x82;
 pub const PT_VIDEO: u8 = 0x90;
-pub const PT_AUDIO: u8 = 0x91;
+pub const PT_AUDIO: u8 = 0x91; // legacy (v0.5.0 and older): seq u32 | rate u32 | samples
+/// Audio with loss protection, see audiopkt.rs.
+pub const PT_AUDIO2: u8 = 0x92;
 pub const PT_KEYREQ: u8 = 0xA0;
 pub const PT_PING: u8 = 0xA1;
 pub const PT_PONG: u8 = 0xA2;
 pub const PT_BYE: u8 = 0xA3;
 /// Client -> host: resend these fragments. frame_id u32 | n u16 | n × frag_idx u16 (n = 0: whole frame).
 pub const PT_NACK: u8 = 0xA4;
-/// Client -> host: totals of fragments received / found missing, for bitrate control.
+/// Client -> host: running totals (u64 each): fragments received | found missing | still missing after a
+/// repeat request | frames given up on. Older clients send only the first two.
 pub const PT_REPORT: u8 = 0xA5;
 
 pub const ROLE_HOST: u8 = 1;
@@ -38,16 +41,44 @@ const STUN_SERVERS: &[&str] = &[
 ];
 const STUN_COOKIE: u32 = 0x2112_A442;
 
-/// Test hook: SS_SIM_LOSS=0.02 drops 2% of the media packets we send, to rehearse a bad connection.
-fn sim_loss() -> f64 {
-    static P: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *P.get_or_init(|| std::env::var("SS_SIM_LOSS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
+/// Test hook: SS_SIM_LOSS=0.02 makes the host drop 2% of the media packets it sends (off by default), to
+/// rehearse a bad connection. Optional SS_SIM_BURST=4 makes the losses come in bursts of ~4 packets on average
+/// (same overall rate), like Wi-Fi or an overfull router queue.
+fn sim_cfg() -> (f64, f64) {
+    static P: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let get = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().replace(',', ".").parse::<f64>().ok());
+        let loss = get("SS_SIM_LOSS").unwrap_or(0.0).clamp(0.0, 0.95);
+        (loss, get("SS_SIM_BURST").unwrap_or(1.0).max(1.0))
+    })
+}
+
+fn rand01() -> f64 {
+    u32::from_le_bytes(random_bytes::<4>()) as f64 / (u32::MAX as f64 + 1.0)
+}
+
+/// Whether the loss simulation eats this packet. A two-state chain: "bad" drops everything.
+fn sim_drop() -> bool {
+    static BAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let (p, burst) = sim_cfg();
+    if p <= 0.0 {
+        return false;
+    }
+    if burst <= 1.0 {
+        return rand01() < p;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let leave = 1.0 / burst; // mean bad-run length = burst
+    let enter = p * leave / (1.0 - p); // stationary share of "bad" = p
+    let bad = BAD.load(Relaxed);
+    let next = if bad { rand01() >= leave } else { rand01() < enter };
+    BAD.store(next, Relaxed);
+    next
 }
 
 /// send_to for media packets (subject to the loss simulation).
 pub fn send_media(sock: &UdpSocket, pkt: &[u8], to: SocketAddr) {
-    let p = sim_loss();
-    if p > 0.0 && (u32::from_le_bytes(random_bytes::<4>()) as f64 / u32::MAX as f64) < p {
+    if sim_drop() {
         return;
     }
     let _ = sock.send_to(pkt, to);
@@ -302,7 +333,7 @@ pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], t
                 }
             }
             // The other side already decided we're connected and started talking.
-            PT_VIDEO | PT_AUDIO | PT_KEYREQ | PT_PING | PT_PONG => return Ok(from),
+            PT_VIDEO | PT_AUDIO | PT_AUDIO2 | PT_KEYREQ | PT_PING | PT_PONG | PT_NACK | PT_REPORT => return Ok(from),
             _ => {}
         }
     }

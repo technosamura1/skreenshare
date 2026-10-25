@@ -1,6 +1,9 @@
 // Host side: capture -> NVENC -> paced UDP. Audio goes straight from the WASAPI callback.
 use crate::capture::{self, Capturer, Event, MonitorInfo};
+use crate::audiopkt::AudioTx;
 use crate::net::{self, Code};
+use crate::ratectl::{RateControl, ReportTracker};
+use crate::retx::{self, pacer_rate, KeyGate, Poll};
 use crate::ui::{self, Exchange};
 use crate::video::{Encoder, EncoderConfig};
 use anyhow::{bail, Result};
@@ -52,90 +55,11 @@ struct Shared {
     last_seen_ms: AtomicU64,
     sent_bytes: AtomicU64,
     resent: AtomicU64,
-    /// Packet loss in the last client report, in 1/10000.
+    /// Raw packet loss in the last client reports, in 1/10000 (for the status line).
     loss_bp: AtomicU32,
-    reports: AtomicU32,
     /// Pacer rate, bytes per second.
     send_rate: AtomicU64,
 }
-
-/// Sends video datagrams no faster than `send_rate`, so bursts (keyframes) don't overflow the
-/// router queue on the way — that would turn into exactly the packet loss we're trying to avoid.
-struct Pacer {
-    tokens: f64,
-    last: Instant,
-}
-
-impl Pacer {
-    const BURST: f64 = 48.0 * 1300.0;
-
-    fn wait(&mut self, need: usize, rate: f64) {
-        let need = need as f64;
-        loop {
-            let now = Instant::now();
-            self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * rate).min(Self::BURST);
-            self.last = now;
-            if self.tokens >= need {
-                self.tokens -= need;
-                return;
-            }
-            if (need - self.tokens) / rate > 0.002 {
-                std::thread::sleep(Duration::from_millis(1));
-            } else {
-                std::thread::yield_now();
-            }
-        }
-    }
-}
-
-/// Pacer speed for a given video bitrate: room for keyframe bursts and retransmissions, within the cap.
-fn pacer_rate(bitrate_mbps: f64, max_send_mbps: u32) -> u64 {
-    ((bitrate_mbps * 2.0).max(10.0).min(max_send_mbps as f64) * 125_000.0) as u64
-}
-
-/// Bitrate control: back off when the client reports loss (the link is overfull), creep back up
-/// when the link has been clean for a while.
-struct RateControl {
-    max: f64,
-    cur: f64,
-    last_down: Instant,
-    clean_since: Instant,
-    reports_seen: u32,
-}
-
-impl RateControl {
-    const MIN: f64 = 3.0;
-
-    fn new(max: f64) -> Self {
-        RateControl { max, cur: max, last_down: Instant::now(), clean_since: Instant::now(), reports_seen: 0 }
-    }
-
-    /// Feed the latest report; returns the new target bitrate if it changed.
-    fn update(&mut self, reports: u32, loss: f64) -> Option<f64> {
-        if reports == self.reports_seen {
-            return None;
-        }
-        self.reports_seen = reports;
-        let before = self.cur;
-        let now = Instant::now();
-        if loss > 0.03 {
-            if now.duration_since(self.last_down) > Duration::from_secs(1) {
-                self.cur = (self.cur * if loss > 0.08 { 0.7 } else { 0.85 }).max(Self::MIN);
-                self.last_down = now;
-            }
-            self.clean_since = now;
-        } else if loss > 0.005 {
-            self.clean_since = now;
-        } else if now.duration_since(self.clean_since) > Duration::from_secs(4) {
-            self.cur = (self.cur * 1.1).min(self.max);
-            self.clean_since = now;
-        }
-        (self.cur != before).then_some(self.cur)
-    }
-}
-
-/// How many recent frames we keep for retransmission (~4 s at 60 fps).
-const HISTORY_FRAMES: usize = 240;
 
 impl Shared {
     fn now_ms(&self) -> u64 {
@@ -163,14 +87,9 @@ impl AudioSource {
 
 type AudioSink = Box<dyn FnMut(&[i16], u32) + Send>;
 
-/// Samples per audio datagram: 120 stereo frames = 2.5 ms. Small, because each datagram also
-/// carries the previous one's samples so a single lost packet can be rebuilt by the client.
-const AUDIO_CHUNK: usize = 240;
-
 fn audio_sender(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, sh: Arc<Shared>, seq: Arc<AtomicU32>) -> AudioSink {
-    let mut pending: Vec<i16> = Vec::new();
-    let mut prev: Vec<i16> = Vec::new();
-    let mut pkt = Vec::with_capacity(1100);
+    // Every datagram carries the previous one's samples too (see audiopkt.rs), so one lost packet is rebuilt.
+    let mut tx = AudioTx::new(token, seq);
     let mut beep = crate::avsync::BeepEdge::new(48_000);
     Box::new(move |samples, rate| {
         if crate::avsync::enabled() {
@@ -182,20 +101,10 @@ fn audio_sender(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, sh: Arc<Shar
                 }
             }
         }
-        pending.extend_from_slice(samples);
-        while pending.len() >= AUDIO_CHUNK {
-            let cur: Vec<i16> = pending.drain(..AUDIO_CHUNK).collect();
-            net::write_header(&mut pkt, net::PT_AUDIO, token);
-            pkt.extend_from_slice(&seq.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-            pkt.extend_from_slice(&rate.to_le_bytes());
-            pkt.extend_from_slice(&(AUDIO_CHUNK as u16).to_le_bytes());
-            for s in cur.iter().chain(prev.iter()) {
-                pkt.extend_from_slice(&s.to_le_bytes());
-            }
-            prev = cur;
-            net::send_media(&sock, &pkt, peer);
+        tx.push(samples, rate, |pkt| {
+            net::send_media(&sock, pkt, peer);
             sh.sent_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
-        }
+        });
     })
 }
 
@@ -280,7 +189,6 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         sent_bytes: AtomicU64::new(0),
         resent: AtomicU64::new(0),
         loss_bp: AtomicU32::new(0),
-        reports: AtomicU32::new(0),
         send_rate: AtomicU64::new(pacer_rate(o.bitrate_mbps as f64, o.max_send_mbps)),
     });
     {
@@ -288,6 +196,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         ui::on_stop(move || sh.running.store(false, Ordering::Relaxed));
     }
     let (nack_tx, nack_rx) = mpsc::channel::<(u32, Vec<u16>)>();
+    let (rep_tx, rep_rx) = mpsc::channel::<crate::ratectl::ReportDelta>();
 
     // Control channel from the client.
     {
@@ -297,7 +206,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
             let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
             let mut buf = [0u8; 2048];
             let mut out = Vec::with_capacity(64);
-            let mut last_report = (0u64, 0u64);
+            let mut tracker = ReportTracker::default();
             while sh.running.load(Ordering::Relaxed) {
                 if sh.now_ms().saturating_sub(sh.last_seen_ms.load(Ordering::Relaxed)) > 10_000 {
                     println!("Связь с другом потеряна.");
@@ -322,23 +231,15 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
                         let _ = sock.send_to(&out, from);
                     }
                     net::PT_PUNCH => net::answer_punch(&sock, token, net::ROLE_HOST, body, from),
-                    net::PT_NACK if body.len() >= 6 => {
-                        let fid = u32::from_le_bytes(body[0..4].try_into().unwrap());
-                        let n = u16::from_le_bytes([body[4], body[5]]) as usize;
-                        let idxs: Vec<u16> =
-                            body[6..].chunks_exact(2).take(n).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-                        let _ = nack_tx.send((fid, idxs));
+                    net::PT_NACK => {
+                        if let Some(n) = retx::parse_nack(body) {
+                            let _ = nack_tx.send(n);
+                        }
                     }
-                    net::PT_REPORT if body.len() >= 16 => {
-                        let got = u64::from_le_bytes(body[0..8].try_into().unwrap());
-                        let missed = u64::from_le_bytes(body[8..16].try_into().unwrap());
-                        let (dg, dm) = (got.saturating_sub(last_report.0), missed.saturating_sub(last_report.1));
-                        if got >= last_report.0 {
-                            last_report = (got, missed);
-                            if dg + dm > 0 {
-                                sh.loss_bp.store((dm * 10_000 / (dg + dm)) as u32, Ordering::Relaxed);
-                                sh.reports.fetch_add(1, Ordering::Relaxed);
-                            }
+                    net::PT_REPORT => {
+                        if let Some(d) = tracker.on_report(body) {
+                            sh.loss_bp.store((d.missed * 10_000 / d.total().max(1)) as u32, Ordering::Relaxed);
+                            let _ = rep_tx.send(d);
                         }
                     }
                     net::PT_BYE => {
@@ -351,58 +252,41 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         });
     }
 
-    // Paced sender. Keeps recent frames' datagrams so packets the client reports lost can be resent.
+    // Paced sender. Keeps recent frames' datagrams so packets the client reports lost can be resent
+    // (retransmissions go out before new frames, see retx.rs).
     let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, bool, u32)>(6);
     let sender = {
         let sock = sock.clone();
         let sh = sh.clone();
         std::thread::spawn(move || {
-            let mut pacer = Pacer { tokens: Pacer::BURST, last: Instant::now() };
-            let mut history: std::collections::VecDeque<(u32, Vec<Vec<u8>>)> = Default::default();
-            let mut send = |pacer: &mut Pacer, p: &[u8]| {
-                pacer.wait(p.len(), sh.send_rate.load(Ordering::Relaxed) as f64);
-                net::send_media(&sock, p, peer);
-                sh.sent_bytes.fetch_add(p.len() as u64, Ordering::Relaxed);
-            };
+            let mut s = retx::Sender::new(token, Instant::now());
+            let mut closed = false;
             loop {
-                // Retransmissions first: the client is waiting on them.
+                let now = Instant::now();
                 while let Ok((fid, idxs)) = nack_rx.try_recv() {
-                    let Some((_, pkts)) = history.iter().find(|(f, _)| *f == fid) else { continue };
-                    let all: Vec<u16>;
-                    let list = if idxs.is_empty() {
-                        all = (0..pkts.len() as u16).collect();
-                        &all
-                    } else {
-                        &idxs
-                    };
-                    for &i in list {
-                        if let Some(p) = pkts.get(i as usize) {
-                            send(&mut pacer, p);
-                            sh.resent.fetch_add(1, Ordering::Relaxed);
-                        }
+                    s.on_nack(now, fid, &idxs);
+                }
+                if !s.busy() && !closed {
+                    match rx.try_recv() {
+                        Ok((data, key, fid)) => s.push_frame(fid, key, &data),
+                        Err(mpsc::TryRecvError::Empty) => {}
+                        Err(mpsc::TryRecvError::Disconnected) => closed = true,
                     }
                 }
-                let (data, key, fid) = match rx.recv_timeout(Duration::from_millis(2)) {
-                    Ok(f) => f,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                };
-                let count = data.len().div_ceil(net::MAX_PAYLOAD).max(1);
-                let mut pkts = Vec::with_capacity(count);
-                for (i, chunk) in data.chunks(net::MAX_PAYLOAD).enumerate() {
-                    let mut pkt = Vec::with_capacity(net::VIDEO_HEADER_LEN + chunk.len());
-                    net::write_header(&mut pkt, net::PT_VIDEO, token);
-                    pkt.extend_from_slice(&fid.to_le_bytes());
-                    pkt.extend_from_slice(&(i as u16).to_le_bytes());
-                    pkt.extend_from_slice(&(count as u16).to_le_bytes());
-                    pkt.push(key as u8);
-                    pkt.extend_from_slice(chunk);
-                    send(&mut pacer, &pkt);
-                    pkts.push(pkt);
-                }
-                history.push_back((fid, pkts));
-                while history.len() > HISTORY_FRAMES {
-                    history.pop_front();
+                match s.poll(now, sh.send_rate.load(Ordering::Relaxed) as f64) {
+                    Poll::Send(p) => {
+                        net::send_media(&sock, &p, peer);
+                        sh.sent_bytes.fetch_add(p.len() as u64, Ordering::Relaxed);
+                        sh.resent.store(s.resent, Ordering::Relaxed);
+                    }
+                    Poll::Wait(d) if d > Duration::from_millis(2) => std::thread::sleep(Duration::from_millis(1)),
+                    Poll::Wait(_) => std::thread::yield_now(),
+                    Poll::Idle if closed => break,
+                    Poll::Idle => match rx.recv_timeout(Duration::from_millis(2)) {
+                        Ok((data, key, fid)) => s.push_frame(fid, key, &data),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => closed = true,
+                    },
                 }
             }
         })
@@ -419,23 +303,25 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
     let mut dirty = true;
     let mut force_key = true;
     let mut next_due = Instant::now();
-    let mut last_key = Instant::now() - Duration::from_secs(1);
+    let mut gate = KeyGate::new(Instant::now());
     let mut fid = 0u32;
     let mut stat_t = Instant::now();
     let mut stat_frames = 0u32;
     let mut stat_enc = Duration::ZERO;
     let mut stat_bytes0 = 0u64;
     let mut flash = crate::avsync::FlashEdge::default();
-    let mut rc = RateControl::new(o.bitrate_mbps as f64);
+    let mut rc = RateControl::new(o.bitrate_mbps as f64, Instant::now());
     let mut stat_resent0 = 0u64;
 
     while sh.running.load(Ordering::Relaxed) {
         let loss = sh.loss_bp.load(Ordering::Relaxed) as f64 / 10_000.0;
-        if let Some(mbps) = rc.update(sh.reports.load(Ordering::Relaxed), loss) {
-            if let Some(e) = enc.as_mut() {
-                e.set_bitrate((mbps * 1e6) as u64);
+        while let Ok(d) = rep_rx.try_recv() {
+            if let Some(mbps) = rc.update(Instant::now(), d) {
+                if let Some(e) = enc.as_mut() {
+                    e.set_bitrate((mbps * 1e6) as u64);
+                }
+                sh.send_rate.store(pacer_rate(mbps, o.max_send_mbps), Ordering::Relaxed);
             }
-            sh.send_rate.store(pacer_rate(mbps, o.max_send_mbps), Ordering::Relaxed);
         }
         // Discord started, quit or restarted: re-aim the exclusion so its voices never leak in.
         if o.audio && audio_check.elapsed() > Duration::from_secs(3) {
@@ -457,9 +343,11 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
             }
             Event::Timeout => {}
         }
-        // Rate-limit forced keyframes: the client re-asks every few hundred ms while waiting.
-        if sh.keyreq.load(Ordering::Relaxed) && last_key.elapsed() > Duration::from_millis(250) {
-            sh.keyreq.store(false, Ordering::Relaxed);
+        // Keyframe requests are a last resort on the client now; still served at most every 500 ms.
+        if sh.keyreq.swap(false, Ordering::Relaxed) {
+            gate.request();
+        }
+        if gate.take(Instant::now()) {
             force_key = true;
             dirty = true;
         }
@@ -497,7 +385,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         })?;
         stat_enc += t0.elapsed();
         if key_now {
-            last_key = Instant::now();
+            gate.note_key(Instant::now());
         }
         force_key = false;
         dirty = false;
