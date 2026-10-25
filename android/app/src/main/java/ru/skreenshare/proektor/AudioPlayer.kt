@@ -30,6 +30,8 @@ class AudioPlayer(private val rate: Int, private val channels: Int) {
     private val bytesPerMs = rate * channels * 2 / 1000
     private val frameBytes = channels * 2
     private val timeline = AudioTimeline(rate)
+    /** Last ~5 ms that went to the speaker: the material for concealing a hole (see [Plc]). */
+    private var tail: ByteArray? = null
 
     @Volatile private var lastWriteNanos = 0L
     private val clockLock = Any()
@@ -103,6 +105,13 @@ class AudioPlayer(private val rate: Int, private val channels: Int) {
         lastWriteNanos = System.nanoTime()
     }
 
+    /** Fills a hole of [frames] sample frames with a faded repeat of the last audio instead of a hard cut to silence. */
+    private fun writeConceal(frames: Int) {
+        val c = Plc.conceal(tail, frames, channels, rate)
+        writeAll(c, 0, c.size)
+        tail = null // what follows is a fresh start
+    }
+
     private fun writeSilence(frames: Int) {
         var left = frames
         val z = ByteArray(minOf(frames, 4800) * frameBytes)
@@ -142,9 +151,11 @@ class AudioPlayer(private val rate: Int, private val channels: Int) {
                 val plan = timeline.plan(item.tsMs, frames, resync)
                 resync = false
                 if (plan.drop) continue
-                if (plan.silenceFrames > 0) writeSilence(plan.silenceFrames)
+                if (plan.silenceFrames > 0) writeConceal(plan.silenceFrames)
                 val skip = plan.skipFrames * frameBytes
                 writeAll(data, skip, frames * frameBytes - skip) // blocks when the track's buffer is full: this paces us
+                val end = frames * frameBytes
+                tail = data.copyOfRange(maxOf(skip, end - bytesPerMs * 5 / frameBytes * frameBytes), end)
             }
         } catch (e: Throwable) {
             if (running) Log.w(TAG, "audio: $e")

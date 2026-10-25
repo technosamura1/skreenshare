@@ -1,14 +1,21 @@
 // One streaming session: capture -> NVENC H.264 -> paced UDP to the projector, plus system audio, plus a
-// small control thread (keyframe requests, keep-alive, receiver reports).
+// small control thread (packet re-requests, keyframe requests, keep-alive, receiver reports).
+//
+// Loss handling (v0.4): every video packet goes into a ring buffer of the last ~300 ms; when the projector sends a
+// NACK for some (frame, packet) pairs only those are re-sent (rate-limited). A whole keyframe is only produced when
+// the projector says a frame could not be recovered, and never more often than every 500 ms.
+// `SS_SIM_LOSS=0.05` makes this sender drop 5 % of everything it sends (video, audio, re-sends) to test all of it.
 use crate::capture::{self, Capturer, Event, Source};
 use crate::wincap::WindowCapturer;
 use crate::video::{Encoder, EncoderConfig, Scaler};
 use anyhow::{anyhow, bail, Result};
 use proto as p;
+use proto::loss::LossSim;
 use proto::rate::{RateController, Sample};
+use proto::retx::{RetxBuffer, RetxLimiter};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -60,6 +67,18 @@ struct Shared {
     report_seq: AtomicU64,
     /// Current encoder target, kbit/s (the paced sender follows it).
     target_kbps: AtomicU32,
+    /// Features both sides agreed on in the handshake (`proto::FEAT_*`).
+    features: AtomicU8,
+    /// Last ~300 ms of video packets, for NACK re-sends.
+    retx: Mutex<RetxBuffer>,
+    retx_limit: Mutex<RetxLimiter>,
+    /// Test aid: drops a share of everything sent (env `SS_SIM_LOSS`, off by default).
+    sim: Mutex<LossSim>,
+    /// Counters (cumulative): original video packets, re-sent packets, re-sends refused by the limiter, NACK items.
+    video_pkts: AtomicU64,
+    retx_pkts: AtomicU64,
+    retx_refused: AtomicU64,
+    nack_items: AtomicU64,
     status: Mutex<Status>,
     repaint: Box<dyn Fn() + Send + Sync>,
 }
@@ -70,6 +89,17 @@ impl Shared {
     }
     fn now_ms_f(&self) -> f64 {
         self.start.elapsed().as_secs_f64() * 1000.0
+    }
+    fn nack_on(&self) -> bool {
+        self.features.load(Ordering::Relaxed) & p::FEAT_NACK != 0
+    }
+    /// Sends one media packet (video, audio, re-send), through the loss simulator when `SS_SIM_LOSS` is set.
+    fn send_media(&self, sock: &UdpSocket, peer: SocketAddr, pkt: &[u8]) {
+        self.sent_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+        if self.sim.lock().unwrap().drop_next() {
+            return;
+        }
+        let _ = sock.send_to(pkt, peer);
     }
     fn set(&self, f: impl FnOnce(&mut Status)) {
         f(&mut self.status.lock().unwrap());
@@ -95,6 +125,16 @@ impl Stream {
             report: Mutex::new(None),
             report_seq: AtomicU64::new(0),
             target_kbps: AtomicU32::new(20_000),
+            features: AtomicU8::new(0),
+            retx: Mutex::new(RetxBuffer::new(300)),
+            retx_limit: Mutex::new(RetxLimiter::new(24.0 * 1300.0)),
+            sim: Mutex::new(LossSim::from_env(
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1),
+            )),
+            video_pkts: AtomicU64::new(0),
+            retx_pkts: AtomicU64::new(0),
+            retx_refused: AtomicU64::new(0),
+            nack_items: AtomicU64::new(0),
             status: Mutex::new(Status {
                 phase: Phase::Connecting,
                 text: "Соединяюсь с проектором...".into(),
@@ -229,7 +269,10 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
         audio_rate,
         audio_channels: 2,
         clock_sync: 1, // audio and video are stamped from the same clock (sh.start)
+        features: p::FEAT_NACK | p::FEAT_AUDIO_RED,
     };
+    sh.features.store(0, Ordering::Relaxed);
+    sh.retx.lock().unwrap().clear();
 
     // ---- handshake: START until START_ACK
     sh.set(|s| s.text = format!("Соединяюсь с проектором {}...", peer.ip()));
@@ -245,8 +288,10 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
             match sock.recv_from(&mut buf) {
                 Ok((n, from)) => {
                     if from.ip() == peer.ip() {
-                        if let Some((p::T_START_ACK, s, _)) = p::parse_header(&buf[..n]) {
+                        if let Some((p::T_START_ACK, s, body)) = p::parse_header(&buf[..n]) {
                             if s == session {
+                                // A v0.3 projector answers with an empty ACK: no NACK, no audio redundancy.
+                                sh.features.store(p::parse_start_ack(body) & start.features, Ordering::Relaxed);
                                 acked = true;
                                 break;
                             }
@@ -291,7 +336,12 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
         let sh2 = sh.clone();
         let mut pending: Vec<i16> = Vec::new();
         let mut pkt = Vec::with_capacity(1200);
-        let chunk = ((audio_rate / 200).min(280) * 2) as usize; // 5 ms of stereo
+        // With redundancy each packet carries two chunks, so chunks are 3 ms (two of them fit a packet easily and a
+        // lost packet is covered by the next one); without it 5 ms as before.
+        let red = sh.features.load(Ordering::Relaxed) & p::FEAT_AUDIO_RED != 0;
+        let chunk = if red { ((audio_rate as f64 * 0.003).round() as u32).clamp(1, 300) * 2 } else { (audio_rate / 200).min(280) * 2 } as usize;
+        let mut prev_chunk: Vec<u8> = Vec::new();
+        let mut cur_chunk: Vec<u8> = Vec::with_capacity(chunk * 2);
         let chunk_ms = (chunk / 2) as f64 * 1000.0 / audio_rate as f64;
         let ms_per_frame = 1000.0 / audio_rate as f64;
         let offset = o.av_offset_ms as f64;
@@ -309,13 +359,23 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
             pending.extend_from_slice(samples);
             while pending.len() >= chunk {
                 let a = anchor.unwrap_or(0.0);
-                p::write_audio_header(session, seq.fetch_add(1, Ordering::Relaxed), (a + offset).max(0.0) as u32, &mut pkt);
-                for s in pending.drain(..chunk) {
-                    pkt.extend_from_slice(&s.to_le_bytes());
+                let ts = (a + offset).max(0.0).round() as u32;
+                let n = seq.fetch_add(1, Ordering::Relaxed);
+                if red {
+                    cur_chunk.clear();
+                    for s in pending.drain(..chunk) {
+                        cur_chunk.extend_from_slice(&s.to_le_bytes());
+                    }
+                    p::write_audio_red(session, n, ts, &prev_chunk, &cur_chunk, &mut pkt);
+                    std::mem::swap(&mut prev_chunk, &mut cur_chunk);
+                } else {
+                    p::write_audio_header(session, n, ts, &mut pkt);
+                    for s in pending.drain(..chunk) {
+                        pkt.extend_from_slice(&s.to_le_bytes());
+                    }
                 }
                 anchor = Some(a + chunk_ms);
-                let _ = sock.send_to(&pkt, peer);
-                sh2.sent_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                sh2.send_media(&sock, peer, &pkt);
             }
         }) {
             Ok(s) => {
@@ -452,6 +512,9 @@ fn capture_loop(
     let mut started = false;
     let mut last_adapt = Instant::now();
     let mut last_seq = 0u64;
+    let mut vp_at_sample = 0u64;
+    let mut vp_at_stat = 0u64;
+    let mut retx_at_stat = 0u64;
 
     while sh.running.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -470,8 +533,11 @@ fn capture_loop(
             }
             Event::Timeout => {}
         }
-        // Rate-limit forced keyframes: the receiver re-asks every ~150 ms while it waits for one.
-        if sh.keyreq.load(Ordering::Relaxed) && last_key.elapsed() > Duration::from_millis(250) {
+        // Rate-limit forced keyframes. With NACK a keyframe is only asked for when a frame could not be recovered,
+        // and a keyframe is hundreds of packets: at most one per 500 ms so requests can never snowball into a loop.
+        // (v0.3 projectors re-ask every ~150 ms while they wait for one: 250 ms as before.)
+        let key_gap = Duration::from_millis(if sh.nack_on() { 500 } else { 250 });
+        if sh.keyreq.load(Ordering::Relaxed) && last_key.elapsed() > key_gap {
             sh.keyreq.store(false, Ordering::Relaxed);
             force_key = true;
             dirty = true;
@@ -484,7 +550,11 @@ fn capture_loop(
             if let (true, Some(r)) = (seq != last_seq, rep) {
                 last_seq = seq;
                 let rtt_ms = sh.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0;
-                let sample = Sample { lost_frames: r.lost_frames as u32, dropped_frames: r.dropped_frames as u32, rtt_ms };
+                // share of the video packets that had to be asked for again in that second (0 with a v0.3 projector)
+                let vp = sh.video_pkts.load(Ordering::Relaxed);
+                let raw_loss = if vp > vp_at_sample { (r.nack_pkts as f64 / (vp - vp_at_sample) as f64).min(1.0) } else { 0.0 };
+                vp_at_sample = vp;
+                let sample = Sample { lost_frames: r.lost_frames as u32, raw_loss, dropped_frames: r.dropped_frames as u32, rtt_ms };
                 if let Some(mbps) = ctl.on_sample(sample) {
                     enc.set_bitrate((mbps * 1e6) as u64, fps); // NVENC reconfigures itself (with a keyframe)
                     sh.target_kbps.store((mbps * 1000.0) as u32, Ordering::Relaxed);
@@ -556,11 +626,29 @@ fn capture_loop(
                 if stat_frames > 0 { stat_enc.as_secs_f64() * 1000.0 / stat_frames as f64 } else { 0.0 },
                 rtt,
             );
-            if let Some(r) = rep {
+            if let Some(r) = rep.as_ref() {
                 st.push_str(&format!(" · проектор показывает {} к/с", r.decoded_fps));
                 if r.lost_frames > 0 || r.dropped_frames > 0 {
                     st.push_str(&format!(" (потеряно {}, пропущено {})", r.lost_frames, r.dropped_frames));
                 }
+            }
+            if sh.nack_on() {
+                // Packet loss on the way to the projector, and how much of it was repaired by re-sending.
+                let vp = sh.video_pkts.load(Ordering::Relaxed);
+                let rx = sh.retx_pkts.load(Ordering::Relaxed);
+                let (dvp, drx) = (vp - vp_at_stat, rx - retx_at_stat);
+                vp_at_stat = vp;
+                retx_at_stat = rx;
+                let asked = rep.as_ref().map_or(0, |r| r.nack_pkts as u64);
+                let share = if dvp > 0 { (asked as f64 / dvp as f64 * 100.0).min(100.0) } else { 0.0 };
+                st.push_str(&format!(" · потери пакетов {share:.1}% (повторно отправлено {drx}/с"));
+                if let Some(r) = rep.as_ref() {
+                    st.push_str(&format!(", восстановлено {}", r.recovered_pkts));
+                }
+                st.push(')');
+            }
+            if sh.sim.lock().unwrap().enabled() {
+                st.push_str(&format!(" · ТЕСТ: имитация потерь {:.1}%", sh.sim.lock().unwrap().rate() * 100.0));
             }
             sh.set(|s| s.stats = st);
             stat_t = Instant::now();
@@ -597,8 +685,11 @@ fn video_sender(sock: Arc<UdpSocket>, sh: Arc<Shared>, peer: SocketAddr, session
                 std::thread::sleep(Duration::from_millis(1)); // timer resolution is 1 ms (timeBeginPeriod)
             }
             tokens -= need;
-            let _ = sock.send_to(&pkt, peer);
-            sh.sent_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+            if sh.nack_on() {
+                sh.retx.lock().unwrap().store(sh.now_ms(), f.id, i as u16, count as u16, &pkt);
+            }
+            sh.video_pkts.fetch_add(1, Ordering::Relaxed);
+            sh.send_media(&sock, peer, &pkt);
         }
     }
 }
@@ -635,6 +726,25 @@ fn control(sock: Arc<UdpSocket>, sh: Arc<Shared>, stop: Arc<AtomicBool>, peer: S
         sh.last_seen_ms.store(sh.now_ms(), Ordering::Relaxed);
         match ty {
             p::T_KEYREQ => sh.keyreq.store(true, Ordering::Relaxed),
+            p::T_NACK if sh.nack_on() => {
+                let items = p::parse_nack(body);
+                sh.nack_items.fetch_add(items.len() as u64, Ordering::Relaxed);
+                let now = sh.now_ms();
+                let rate = (sh.target_kbps.load(Ordering::Relaxed) as f64 * 125.0 * 0.3).max(125_000.0);
+                let mut pkts = Vec::new();
+                for it in items {
+                    // a packet re-sent in the last 25 ms is still on its way: the receiver asked twice
+                    sh.retx.lock().unwrap().collect(now, it, 25, &mut pkts);
+                }
+                for pkt in pkts {
+                    if sh.retx_limit.lock().unwrap().allow(now, pkt.len(), rate) {
+                        sh.retx_pkts.fetch_add(1, Ordering::Relaxed);
+                        sh.send_media(&sock, peer, &pkt);
+                    } else {
+                        sh.retx_refused.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             p::T_PING => {
                 out.clear();
                 out.extend_from_slice(&buf[..n]);

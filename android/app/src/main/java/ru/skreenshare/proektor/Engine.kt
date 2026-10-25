@@ -23,7 +23,7 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
         fun onError(msg: String)
     }
 
-    private class Session(val id: Int, val peer: InetSocketAddress, val start: Proto.Start)
+    private class Session(val id: Int, val peer: InetSocketAddress, val start: Proto.Start, val features: Int)
 
     @Volatile private var running = false
     @Volatile private var surface: Surface? = null
@@ -35,11 +35,14 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
     private var decoder: VideoDecoder? = null
     @Volatile private var audio: AudioPlayer? = null
     private var clock: MediaClock? = null
-    private var lastAudioSeq = 0
-    private var haveAudioSeq = false
-    private val reasm = Reassembler(this)
+    private var reasm = Reassembler(this)
+    private val keyPolicy = KeyPolicy()
+    private var arx: AudioRx? = null
+    private val audioOut = ArrayList<AudioRx.Chunk>(4)
+    private val nackOut = ArrayList<Proto.NackItem>()
     private var awaitingKey = true
-    private var lastKeyReq = 0L
+    private var lastNacked = 0
+    private var lastRecovered = 0
     private var lastPacketAt = 0L
     private var lastHello = 0L
     private var lastReport = 0L
@@ -82,7 +85,7 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
                 bind(InetSocketAddress(Proto.PORT))
                 broadcast = true
                 try { receiveBufferSize = 4 shl 20 } catch (_: Throwable) {}
-                soTimeout = 20
+                soTimeout = 3 // short: NACKs and the loss timers are driven from this loop
             }
         } catch (e: Throwable) {
             listener.onError("Не удалось открыть порт ${Proto.PORT}: $e")
@@ -116,6 +119,7 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
         if (!Proto.isOurs(b, len)) return
         val sid = Proto.session(b)
         val now = System.nanoTime()
+        val nowMs = now / 1_000_000
         when (Proto.type(b)) {
             Proto.T_PROBE -> {
                 val rp = Proto.parseProbe(b, len)
@@ -126,7 +130,7 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
                 val cur = session
                 val peer = InetSocketAddress(from, port)
                 if (cur != null && cur.id == sid && cur.peer == peer) {
-                    send(sock, Proto.simple(Proto.T_START_ACK, sid), peer) // sender retries until it hears this
+                    send(sock, Proto.startAck(sid, cur.features), peer) // sender retries until it hears this
                     lastPacketAt = now
                     return
                 }
@@ -139,17 +143,26 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
                 when (Proto.type(b)) {
                     Proto.T_VIDEO -> {
                         val f = Proto.parseVideo(b, len) ?: return
-                        reasm.push(f, b, len)
+                        reasm.push(nowMs, f, b, len)
                     }
-                    Proto.T_AUDIO -> {
-                        val a = Proto.parseAudio(b, len) ?: return
+                    Proto.T_AUDIO, Proto.T_AUDIO_RED -> {
                         val pl = audio ?: return
-                        // UDP may reorder: an older chunk than one already queued is useless.
-                        if (haveAudioSeq && a.seq - lastAudioSeq <= 0) return
-                        haveAudioSeq = true; lastAudioSeq = a.seq
-                        val t = a.tsMs.toLong() and 0xFFFFFFFFL
-                        if (cur.start.clockSync != 0) clock?.arrival?.onTimestamp(t, System.nanoTime() / 1_000_000)
-                        pl.push(t, b.copyOfRange(a.payloadOffset, len))
+                        val rx = arx ?: return
+                        audioOut.clear()
+                        if (Proto.type(b) == Proto.T_AUDIO) {
+                            val a = Proto.parseAudio(b, len) ?: return
+                            rx.onPlain(a.seq, a.tsMs.toLong() and 0xFFFFFFFFL, b.copyOfRange(a.payloadOffset, len), audioOut)
+                        } else {
+                            val a = Proto.parseAudioRed(b, len) ?: return
+                            val prev = if (a.prevLen > 0) b.copyOfRange(a.prevOffset, a.prevOffset + a.prevLen) else null
+                            rx.onRed(a.seq, a.tsMs.toLong() and 0xFFFFFFFFL, prev, b.copyOfRange(a.curOffset, a.curOffset + a.curLen), audioOut)
+                        }
+                        // The last chunk is the one that just arrived; a rebuilt older one (if any) comes first.
+                        for (c in audioOut) {
+                            val t = Math.round(c.tsMs).toLong() and 0xFFFFFFFFL
+                            if (cur.start.clockSync != 0 && c === audioOut.last()) clock?.arrival?.onTimestamp(t, nowMs)
+                            pl.push(t, c.data)
+                        }
                     }
                     Proto.T_PING -> send(sock, b.copyOf(len).also { it[1] = Proto.T_PONG.toByte() }, cur.peer)
                     Proto.T_BYE -> endSession(sendBye = false)
@@ -166,7 +179,10 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
         val synced = s.clockSync != 0
         val mc = if (synced) MediaClock { audio?.clockMs() } else null
         clock = mc
-        haveAudioSeq = false
+        arx = AudioRx(s.audioRate.coerceAtLeast(1), s.audioChannels.coerceAtLeast(1))
+        // Only what the sender offered AND we can do; an older sender offers nothing and gets the v0.3 behaviour.
+        val features = s.features and (Proto.FEAT_NACK or Proto.FEAT_AUDIO_RED)
+        reasm = Reassembler(this, if (features and Proto.FEAT_NACK != 0) Reassembler.Config() else Reassembler.Config.withoutNack())
         try {
             decoder = VideoDecoder(surf, s.width, s.height, s.fps, { needKey = true }, mc,
                 if (mc != null) SyncController { ms -> audio?.delayBy(ms) } else null)
@@ -178,14 +194,15 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
         if (s.audioRate in 8000..96000 && s.audioChannels in 1..2) {
             try { audio = AudioPlayer(s.audioRate, s.audioChannels) } catch (e: Throwable) { Log.w(TAG, "audio: $e") }
         }
-        session = Session(id, peer, s)
+        session = Session(id, peer, s, features)
         reasm.reset()
+        keyPolicy.onKey(); keyPolicy.need()
         awaitingKey = true
         needKey = true
         lastPacketAt = System.nanoTime()
         lastReport = lastPacketAt
-        lastDecoded = 0; lastDropped = 0; lastLost = 0
-        send(sock, Proto.simple(Proto.T_START_ACK, id), peer)
+        lastDecoded = 0; lastDropped = 0; lastLost = 0; lastNacked = 0; lastRecovered = 0
+        send(sock, Proto.startAck(id, features), peer)
         listener.onStreaming(true, "${peer.address.hostAddress}  ${s.width}x${s.height} ${s.fps} к/с", s.width, s.height)
     }
 
@@ -206,20 +223,29 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
         val s = session
         if (s != null) {
             if ((now - lastPacketAt) / 1_000_000 > SESSION_TIMEOUT_MS) { endSession(sendBye = false); return }
-            // A frame that has been waiting for its last fragments for too long is gone.
-            if (reasm.oldestOlderThan(100)) reasm.giveUpOldest()
-            if (needKey && (now - lastKeyReq) / 1_000_000 > 150) {
-                lastKeyReq = now
-                send(sock, Proto.simple(Proto.T_KEYREQ, s.id), s.peer)
+            val nowMs = now / 1_000_000
+            // Ask for exactly the missing packets; a frame that outlives the latency budget is given up (-> keyframe).
+            nackOut.clear()
+            reasm.poll(nowMs, nackOut)
+            var from = 0
+            while (from < nackOut.size) {
+                val to = minOf(from + Proto.MAX_NACK_ITEMS, nackOut.size)
+                send(sock, Proto.nack(s.id, nackOut.subList(from, to)), s.peer)
+                from = to
             }
+            if (needKey) keyPolicy.need() // the decoder asked for one
+            if (keyPolicy.poll(nowMs, reasm.keyPending())) send(sock, Proto.simple(Proto.T_KEYREQ, s.id), s.peer)
             if ((now - lastReport) / 1_000_000 >= 1000) {
                 lastReport = now
                 val d = decoder
                 val dec = d?.decoded?.get() ?: 0
                 val drp = d?.dropped?.get() ?: 0
                 val lost = reasm.lost
-                send(sock, Proto.report(s.id, Proto.Report(dec - lastDecoded, lost - lastLost, drp - lastDropped)), s.peer)
-                lastDecoded = dec; lastDropped = drp; lastLost = lost
+                val nk = reasm.nackedPkts
+                val rc = reasm.recoveredPkts
+                send(sock, Proto.report(s.id, Proto.Report(dec - lastDecoded, lost - lastLost, drp - lastDropped,
+                    nk - lastNacked, rc - lastRecovered)), s.peer)
+                lastDecoded = dec; lastDropped = drp; lastLost = lost; lastNacked = nk; lastRecovered = rc
             }
         }
         if ((now - lastHello) / 1_000_000 >= 1000) {
@@ -235,14 +261,15 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
         if (awaitingKey) {
             if (!key) return
             awaitingKey = false
-            needKey = false
         }
-        if (!d.submit(data, tsMs)) { awaitingKey = true; needKey = true }
+        if (key) { needKey = false; keyPolicy.onKey() }
+        if (!d.submit(data, tsMs)) { awaitingKey = true; needKey = true; keyPolicy.need() }
     }
 
     override fun onLost() {
         awaitingKey = true
         needKey = true
+        keyPolicy.need()
     }
 
     // ---- discovery

@@ -6,9 +6,19 @@
 //! golden-bytes tests in both places keep them in sync.
 
 /// UDP port the receiver (projector) listens on: START, media, PROBE.
+pub mod audiorx;
 pub mod geom;
 pub mod h264;
+pub mod keyreq;
+pub mod loss;
 pub mod rate;
+pub mod reassembly;
+pub mod retx;
+
+#[cfg(test)]
+mod legacy;
+#[cfg(test)]
+mod sim;
 
 pub const PORT: u16 = 47800;
 /// UDP port the sender listens on for receiver announcements (broadcast HELLO).
@@ -33,13 +43,26 @@ pub const T_START: u8 = 0x03;
 pub const T_START_ACK: u8 = 0x04;
 pub const T_VIDEO: u8 = 0x10;
 pub const T_AUDIO: u8 = 0x11;
+/// v0.4: audio with a copy of the previous chunk (negotiated with [`FEAT_AUDIO_RED`]).
+pub const T_AUDIO_RED: u8 = 0x12;
 pub const T_KEYREQ: u8 = 0x20;
 pub const T_PING: u8 = 0x21;
 pub const T_PONG: u8 = 0x22;
 pub const T_BYE: u8 = 0x23;
 pub const T_REPORT: u8 = 0x24;
+/// v0.4: receiver -> sender, list of missing video packets (negotiated with [`FEAT_NACK`]).
+pub const T_NACK: u8 = 0x25;
 
 pub const FLAG_KEY: u8 = 1;
+/// Set on a re-sent video packet (old receivers only look at FLAG_KEY and ignore it).
+pub const FLAG_RETX: u8 = 2;
+/// `Start::features` (what the sender can do) and the START_ACK body (what the receiver agreed to).
+pub const FEAT_NACK: u8 = 1;
+pub const FEAT_AUDIO_RED: u8 = 2;
+/// NACK item `idx` meaning "every fragment of this frame" (the receiver has seen none of it).
+pub const NACK_ALL: u16 = 0xFFFF;
+/// Items per NACK datagram (6 bytes each).
+pub const MAX_NACK_ITEMS: usize = 150;
 pub const HELLO_BUSY: u8 = 1;
 
 pub const VCODEC_H264: u8 = 1;
@@ -120,6 +143,8 @@ pub struct Start {
     /// 1 = audio timestamps are capture times on the same clock (same origin) as the video timestamps, so the
     /// receiver can lip-sync. 0 = (v0.1 sender) timestamps of audio are not comparable to video.
     pub clock_sync: u8,
+    /// v0.4 capability bits ([`FEAT_NACK`], [`FEAT_AUDIO_RED`]). Absent (0) from older senders.
+    pub features: u8,
 }
 
 pub fn write_start(session: u32, s: &Start, out: &mut Vec<u8>) {
@@ -131,6 +156,7 @@ pub fn write_start(session: u32, s: &Start, out: &mut Vec<u8>) {
     out.extend_from_slice(&s.audio_rate.to_le_bytes());
     out.push(s.audio_channels);
     out.push(s.clock_sync);
+    out.push(s.features);
 }
 
 pub fn parse_start(body: &[u8]) -> Option<Start> {
@@ -145,7 +171,18 @@ pub fn parse_start(body: &[u8]) -> Option<Start> {
         audio_rate: u32::from_le_bytes(body[6..10].try_into().unwrap()),
         audio_channels: body[10],
         clock_sync: body.get(11).copied().unwrap_or(0),
+        features: body.get(12).copied().unwrap_or(0),
     })
+}
+
+/// START_ACK: header + (v0.4) the feature bits the receiver will use. Older receivers send no body = 0.
+pub fn write_start_ack(session: u32, features: u8, out: &mut Vec<u8>) {
+    header(T_START_ACK, session, out);
+    out.push(features);
+}
+
+pub fn parse_start_ack(body: &[u8]) -> u8 {
+    body.first().copied().unwrap_or(0)
 }
 
 pub fn write_simple(ty: u8, session: u32, out: &mut Vec<u8>) {
@@ -215,6 +252,10 @@ pub struct Report {
     pub decoded_fps: u16,
     pub lost_frames: u16,
     pub dropped_frames: u16,
+    /// v0.4: video packets the receiver found missing in the last second (before any retransmission).
+    pub nack_pkts: u16,
+    /// v0.4: of those, how many arrived after all (retransmitted).
+    pub recovered_pkts: u16,
 }
 
 pub fn write_report(session: u32, r: &Report, out: &mut Vec<u8>) {
@@ -222,6 +263,8 @@ pub fn write_report(session: u32, r: &Report, out: &mut Vec<u8>) {
     out.extend_from_slice(&r.decoded_fps.to_le_bytes());
     out.extend_from_slice(&r.lost_frames.to_le_bytes());
     out.extend_from_slice(&r.dropped_frames.to_le_bytes());
+    out.extend_from_slice(&r.nack_pkts.to_le_bytes());
+    out.extend_from_slice(&r.recovered_pkts.to_le_bytes());
 }
 
 pub fn parse_report(body: &[u8]) -> Option<Report> {
@@ -232,7 +275,61 @@ pub fn parse_report(body: &[u8]) -> Option<Report> {
         decoded_fps: u16::from_le_bytes([body[0], body[1]]),
         lost_frames: u16::from_le_bytes([body[2], body[3]]),
         dropped_frames: u16::from_le_bytes([body[4], body[5]]),
+        nack_pkts: if body.len() >= 8 { u16::from_le_bytes([body[6], body[7]]) } else { 0 },
+        recovered_pkts: if body.len() >= 10 { u16::from_le_bytes([body[8], body[9]]) } else { 0 },
     })
+}
+
+/// NACK: header + count(1) + count x (frame_id u32, idx u16). Extra items beyond [`MAX_NACK_ITEMS`] are not written.
+pub fn write_nack(session: u32, items: &[(u32, u16)], out: &mut Vec<u8>) {
+    header(T_NACK, session, out);
+    let n = items.len().min(MAX_NACK_ITEMS);
+    out.push(n as u8);
+    for &(frame, idx) in &items[..n] {
+        out.extend_from_slice(&frame.to_le_bytes());
+        out.extend_from_slice(&idx.to_le_bytes());
+    }
+}
+
+pub fn parse_nack(body: &[u8]) -> Vec<(u32, u16)> {
+    let Some(&n) = body.first() else { return Vec::new() };
+    body[1..]
+        .chunks_exact(6)
+        .take(n as usize)
+        .map(|c| (u32::from_le_bytes(c[0..4].try_into().unwrap()), u16::from_le_bytes([c[4], c[5]])))
+        .collect()
+}
+
+/// Audio with redundancy: header + seq(4) ts_ms(4) cur_len(2), then [previous chunk (0 or cur_len bytes)][current chunk].
+/// `ts_ms` is the capture time of the CURRENT chunk; the previous one ends where it starts.
+pub const AUDIO_RED_HEADER_LEN: usize = HEADER_LEN + 10;
+
+pub fn write_audio_red(session: u32, seq: u32, ts_ms: u32, prev: &[u8], cur: &[u8], out: &mut Vec<u8>) {
+    header(T_AUDIO_RED, session, out);
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&ts_ms.to_le_bytes());
+    out.extend_from_slice(&(cur.len() as u16).to_le_bytes());
+    out.extend_from_slice(prev);
+    out.extend_from_slice(cur);
+}
+
+/// (seq, ts_ms, previous chunk (maybe empty), current chunk)
+pub fn parse_audio_red(body: &[u8]) -> Option<(u32, u32, &[u8], &[u8])> {
+    if body.len() < 10 {
+        return None;
+    }
+    let cur_len = u16::from_le_bytes([body[8], body[9]]) as usize;
+    let data = &body[10..];
+    if cur_len == 0 || data.len() < cur_len || (data.len() != cur_len && data.len() != 2 * cur_len) {
+        return None;
+    }
+    let (prev, cur) = data.split_at(data.len() - cur_len);
+    Some((
+        u32::from_le_bytes(body[0..4].try_into().unwrap()),
+        u32::from_le_bytes(body[4..8].try_into().unwrap()),
+        prev,
+        cur,
+    ))
 }
 
 /// Splits one encoded access unit into datagram payload ranges (at least one, even for empty data).
@@ -240,137 +337,8 @@ pub fn fragment_count(len: usize) -> usize {
     len.div_ceil(MAX_PAYLOAD).max(1)
 }
 
-/// Receiver-side frame reassembly. Frames arrive as fragments, possibly reordered or missing; complete
-/// frames are returned strictly in order, a frame that can never complete is reported as lost.
-pub mod reassembly {
-    use super::VideoFrag;
-    use std::collections::BTreeMap;
-
-    pub struct Frame {
-        pub frame_id: u32,
-        pub ts_ms: u32,
-        pub key: bool,
-        pub data: Vec<u8>,
-    }
-
-    struct Partial {
-        ts_ms: u32,
-        key: bool,
-        count: u16,
-        got: u16,
-        frags: Vec<Option<Vec<u8>>>,
-    }
-
-    #[derive(Default)]
-    pub struct Reassembler {
-        next_id: Option<u32>,
-        pending: BTreeMap<u32, Partial>,
-        pub lost: u32,
-    }
-
-    pub enum Out {
-        Frame(Frame),
-        /// One or more frames were skipped: the decoder needs a keyframe.
-        Lost,
-    }
-
-    /// Max frames we keep waiting for before declaring the oldest one lost.
-    const MAX_PENDING: usize = 4;
-
-    impl Reassembler {
-        pub fn new() -> Self {
-            Self::default()
-        }
-
-        pub fn reset(&mut self) {
-            self.next_id = None;
-            self.pending.clear();
-        }
-
-        pub fn push(&mut self, f: &VideoFrag, payload: &[u8], out: &mut Vec<Out>) {
-            if f.count == 0 || f.idx >= f.count {
-                return;
-            }
-            let next = *self.next_id.get_or_insert(f.frame_id);
-            // Older than what we already delivered/skipped: ignore.
-            if (f.frame_id.wrapping_sub(next) as i32) < 0 {
-                return;
-            }
-            let p = self.pending.entry(f.frame_id).or_insert_with(|| Partial {
-                ts_ms: f.ts_ms,
-                key: f.key,
-                count: f.count,
-                got: 0,
-                frags: vec![None; f.count as usize],
-            });
-            if p.count != f.count {
-                return;
-            }
-            if p.frags[f.idx as usize].is_none() {
-                p.frags[f.idx as usize] = Some(payload.to_vec());
-                p.got += 1;
-            }
-            self.drain(out);
-            // Too many half-finished frames waiting: give up on the oldest.
-            while self.pending.len() > MAX_PENDING {
-                let (&id, _) = self.pending.iter().next().unwrap();
-                self.skip_to(id, out);
-            }
-        }
-
-        /// Gives up on the oldest incomplete frame (called when it is clearly too late).
-        pub fn give_up_oldest(&mut self, out: &mut Vec<Out>) {
-            if let Some((&id, _)) = self.pending.iter().next() {
-                self.skip_to(id, out);
-            }
-        }
-
-        pub fn has_pending(&self) -> bool {
-            !self.pending.is_empty()
-        }
-
-        fn skip_to(&mut self, id: u32, out: &mut Vec<Out>) {
-            // Everything before `id` (and `id` itself) is abandoned.
-            self.pending.remove(&id);
-            self.next_id = Some(id.wrapping_add(1));
-            self.lost += 1;
-            out.push(Out::Lost);
-            self.drain(out);
-        }
-
-        fn drain(&mut self, out: &mut Vec<Out>) {
-            loop {
-                let Some(next) = self.next_id else { return };
-                // A complete frame ahead of a hole: the hole is lost, jump over it.
-                let complete_id = self
-                    .pending
-                    .iter()
-                    .find(|(_, p)| p.got == p.count)
-                    .map(|(&id, _)| id);
-                let Some(cid) = complete_id else { return };
-                if cid != next {
-                    // frames in [next, cid) never completed
-                    let missing = cid.wrapping_sub(next);
-                    self.pending.retain(|&id, _| id.wrapping_sub(next) >= missing);
-                    self.lost += missing;
-                    out.push(Out::Lost);
-                    self.next_id = Some(cid);
-                }
-                let p = self.pending.remove(&cid).unwrap();
-                let mut data = Vec::with_capacity(p.frags.iter().map(|f| f.as_ref().map_or(0, |v| v.len())).sum());
-                for f in p.frags {
-                    data.extend_from_slice(&f.unwrap());
-                }
-                out.push(Out::Frame(Frame { frame_id: cid, ts_ms: p.ts_ms, key: p.key, data }));
-                self.next_id = Some(cid.wrapping_add(1));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::reassembly::*;
     use super::*;
 
     fn hex(b: &[u8]) -> String {
@@ -394,9 +362,9 @@ mod tests {
     #[test]
     fn golden_start() {
         let mut o = Vec::new();
-        let s = Start { width: 1920, height: 1080, fps: 30, vcodec: 1, audio_rate: 48000, audio_channels: 2, clock_sync: 1 };
+        let s = Start { width: 1920, height: 1080, fps: 30, vcodec: 1, audio_rate: 48000, audio_channels: 2, clock_sync: 1, features: FEAT_NACK | FEAT_AUDIO_RED };
         write_start(0x01020304, &s, &mut o);
-        assert_eq!(hex(&o), "d703".to_string() + "04030201" + "8007" + "3804" + "1e" + "01" + "80bb0000" + "02" + "01");
+        assert_eq!(hex(&o), "d703".to_string() + "04030201" + "8007" + "3804" + "1e" + "01" + "80bb0000" + "02" + "01" + "03");
         let (_, sess, body) = parse_header(&o).unwrap();
         assert_eq!(sess, 0x01020304);
         assert_eq!(parse_start(body).unwrap(), s);
@@ -407,7 +375,7 @@ mod tests {
         // 11-byte START as sent by v0.1.0: still understood, but flagged as not lip-sync capable.
         let body = [0x80, 0x07, 0x38, 0x04, 0x1e, 0x01, 0x80, 0xbb, 0x00, 0x00, 0x02];
         let s = parse_start(&body).unwrap();
-        assert_eq!((s.width, s.audio_rate, s.clock_sync), (1920, 48000, 0));
+        assert_eq!((s.width, s.audio_rate, s.clock_sync, s.features), (1920, 48000, 0, 0));
     }
 
     #[test]
@@ -428,81 +396,16 @@ mod tests {
     #[test]
     fn golden_report_ping() {
         let mut o = Vec::new();
-        write_report(1, &Report { decoded_fps: 30, lost_frames: 2, dropped_frames: 1 }, &mut o);
-        assert_eq!(hex(&o), "d724".to_string() + "01000000" + "1e00" + "0200" + "0100");
+        write_report(1, &Report { decoded_fps: 30, lost_frames: 2, dropped_frames: 1, nack_pkts: 5, recovered_pkts: 4 }, &mut o);
+        assert_eq!(hex(&o), "d724".to_string() + "01000000" + "1e00" + "0200" + "0100" + "0500" + "0400");
+        assert_eq!(parse_report(&o[HEADER_LEN..]).unwrap().recovered_pkts, 4);
         write_ping(T_PING, 1, 0x0a0b0c0d, &mut o);
         assert_eq!(hex(&o), "d721".to_string() + "01000000" + "0d0c0b0a");
+        // a v0.3 receiver's 6-byte report is still understood
+        let old = parse_report(&[30, 0, 2, 0, 1, 0]).unwrap();
+        assert_eq!((old.decoded_fps, old.lost_frames, old.nack_pkts, old.recovered_pkts), (30, 2, 0, 0));
         write_simple(T_KEYREQ, 1, &mut o);
         assert_eq!(hex(&o), "d72001000000");
-    }
-
-    fn frag(id: u32, idx: u16, count: u16, key: bool) -> VideoFrag {
-        VideoFrag { ts_ms: id.wrapping_mul(33), frame_id: id, idx, count, key }
-    }
-
-    fn frames(out: &[Out]) -> Vec<(u32, Vec<u8>)> {
-        out.iter()
-            .filter_map(|o| match o {
-                Out::Frame(f) => Some((f.frame_id, f.data.clone())),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn reassemble_in_order_and_reordered() {
-        let mut r = Reassembler::new();
-        let mut out = Vec::new();
-        r.push(&frag(0, 1, 2, true), b"BB", &mut out);
-        assert!(out.is_empty());
-        r.push(&frag(0, 0, 2, true), b"AA", &mut out);
-        r.push(&frag(1, 0, 1, false), b"C", &mut out);
-        assert_eq!(frames(&out), vec![(0, b"AABB".to_vec()), (1, b"C".to_vec())]);
-        assert_eq!(r.lost, 0);
-    }
-
-    #[test]
-    fn lost_fragment_is_skipped_when_next_frame_completes() {
-        let mut r = Reassembler::new();
-        let mut out = Vec::new();
-        r.push(&frag(0, 0, 1, true), b"K", &mut out);
-        r.push(&frag(1, 0, 2, false), b"x", &mut out); // second fragment never arrives
-        r.push(&frag(2, 0, 1, false), b"P", &mut out);
-        assert!(out.iter().any(|o| matches!(o, Out::Lost)));
-        assert_eq!(frames(&out), vec![(0, b"K".to_vec()), (2, b"P".to_vec())]);
-        assert_eq!(r.lost, 1);
-    }
-
-    #[test]
-    fn duplicate_and_old_fragments_ignored() {
-        let mut r = Reassembler::new();
-        let mut out = Vec::new();
-        r.push(&frag(5, 0, 1, true), b"K", &mut out);
-        r.push(&frag(5, 0, 1, true), b"K", &mut out);
-        r.push(&frag(3, 0, 1, false), b"old", &mut out);
-        assert_eq!(frames(&out).len(), 1);
-    }
-
-    #[test]
-    fn give_up_oldest_reports_loss() {
-        let mut r = Reassembler::new();
-        let mut out = Vec::new();
-        r.push(&frag(0, 0, 2, true), b"a", &mut out);
-        assert!(r.has_pending());
-        r.give_up_oldest(&mut out);
-        assert!(matches!(out[0], Out::Lost));
-        assert!(!r.has_pending());
-        r.push(&frag(1, 0, 1, true), b"k", &mut out);
-        assert_eq!(frames(&out), vec![(1, b"k".to_vec())]);
-    }
-
-    #[test]
-    fn frame_id_wraparound() {
-        let mut r = Reassembler::new();
-        let mut out = Vec::new();
-        r.push(&frag(u32::MAX, 0, 1, true), b"a", &mut out);
-        r.push(&frag(0, 0, 1, false), b"b", &mut out);
-        assert_eq!(frames(&out).len(), 2);
     }
 
     #[test]
@@ -510,5 +413,37 @@ mod tests {
         assert_eq!(fragment_count(0), 1);
         assert_eq!(fragment_count(1200), 1);
         assert_eq!(fragment_count(1201), 2);
+    }
+
+    #[test]
+    fn golden_start_ack_nack_audio_red() {
+        let mut o = Vec::new();
+        write_start_ack(1, FEAT_NACK | FEAT_AUDIO_RED, &mut o);
+        assert_eq!(hex(&o), "d704".to_string() + "01000000" + "03");
+        assert_eq!(parse_start_ack(&o[HEADER_LEN..]), 3);
+        assert_eq!(parse_start_ack(&[]), 0); // v0.3 receiver: empty ACK = no new features
+
+        write_nack(1, &[(5, 1), (0x01020304, NACK_ALL)], &mut o);
+        assert_eq!(hex(&o), "d725".to_string() + "01000000" + "02" + "050000000100" + "04030201ffff");
+        assert_eq!(parse_nack(&o[HEADER_LEN..]), vec![(5, 1), (0x01020304, NACK_ALL)]);
+        // a truncated list never panics and yields only complete items
+        assert_eq!(parse_nack(&o[HEADER_LEN..o.len() - 2]), vec![(5, 1)]);
+        let many: Vec<(u32, u16)> = (0..400).map(|i| (i, 0)).collect();
+        write_nack(1, &many, &mut o);
+        assert_eq!(parse_nack(&o[HEADER_LEN..]).len(), MAX_NACK_ITEMS);
+        assert!(o.len() <= MAX_PAYLOAD);
+
+        write_audio_red(7, 9, 1234, &[1, 2], &[3, 4], &mut o);
+        assert_eq!(hex(&o), "d712".to_string() + "07000000" + "09000000" + "d2040000" + "0200" + "0102" + "0304");
+        let (_, _, body) = parse_header(&o).unwrap();
+        assert_eq!(parse_audio_red(body).unwrap(), (9, 1234, &[1u8, 2][..], &[3u8, 4][..]));
+        write_audio_red(7, 0, 0, &[], &[3, 4], &mut o);
+        let (_, _, body) = parse_header(&o).unwrap();
+        assert_eq!(parse_audio_red(body).unwrap().2.len(), 0);
+        assert!(parse_audio_red(&body[..body.len() - 1]).is_none());
+        // inconsistent length is rejected
+        let mut bad = body.to_vec();
+        bad.push(0);
+        assert!(parse_audio_red(&bad).is_none());
     }
 }

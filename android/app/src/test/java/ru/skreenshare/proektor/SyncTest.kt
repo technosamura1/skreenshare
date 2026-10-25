@@ -21,8 +21,15 @@ class SyncTest {
     @Test fun smallJitterIsIgnored() {
         val t = AudioTimeline(rate)
         t.plan(1000.0, frames(5), true)
-        val p = t.plan(1000.0 + 5 + 6, frames(5), false) // 6 ms late: inside the tolerance
+        val p = t.plan(1000.0 + 5 + 1.5, frames(5), false) // 1.5 ms late: inside the tolerance
         assertEquals(0, p.silenceFrames); assertEquals(0, p.skipFrames); assertFalse(p.drop)
+    }
+
+    @Test fun aSingleLostThreeMsPacketIsFilledToo() {
+        val t = AudioTimeline(rate)
+        t.plan(1000.0, frames(3), true)
+        val p = t.plan(1006.0, frames(3), false) // the 1003..1006 chunk never came
+        near(frames(3), p.silenceFrames)
     }
 
     @Test fun lostPacketsBecomeSilenceSoTheClockStaysTrue() {
@@ -38,8 +45,11 @@ class SyncTest {
     @Test fun overlapIsTrimmedOrDropped() {
         val t = AudioTimeline(rate)
         t.plan(1000.0, frames(10), true)           // covers 1000..1010
-        val trim = t.plan(1004.0, frames(10), false) // starts 6 ms early -> inside tolerance, kept
+        val trim = t.plan(1009.0, frames(10), false) // starts 1 ms early -> inside tolerance, kept
         assertEquals(0, trim.skipFrames)
+        val t3 = AudioTimeline(rate)
+        t3.plan(1000.0, frames(10), true)
+        near(frames(6), t3.plan(1004.0, frames(10), false).skipFrames) // 6 ms early -> trimmed
         val t2 = AudioTimeline(rate)
         t2.plan(1000.0, frames(30), true)           // covers 1000..1030
         val p = t2.plan(1010.0, frames(10), false)   // fully inside what is written
@@ -133,5 +143,38 @@ class SyncTest {
         var t = 0L
         repeat(2000) { c.onFrame(120.0, t); t += 25 }
         assertTrue(asked <= SyncController.MAX_EXTRA_MS)
+    }
+
+    private fun sine(frames: Int): ByteArray {
+        val out = ByteArray(frames * 4)
+        for (f in 0 until frames) {
+            val v = (12000 * Math.sin(2 * Math.PI * 440.0 * f / rate)).toInt()
+            for (c in 0 until 2) { out[f * 4 + c * 2] = v.toByte(); out[f * 4 + c * 2 + 1] = (v shr 8).toByte() }
+        }
+        return out
+    }
+    private fun sample(b: ByteArray, frame: Int) = ((b[frame * 4].toInt() and 0xFF) or (b[frame * 4 + 1].toInt() shl 8)).toShort().toInt()
+
+    @Test fun plcHasExactlyTheHolesLengthAndFadesOut() {
+        val tail = sine(240)
+        for (ms in listOf(1, 3, 6, 12, 40, 250)) {
+            val n = frames(ms)
+            val c = Plc.conceal(tail, n, 2, rate)
+            assertEquals(n * 4, c.size)
+            // the end of a long hole is silent: no sound is invented beyond the fade
+            if (ms >= 40) assertEquals(0, sample(c, n - 1))
+        }
+        val c = Plc.conceal(tail, frames(3), 2, rate)
+        var peak = 0
+        for (f in 0 until frames(3)) peak = maxOf(peak, Math.abs(sample(c, f)))
+        assertTrue("concealment must carry sound, peak=$peak", peak > 1000)
+        assertTrue(peak <= 12000)
+    }
+
+    @Test fun plcWithoutHistoryOrHoleIsSilentOrEmpty() {
+        assertTrue(Plc.conceal(null, 100, 2, rate).all { it == 0.toByte() })
+        assertEquals(400, Plc.conceal(null, 100, 2, rate).size)
+        assertEquals(0, Plc.conceal(sine(100), 0, 2, rate).size)
+        assertEquals(0, Plc.conceal(sine(100), -5, 2, rate).size)
     }
 }

@@ -84,7 +84,7 @@ class AudioTimeline(private val rate: Int) {
     fun writtenFrames() = written
 
     companion object {
-        const val TOL_MS = 8.0
+        const val TOL_MS = 2.0 // was 8: with 3 ms chunks a lost packet is a hole of only 3 ms, and it must be filled
         const val MAX_GAP_MS = 250.0
     }
 }

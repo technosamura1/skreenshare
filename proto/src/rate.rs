@@ -2,12 +2,19 @@
 //!
 //! Called once a second with what the receiver reported. Lowers the bitrate fast when frames get lost or the
 //! round trip time balloons, and raises it slowly (and not above a level that just failed) when things are clean.
+//!
+//! Since v0.4 lost packets are re-sent (NACK), so the signal is the RESIDUAL loss: frames that could not be
+//! recovered in time. One isolated second with a frame or two lost is a burst, not congestion, and does not cut the
+//! bitrate; loss that repeats in consecutive seconds does, and so does a large frame loss at once. The raw packet
+//! loss rate only counts when it stays very high for seconds (retransmissions then eat the link themselves).
 
 /// What the sender knows after one second.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sample {
     /// Frames the receiver could not assemble (lost packets) during the last second.
     pub lost_frames: u32,
+    /// Share of video packets that had to be re-requested during the last second (0..1; 0 = unknown / old receiver).
+    pub raw_loss: f64,
     /// Frames the receiver threw away (decoder behind / too late) during the last second.
     pub dropped_frames: u32,
     /// Round trip time of the control PING, ms (0 = unknown).
@@ -25,11 +32,16 @@ pub struct RateController {
     backoff: u32,
     rtt_floor: f64,
     applied: f64,
+    /// Residual loss seen in the previous two seconds (bit 0 = last second).
+    lost_hist: u8,
+    high_raw: u32,
 }
 
 const BACKOFF_MIN_S: u32 = 8;
 const BACKOFF_MAX_S: u32 = 30;
 const CALM_RESET_S: u32 = 60;
+/// Share of packets re-requested that, held for 3 s, is itself a sign of a congested link.
+const RAW_LOSS_HIGH: f64 = 0.15;
 
 impl RateController {
     pub fn new(start_mbps: f64, min_mbps: f64, max_mbps: f64) -> Self {
@@ -45,6 +57,8 @@ impl RateController {
             backoff: BACKOFF_MIN_S,
             rtt_floor: f64::MAX,
             applied: cur,
+            lost_hist: 0,
+            high_raw: 0,
         }
     }
 
@@ -60,8 +74,16 @@ impl RateController {
             rtt_bad = s.rtt_ms > self.rtt_floor + 50.0;
         }
         let heavy = s.lost_frames >= 3 || rtt_bad && s.lost_frames > 0;
-        let bad = s.lost_frames > 0 || s.dropped_frames >= 3 || rtt_bad;
-        if bad {
+        let sustained = s.lost_frames > 0 && self.lost_hist & 0b11 != 0;
+        self.lost_hist = (self.lost_hist << 1) | (s.lost_frames > 0) as u8;
+        self.high_raw = if s.raw_loss > RAW_LOSS_HIGH { self.high_raw + 1 } else { 0 };
+        let raw_bad = self.high_raw >= 3;
+        let burst = s.lost_frames > 0 && !heavy && !sustained;
+        let bad = heavy || sustained || raw_bad || s.dropped_frames >= 3 || rtt_bad;
+        if burst && !bad {
+            // a single burst of residual loss: don't react, but don't count this second as calm either
+            self.clean = 0;
+        } else if bad {
             let factor = if heavy { 0.65 } else { 0.85 };
             self.soft_max = (self.cur * 0.92).max(self.min);
             if self.clean < self.backoff.saturating_mul(2) {
@@ -96,7 +118,7 @@ impl RateController {
 mod tests {
     use super::*;
 
-    const OK: Sample = Sample { lost_frames: 0, dropped_frames: 0, rtt_ms: 5.0 };
+    const OK: Sample = Sample { lost_frames: 0, raw_loss: 0.0, dropped_frames: 0, rtt_ms: 5.0 };
 
     #[test]
     fn loss_lowers_quickly_down_to_the_floor() {
@@ -110,10 +132,41 @@ mod tests {
     }
 
     #[test]
-    fn mild_trouble_is_a_small_step() {
+    fn mild_trouble_is_a_small_step_once_it_repeats() {
         let mut r = RateController::new(20.0, 6.0, 40.0);
-        let n = r.on_sample(Sample { lost_frames: 1, ..OK }).unwrap();
+        assert!(r.on_sample(Sample { lost_frames: 1, ..OK }).is_none()); // a burst: ignored
+        let n = r.on_sample(Sample { lost_frames: 1, ..OK }).unwrap(); // again right away: it is real
         assert!((n - 17.0).abs() < 0.01, "{n}");
+    }
+
+    #[test]
+    fn an_isolated_burst_does_not_cut_the_bitrate() {
+        let mut r = RateController::new(20.0, 6.0, 40.0);
+        for sec in 0..120 {
+            // one second with 2 unrecoverable frames every 10 s, steady 5% raw loss in between
+            let s = Sample { lost_frames: if sec % 10 == 5 { 2 } else { 0 }, raw_loss: 0.05, ..OK };
+            r.on_sample(s);
+        }
+        assert!(r.mbps() >= 20.0, "{}", r.mbps());
+    }
+
+    #[test]
+    fn steady_raw_loss_with_everything_recovered_changes_nothing() {
+        let mut r = RateController::new(20.0, 6.0, 40.0);
+        for _ in 0..60 {
+            assert!(r.on_sample(Sample { raw_loss: 0.05, ..OK }).is_none() || r.mbps() >= 20.0);
+        }
+        assert!(r.mbps() >= 20.0);
+    }
+
+    #[test]
+    fn raw_loss_that_stays_very_high_does_lower_it() {
+        let mut r = RateController::new(20.0, 6.0, 40.0);
+        r.on_sample(Sample { raw_loss: 0.3, ..OK });
+        r.on_sample(Sample { raw_loss: 0.3, ..OK });
+        assert_eq!(r.mbps(), 20.0);
+        r.on_sample(Sample { raw_loss: 0.3, ..OK });
+        assert!(r.mbps() < 20.0);
     }
 
     #[test]
