@@ -1,0 +1,2 @@
+tools/install-on-projector.bat -text
+tools/install-on-projector.ps1 -text
