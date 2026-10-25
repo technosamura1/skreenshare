@@ -38,6 +38,7 @@ pub struct Encoder {
     frame: *mut AVFrame,
     pkt: *mut AVPacket,
     pts: i64,
+    fps: u32,
     pub width: u32,
     pub height: u32,
 }
@@ -96,7 +97,18 @@ impl Encoder {
             (*frame).width = cfg.width as i32;
             (*frame).height = cfg.height as i32;
             check(av_frame_get_buffer(frame, 64), "av_frame_get_buffer")?;
-            Ok(Encoder { ctx, frame, pkt: av_packet_alloc(), pts: 0, width: cfg.width, height: cfg.height })
+            Ok(Encoder { ctx, frame, pkt: av_packet_alloc(), pts: 0, fps: cfg.fps, width: cfg.width, height: cfg.height })
+        }
+    }
+
+    /// Changes the target bitrate on the fly; FFmpeg's NVENC wrapper notices the new value on the next
+    /// frame and reconfigures the encoder without a keyframe (GPUs with dynamic bitrate support).
+    pub fn set_bitrate(&mut self, bitrate: u64) {
+        unsafe {
+            let c = &mut *self.ctx;
+            c.bit_rate = bitrate as i64;
+            c.rc_max_rate = bitrate as i64;
+            c.rc_buffer_size = (bitrate / self.fps as u64 * 2) as i32;
         }
     }
 

@@ -57,6 +57,38 @@ pub fn color_test(bitrate: u64, preset: &str, hw: bool) -> Result<()> {
     Ok(())
 }
 
+/// Checks that `set_bitrate` really takes effect mid-stream (noise frames always hit the bitrate cap).
+pub fn bitrate_switch_test(preset: &str) -> Result<()> {
+    let (w, h) = (1280u32, 720u32);
+    let mut enc = Encoder::new(&EncoderConfig { width: w, height: h, fps: 60, bitrate: 40_000_000, preset: preset.into() })?;
+    let mut seed = 0x1234_5678u32;
+    let mut avg = |enc: &mut Encoder, frames: u32| -> Result<f64> {
+        let mut total = 0usize;
+        for _ in 0..frames {
+            let (buf, stride) = enc.input()?;
+            for y in 0..h as usize {
+                for b in &mut buf[y * stride..y * stride + w as usize * 4] {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    *b = seed as u8;
+                }
+            }
+            enc.encode(false, |d, _| total += d.len())?;
+        }
+        Ok(total as f64 / frames as f64 / 1024.0)
+    };
+    let hi = avg(&mut enc, 60)?;
+    enc.set_bitrate(8_000_000);
+    let _ = avg(&mut enc, 10)?; // let the rate control settle
+    let lo = avg(&mut enc, 60)?;
+    println!(
+        "Смена битрейта на лету: 40 Мбит/с → {hi:.0} КБ/кадр, 8 Мбит/с → {lo:.0} КБ/кадр {}",
+        if lo < hi * 0.4 { "— OK" } else { "— НЕ РАБОТАЕТ" }
+    );
+    Ok(())
+}
+
 pub fn capture_test(monitor: crate::capture::MonitorInfo, bitrate: u64, preset: &str, hw: bool, out: &Path) -> Result<()> {
     let mut cap = Capturer::new(&monitor)?;
     let (w, h) = (cap.width, cap.height);

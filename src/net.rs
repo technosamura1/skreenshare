@@ -17,6 +17,10 @@ pub const PT_KEYREQ: u8 = 0xA0;
 pub const PT_PING: u8 = 0xA1;
 pub const PT_PONG: u8 = 0xA2;
 pub const PT_BYE: u8 = 0xA3;
+/// Client -> host: resend these fragments. frame_id u32 | n u16 | n × frag_idx u16 (n = 0: whole frame).
+pub const PT_NACK: u8 = 0xA4;
+/// Client -> host: totals of fragments received / found missing, for bitrate control.
+pub const PT_REPORT: u8 = 0xA5;
 
 pub const ROLE_HOST: u8 = 1;
 pub const ROLE_CLIENT: u8 = 2;
@@ -33,6 +37,21 @@ const STUN_SERVERS: &[&str] = &[
     "stun.nextcloud.com:3478",
 ];
 const STUN_COOKIE: u32 = 0x2112_A442;
+
+/// Test hook: SS_SIM_LOSS=0.02 drops 2% of the media packets we send, to rehearse a bad connection.
+fn sim_loss() -> f64 {
+    static P: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("SS_SIM_LOSS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
+}
+
+/// send_to for media packets (subject to the loss simulation).
+pub fn send_media(sock: &UdpSocket, pkt: &[u8], to: SocketAddr) {
+    let p = sim_loss();
+    if p > 0.0 && (u32::from_le_bytes(random_bytes::<4>()) as f64 / u32::MAX as f64) < p {
+        return;
+    }
+    let _ = sock.send_to(pkt, to);
+}
 
 pub fn write_header(buf: &mut Vec<u8>, ty: u8, token: u32) {
     buf.clear();

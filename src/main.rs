@@ -136,6 +136,7 @@ fn run(mut a: Args) -> Result<()> {
             let out = PathBuf::from(a.value("--out")?.unwrap_or_else(|| "selftest.bmp".into()));
             a.finish()?;
             selftest::color_test(bitrate, &preset, hw)?;
+            selftest::bitrate_switch_test(&preset)?;
             let m = host::pick_monitor(mon, false)?;
             selftest::capture_test(m, bitrate, &preset, hw, &out)?;
         }
