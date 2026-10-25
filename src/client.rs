@@ -455,7 +455,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         let frames_limit = o.frames;
         std::thread::spawn(move || {
             boost_thread();
-            let mut dec = match Decoder::new(hw) {
+            let mut dec = match Decoder::new(hw, crate::encsel::Codec::Hevc) {
                 Ok(d) => d,
                 Err(e) => {
                     println!("Декодер не запустился: {e:#}");
@@ -474,8 +474,25 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             let mut px: Vec<u32> = Vec::new();
             let mut done = false;
             let mut flash = crate::avsync::FlashEdge::default();
-            for (data, _key, arrived) in frame_rx {
+            for (data, key, arrived) in frame_rx {
                 let waiting = sh.qdepth.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                // The host fell back from the video card (HEVC) to the processor (H.264) or back: the keyframe's
+                // parameter sets tell which codec this stream is, and the decoder follows.
+                if key {
+                    if let Some(kind) = crate::encsel::detect_codec(&data) {
+                        if kind != dec.codec {
+                            match Decoder::new(hw && !gpu_failed, kind) {
+                                Ok(d) => {
+                                    println!("Поток теперь {kind:?} — переключаю декодер.");
+                                    dec = d;
+                                    watch = HwWatch::new();
+                                    sh.dec_mode.store(dec.hardware as u8, Ordering::Relaxed);
+                                }
+                                Err(e) => println!("Декодер {kind:?} не запустился: {e:#}"),
+                            }
+                        }
+                    }
+                }
                 // Behind by a few frames: still decode (P-frames need it) but skip the readback, colour
                 // conversion and drawing. The picture on screen then jumps to the newest frame instead of
                 // lagging by the whole backlog.
@@ -568,7 +585,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     }
                     if watch.on_packet(ok, pictures) && sh.dec_mode.load(Ordering::Relaxed) != 2 {
                         gpu_failed = true;
-                        match Decoder::new(false) {
+                        match Decoder::new(false, dec.codec) {
                             Ok(d) => {
                                 println!("Декодер видеокарты не работает — перехожу на процессор.");
                                 dec = d;

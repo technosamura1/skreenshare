@@ -443,7 +443,9 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
     let (mut pv, pv_thread) = Preview::new();
     let mut scaler = BgraScaler::new();
     let mut scratch: Vec<u8> = Vec::new();
-    let period = Duration::from_secs_f64(1.0 / o.fps as f64);
+    let mut period = Duration::from_secs_f64(1.0 / o.fps as f64);
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let mut enc_short = String::new();
     let mut enc: Option<Encoder> = None;
     let mut dirty = true;
     let mut force_key = true;
@@ -536,13 +538,30 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
             continue;
         }
         if enc.is_none() {
-            enc = Some(Encoder::new(&EncoderConfig {
-                width: canvas.0,
-                height: canvas.1,
-                fps: o.fps,
-                bitrate: (rc.cur * 1e6) as u64,
-                preset: o.preset.clone(),
-            })?);
+            let (e, note) = Encoder::open_best(
+                &EncoderConfig {
+                    width: canvas.0,
+                    height: canvas.1,
+                    fps: o.fps,
+                    bitrate: (rc.cur * 1e6) as u64,
+                    preset: o.preset.clone(),
+                },
+                cores,
+            )?;
+            ui::encoder(&e.label, note.as_deref());
+            enc_short = match e.backend {
+                crate::video::Backend::Nvenc => "NVENC".to_string(),
+                crate::video::Backend::X264 => "x264 (процессор)".to_string(),
+            };
+            // Software encoding: its own frame rate and a bitrate the CPU can really produce.
+            period = Duration::from_secs_f64(1.0 / e.fps as f64);
+            if let Some(cap) = e.max_mbps {
+                if rc.cur > cap {
+                    rc = RateControl::new(cap, Instant::now());
+                    sh.send_rate.store(pacer_rate(cap, o.max_send_mbps), Ordering::Relaxed);
+                }
+            }
+            enc = Some(e);
             force_key = true;
             pv.reset();
         }
@@ -589,7 +608,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
             let bytes = sh.sent_bytes.load(Ordering::Relaxed);
             let resent = sh.resent.load(Ordering::Relaxed);
             ui::stat(&format!(
-                "{:.0} кадров/с · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · кодирование {:.1} мс",
+                "{enc_short} · {:.0} кадров/с · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · кодирование {:.1} мс",
                 stat_frames as f64 / secs,
                 (bytes - stat_bytes0) as f64 * 8.0 / secs / 1e6,
                 rc.cur,

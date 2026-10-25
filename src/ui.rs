@@ -47,6 +47,21 @@ pub fn diag(text: &str) {
     }
 }
 
+/// Which encoder runs ("Кодирование: видеокарта NVENC ...") and, when the video card was skipped, why.
+pub fn encoder(label: &str, note: Option<&str>) {
+    if ipc() {
+        println!("@ENCODER {label}");
+        if let Some(n) = note {
+            println!("@ENCWARN {}", n.replace('\n', " "));
+        }
+    } else {
+        println!("{label}");
+        if let Some(n) = note {
+            println!("Видеокарта не используется: {n}");
+        }
+    }
+}
+
 pub fn audio_status(text: &str) {
     if ipc() {
         println!("@AUDIO {text}");

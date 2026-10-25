@@ -23,7 +23,7 @@ fn rgb(p: u32) -> (u8, u8, u8) {
 pub fn color_test(bitrate: u64, preset: &str, hw: bool) -> Result<()> {
     let (w, h) = (1280u32, 720u32);
     let mut enc = Encoder::new(&EncoderConfig { width: w, height: h, fps: 60, bitrate, preset: preset.into() })?;
-    let mut dec = Decoder::new(hw)?;
+    let mut dec = Decoder::new(hw, crate::encsel::Codec::Hevc)?;
     let mut sc = Scaler::new();
     let mut last: Vec<u32> = Vec::new();
     let mut keys = 0;
@@ -94,7 +94,7 @@ pub fn capture_test(monitor: crate::capture::MonitorInfo, bitrate: u64, preset: 
     let (w, h) = (cap.width, cap.height);
     println!("Захват {w}x{h} ({}), 3 секунды — подвигай мышкой/окнами...", monitor.adapter);
     let mut enc = Encoder::new(&EncoderConfig { width: w, height: h, fps: 60, bitrate, preset: preset.into() })?;
-    let mut dec = Decoder::new(hw)?;
+    let mut dec = Decoder::new(hw, crate::encsel::Codec::Hevc)?;
     let mut sc = Scaler::new();
     let mut img: Vec<u32> = Vec::new();
     let (mut n, mut bytes) = (0u32, 0usize);

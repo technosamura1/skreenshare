@@ -11,6 +11,7 @@ mod gui;
 mod host;
 mod loopback;
 mod easy;
+mod encsel;
 mod net;
 mod ntfy;
 mod preview;

@@ -167,6 +167,9 @@ struct Session {
     /// Viewer diagnostics (`@DIAG`): decoder type, timings, queue, jitter.
     diag: String,
     audio: String,
+    /// Encoder in use and, if the video card was skipped, the reason.
+    encoder: String,
+    enc_warn: String,
     /// What is shown (window / screen) and whether that is a fallback warning.
     source: String,
     source_warn: bool,
@@ -193,6 +196,8 @@ impl Session {
             stats: String::new(),
             diag: String::new(),
             audio: String::new(),
+            encoder: String::new(),
+            enc_warn: String::new(),
             source: String::new(),
             source_warn: false,
             preview_raw: None,
@@ -217,6 +222,10 @@ impl Session {
                 self.stats = s.to_string();
             } else if let Some(d) = l.strip_prefix("@DIAG ") {
                 self.diag = d.to_string();
+            } else if let Some(a) = l.strip_prefix("@ENCODER ") {
+                self.encoder = a.to_string();
+            } else if let Some(a) = l.strip_prefix("@ENCWARN ") {
+                self.enc_warn = a.to_string();
             } else if let Some(a) = l.strip_prefix("@AUDIO ") {
                 self.audio = a.to_string();
             } else if let Some(p) = l.strip_prefix("@PREVIEW ") {
@@ -744,6 +753,12 @@ impl GuiApp {
             section(ui, |ui| {
                 status_dot(ui, GREEN, "Идёт трансляция");
                 ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
+                if !s.encoder.is_empty() {
+                    ui.label(RichText::new(&s.encoder).color(TEXT));
+                }
+                if !s.enc_warn.is_empty() {
+                    ui.label(RichText::new(format!("Видеокарта не используется: {}", s.enc_warn)).color(RED));
+                }
                 ui.add_space(6.0);
                 if !s.source.is_empty() && s.source_warn {
                     ui.label(RichText::new(&s.source).color(if s.source_warn { RED } else { TEXT }));

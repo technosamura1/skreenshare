@@ -146,6 +146,20 @@
       логика, 7 тестов в lossim + 1 ignored реальный round-trip через ntfy.sh), `ntfy.rs` (curl.exe), `Exchange::Relay`.
       **Не проверено:** запуск exe на Windows (нет Windows) — GPU-декод, окно, GUI, curl.exe из exe.
 
+### 0.7.1 — NVENC на старых драйверах + запасной x264
+
+- Причина «Function not implemented» (ENOSYS из nvenc.c): драйвер друга < минимального для API, под который собран FFmpeg
+  (headers 13.1 → драйвер 610). Пояснение FFmpeg прятал уровень лога ERROR.
+- FFmpeg 9.0.2 пересобран под nv-codec-headers n11.1.5.3 (API 11.1, драйвер ≥ 471.41), + libx264 (static, GPL);
+  AMF/QSV/MF/openh264 убраны. Скрипт: `tools/build-ffmpeg.sh`.
+- `video.rs`: лог FFmpeg перехватывается при открытии (`encsel::parse_nv_log`/`explain_nvenc` → конкретный текст с
+  минимальным драйвером), `Encoder::open_best`: NVENC → x264 (ultrafast, zerolatency, swscale BGRA→YUV420 с масштабом по
+  `encsel::soft_plan`: 1080p30/1080p60/720p30 по числу ядер). `SS_ENCODER=nvenc|x264`.
+- `client.rs`: декодер переключается по кодеку первого ключевого кадра (`encsel::detect_codec`).
+- GUI: строка «Кодирование: …» + красная причина; в статистике префикс кодировщика.
+- Не проверено на Windows с реальной картой: собрано кросс-компиляцией; DLL проверены под wine (x264 → H.264 decode,
+  NVENC без драйвера даёт чистую ошибку).
+
 ## Известные косяки (TODO)
 - **HDR (важно, отложено по просьбе пользователя 2026-10-24):** при включённом HDR в Windows картинка в стриме
   засвечена — legacy `DuplicateOutput` отдаёт плохо смапленный BGRA8. Это видит и друг. План фикса: если

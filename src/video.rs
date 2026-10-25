@@ -1,8 +1,15 @@
-// Thin wrappers over the FFmpeg C API: HEVC NVENC encoder, D3D11VA decoder, swscale converter.
+// Thin wrappers over the FFmpeg C API: HEVC NVENC encoder (x264 fallback), D3D11VA decoder, swscale converter.
 use anyhow::{bail, Result};
 use ffmpeg_next::ffi::*;
-use std::ffi::{CStr, CString};
+use crate::encsel::{self, Codec, SoftPlan};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+/// Oldest NVIDIA driver (Windows) that has the NVENC API this build of FFmpeg was compiled against
+/// (nv-codec-headers n11.1.5.3 = NVENC API 11.1). FFmpeg prints the same number itself when the driver is older.
+pub const NVENC_MIN_DRIVER: &str = "471.41";
 
 const EAGAIN: i32 = -11;
 
@@ -21,9 +28,50 @@ fn check(code: i32, what: &str) -> Result<i32> {
     Ok(code)
 }
 
-pub fn set_log_quiet() {
-    unsafe { av_log_set_level(AV_LOG_ERROR as i32) };
+/// FFmpeg's own messages while an encoder is being opened (the reason NVENC refuses to start is only there).
+static OPEN_LOG: Mutex<String> = Mutex::new(String::new());
+static CAPTURING: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn log_cb(ptr: *mut c_void, level: c_int, fmt: *const c_char, vl: va_list) {
+    let mut buf = [0 as c_char; 1024];
+    let mut prefix: c_int = 1;
+    av_log_format_line2(ptr, level, fmt, vl, buf.as_mut_ptr(), buf.len() as c_int, &mut prefix);
+    let line = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
+    if CAPTURING.load(Ordering::Relaxed) {
+        if let Ok(mut l) = OPEN_LOG.lock() {
+            if l.len() < 16_000 {
+                l.push_str(&line);
+            }
+        }
+    } else if level <= AV_LOG_ERROR as i32 {
+        eprint!("{line}");
+    }
 }
+
+pub fn set_log_quiet() {
+    unsafe {
+        av_log_set_callback(Some(log_cb));
+        av_log_set_level(AV_LOG_ERROR as i32);
+    }
+}
+
+/// Runs `f` with FFmpeg's log at verbose level and returns what it printed.
+fn with_log<T>(f: impl FnOnce() -> T) -> (T, String) {
+    if let Ok(mut l) = OPEN_LOG.lock() {
+        l.clear();
+    }
+    CAPTURING.store(true, Ordering::Relaxed);
+    unsafe { av_log_set_level(AV_LOG_VERBOSE as i32) };
+    let r = f();
+    unsafe { av_log_set_level(AV_LOG_ERROR as i32) };
+    CAPTURING.store(false, Ordering::Relaxed);
+    let log = OPEN_LOG.lock().map(|l| l.clone()).unwrap_or_default();
+    (r, log)
+}
+
+/// NVENC failed once on this PC: later encoders (e.g. after a resolution change) go straight to the processor.
+static NVENC_BAD: AtomicBool = AtomicBool::new(false);
+static NVENC_NOTE: Mutex<String> = Mutex::new(String::new());
 
 pub struct EncoderConfig {
     pub width: u32,
@@ -33,43 +81,128 @@ pub struct EncoderConfig {
     pub preset: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Nvenc,
+    X264,
+}
+
 pub struct Encoder {
     ctx: *mut AVCodecContext,
+    /// BGRA frame the caller draws into (`input()`), always the size of the captured picture.
     frame: *mut AVFrame,
+    /// Software path only: YUV 4:2:0 picture at the (possibly smaller) encoded size, and BGRA -> YUV converter.
+    yuv: *mut AVFrame,
+    sws: *mut SwsContext,
     pkt: *mut AVPacket,
     pts: i64,
-    fps: u32,
+    /// Frame rate the encoder runs at (software encoding may be limited to 30).
+    pub fps: u32,
     pub width: u32,
     pub height: u32,
+    pub backend: Backend,
+    #[allow(dead_code)]
+    pub codec: Codec,
+    /// Size of the encoded picture (differs from `width`x`height` when software encoding scales down).
+    #[allow(dead_code)]
+    pub out_w: u32,
+    #[allow(dead_code)]
+    pub out_h: u32,
+    /// For the status line, e.g. "NVENC · HEVC · 2560x1440".
+    pub label: String,
+    /// Top bitrate worth using (software encoding), Mbit/s.
+    pub max_mbps: Option<f64>,
 }
 
 unsafe impl Send for Encoder {}
 
+fn set_common(c: &mut AVCodecContext, cfg: &EncoderConfig, fps: u32, bitrate: u64) {
+    c.time_base = AVRational { num: 1, den: fps as i32 };
+    c.framerate = AVRational { num: fps as i32, den: 1 };
+    c.bit_rate = bitrate as i64;
+    c.rc_max_rate = bitrate as i64;
+    // ~2 frames of VBV: low latency without starving detailed frames.
+    c.rc_buffer_size = (bitrate / fps as u64 * 2) as i32;
+    // Huge GOP: keyframes only at start and when the client asks after packet loss.
+    c.gop_size = fps as i32 * 600;
+    c.max_b_frames = 0;
+    c.colorspace = AVColorSpace::AVCOL_SPC_BT709;
+    c.color_primaries = AVColorPrimaries::AVCOL_PRI_BT709;
+    c.color_trc = AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+    c.color_range = AVColorRange::AVCOL_RANGE_MPEG;
+    let _ = cfg;
+}
+
 impl Encoder {
+    /// NVENC only (selftest, `--encoder nvenc`): the error carries a readable explanation and the minimum driver.
     pub fn new(cfg: &EncoderConfig) -> Result<Encoder> {
+        Self::new_nvenc(cfg).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// The normal path: NVENC if the driver allows it, else x264 on the processor at a size the CPU can carry.
+    /// `SS_ENCODER=nvenc|x264` forces one (testing). Returns the encoder and, when NVENC was skipped or failed,
+    /// the reason (shown in the GUI as a notice).
+    pub fn open_best(cfg: &EncoderConfig, cores: usize) -> Result<(Encoder, Option<String>)> {
+        let forced = std::env::var("SS_ENCODER").unwrap_or_default().to_lowercase();
+        let mut note = None;
+        let mut nv_err = String::new();
+        if forced != "x264" && !NVENC_BAD.load(Ordering::Relaxed) {
+            match Self::new_nvenc(cfg) {
+                Ok(e) => return Ok((e, None)),
+                Err(why) => {
+                    NVENC_BAD.store(true, Ordering::Relaxed);
+                    if let Ok(mut n) = NVENC_NOTE.lock() {
+                        *n = why.clone();
+                    }
+                    nv_err = why;
+                }
+            }
+        } else if forced == "x264" {
+            nv_err = "кодирование на видеокарте отключено (SS_ENCODER=x264)".into();
+        } else if let Ok(n) = NVENC_NOTE.lock() {
+            nv_err = n.clone();
+        }
+        if forced == "nvenc" {
+            bail!("{nv_err}");
+        }
+        if !nv_err.is_empty() {
+            note = Some(nv_err.clone());
+        }
+        let plan = encsel::soft_plan(cores, cfg.width, cfg.height, cfg.fps);
+        match Self::new_x264(cfg, plan) {
+            Ok(e) => Ok((e, note)),
+            Err(x) => bail!(
+                "Не удалось запустить кодирование видео. {nv_err} Кодирование на процессоре (x264) тоже не запустилось: {x:#}. \
+                 Что сделать: 1) обнови драйвер видеокарты NVIDIA (нужен {NVENC_MIN_DRIVER} или новее) на nvidia.com/drivers и перезапусти программу; \
+                 2) закрой другие программы, которые могут занимать кодировщик (запись экрана, OBS, GeForce Experience); \
+                 3) если не помогло — пришли файл viewer.log или этот текст разработчику."
+            ),
+        }
+    }
+
+    fn alloc_input(cfg: &EncoderConfig) -> Result<*mut AVFrame> {
+        unsafe {
+            let frame = av_frame_alloc();
+            (*frame).format = AVPixelFormat::AV_PIX_FMT_BGRA as i32;
+            (*frame).width = cfg.width as i32;
+            (*frame).height = cfg.height as i32;
+            check(av_frame_get_buffer(frame, 64), "av_frame_get_buffer")?;
+            Ok(frame)
+        }
+    }
+
+    fn new_nvenc(cfg: &EncoderConfig) -> std::result::Result<Encoder, String> {
         unsafe {
             let codec = avcodec_find_encoder_by_name(c"hevc_nvenc".as_ptr());
             if codec.is_null() {
-                bail!("в FFmpeg нет hevc_nvenc");
+                return Err("в FFmpeg нет hevc_nvenc".into());
             }
             let ctx = avcodec_alloc_context3(codec);
             let c = &mut *ctx;
             c.width = cfg.width as i32;
             c.height = cfg.height as i32;
-            c.time_base = AVRational { num: 1, den: cfg.fps as i32 };
-            c.framerate = AVRational { num: cfg.fps as i32, den: 1 };
             c.pix_fmt = AVPixelFormat::AV_PIX_FMT_BGRA;
-            c.bit_rate = cfg.bitrate as i64;
-            c.rc_max_rate = cfg.bitrate as i64;
-            // ~2 frames of VBV: low latency without starving detailed frames.
-            c.rc_buffer_size = (cfg.bitrate / cfg.fps as u64 * 2) as i32;
-            // Huge GOP: keyframes only at start and when the client asks after packet loss.
-            c.gop_size = cfg.fps as i32 * 600;
-            c.max_b_frames = 0;
-            c.colorspace = AVColorSpace::AVCOL_SPC_BT709;
-            c.color_primaries = AVColorPrimaries::AVCOL_PRI_BT709;
-            c.color_trc = AVColorTransferCharacteristic::AVCOL_TRC_BT709;
-            c.color_range = AVColorRange::AVCOL_RANGE_MPEG;
+            set_common(c, cfg, cfg.fps, cfg.bitrate);
 
             let mut opts: *mut AVDictionary = ptr::null_mut();
             let preset = CString::new(cfg.preset.as_str()).unwrap();
@@ -84,20 +217,116 @@ impl Encoder {
             ] {
                 av_dict_set(&mut opts, k.as_ptr(), v.as_ptr(), 0);
             }
+            let (r, log) = with_log(|| avcodec_open2(ctx, codec, &mut opts));
+            av_dict_free(&mut opts);
+            if r < 0 {
+                let mut ctx = ctx;
+                avcodec_free_context(&mut ctx);
+                let why = encsel::explain_nvenc(&av_err(r), &log, NVENC_MIN_DRIVER);
+                let tail = encsel::parse_nv_log(&log).tail.join(" | ");
+                eprintln!("NVENC: {} ({}) FFmpeg: {tail}", av_err(r), r);
+                return Err(why);
+            }
+            let gpu = encsel::parse_nv_log(&log).gpus.first().cloned();
+            let frame = Self::alloc_input(cfg).map_err(|e| format!("{e:#}"))?;
+            Ok(Encoder {
+                ctx,
+                frame,
+                yuv: ptr::null_mut(),
+                sws: ptr::null_mut(),
+                pkt: av_packet_alloc(),
+                pts: 0,
+                fps: cfg.fps,
+                width: cfg.width,
+                height: cfg.height,
+                backend: Backend::Nvenc,
+                codec: Codec::Hevc,
+                out_w: cfg.width,
+                out_h: cfg.height,
+                label: format!(
+                    "Кодирование: видеокарта NVENC (HEVC){} · {}x{}",
+                    gpu.map(|g| format!(", {g}")).unwrap_or_default(),
+                    cfg.width,
+                    cfg.height
+                ),
+                max_mbps: None,
+            })
+        }
+    }
+
+    fn new_x264(cfg: &EncoderConfig, plan: SoftPlan) -> Result<Encoder> {
+        unsafe {
+            let codec = avcodec_find_encoder_by_name(c"libx264".as_ptr());
+            if codec.is_null() {
+                bail!("в FFmpeg нет libx264");
+            }
+            let ctx = avcodec_alloc_context3(codec);
+            let c = &mut *ctx;
+            c.width = plan.width as i32;
+            c.height = plan.height as i32;
+            c.pix_fmt = AVPixelFormat::AV_PIX_FMT_YUV420P;
+            let mbps = (cfg.bitrate as f64 / 1e6).min(plan.max_mbps);
+            let bitrate = (mbps * 1e6) as u64;
+            set_common(c, cfg, plan.fps, bitrate);
+            let mut opts: *mut AVDictionary = ptr::null_mut();
+            for (k, v) in [
+                (c"preset", c"ultrafast"),
+                (c"tune", c"zerolatency"),
+                (c"forced-idr", c"1"),
+                (c"x264-params", c"scenecut=0:repeat-headers=1:aud=0"),
+            ] {
+                av_dict_set(&mut opts, k.as_ptr(), v.as_ptr(), 0);
+            }
             let r = avcodec_open2(ctx, codec, &mut opts);
             av_dict_free(&mut opts);
             if r < 0 {
                 let mut ctx = ctx;
                 avcodec_free_context(&mut ctx);
-                bail!("не удалось запустить NVENC: {} (нужна видеокарта NVIDIA и свежий драйвер)", av_err(r));
+                bail!("{}", av_err(r));
             }
-
-            let frame = av_frame_alloc();
-            (*frame).format = AVPixelFormat::AV_PIX_FMT_BGRA as i32;
-            (*frame).width = cfg.width as i32;
-            (*frame).height = cfg.height as i32;
-            check(av_frame_get_buffer(frame, 64), "av_frame_get_buffer")?;
-            Ok(Encoder { ctx, frame, pkt: av_packet_alloc(), pts: 0, fps: cfg.fps, width: cfg.width, height: cfg.height })
+            let frame = Self::alloc_input(cfg)?;
+            let yuv = av_frame_alloc();
+            (*yuv).format = AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+            (*yuv).width = plan.width as i32;
+            (*yuv).height = plan.height as i32;
+            check(av_frame_get_buffer(yuv, 32), "av_frame_get_buffer")?;
+            let sws = sws_getContext(
+                cfg.width as i32,
+                cfg.height as i32,
+                AVPixelFormat::AV_PIX_FMT_BGRA,
+                plan.width as i32,
+                plan.height as i32,
+                AVPixelFormat::AV_PIX_FMT_YUV420P,
+                2, // SWS_BILINEAR: cheap, no ringing on text when scaling down
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+            );
+            if sws.is_null() {
+                bail!("sws_getContext");
+            }
+            let coeffs = sws_getCoefficients(SWS_CS_ITU709 as i32);
+            sws_setColorspaceDetails(sws, coeffs, 1, coeffs, 0, 0, 1 << 16, 1 << 16);
+            Ok(Encoder {
+                ctx,
+                frame,
+                yuv,
+                sws,
+                pkt: av_packet_alloc(),
+                pts: 0,
+                fps: plan.fps,
+                width: cfg.width,
+                height: cfg.height,
+                backend: Backend::X264,
+                codec: Codec::H264,
+                out_w: plan.width,
+                out_h: plan.height,
+                label: format!(
+                    "Кодирование: процессор x264 (H.264) · {}x{} · {} кадров/с",
+                    plan.width, plan.height, plan.fps
+                ),
+                max_mbps: Some(plan.max_mbps),
+            })
         }
     }
 
@@ -133,11 +362,28 @@ impl Encoder {
 
     pub fn encode(&mut self, force_key: bool, mut out: impl FnMut(&[u8], bool)) -> Result<()> {
         unsafe {
-            (*self.frame).pts = self.pts;
+            let send = if self.backend == Backend::X264 {
+                check(av_frame_make_writable(self.yuv), "av_frame_make_writable")?;
+                let s = [(*self.frame).data[0] as *const u8, ptr::null(), ptr::null(), ptr::null()];
+                let ss = [(*self.frame).linesize[0], 0, 0, 0];
+                sws_scale(
+                    self.sws,
+                    s.as_ptr(),
+                    ss.as_ptr(),
+                    0,
+                    self.height as i32,
+                    (*self.yuv).data.as_ptr() as *const *mut u8,
+                    (*self.yuv).linesize.as_ptr(),
+                );
+                self.yuv
+            } else {
+                self.frame
+            };
+            (*send).pts = self.pts;
             self.pts += 1;
-            (*self.frame).pict_type =
+            (*send).pict_type =
                 if force_key { AVPictureType::AV_PICTURE_TYPE_I } else { AVPictureType::AV_PICTURE_TYPE_NONE };
-            check(avcodec_send_frame(self.ctx, self.frame), "avcodec_send_frame")?;
+            check(avcodec_send_frame(self.ctx, send), "avcodec_send_frame")?;
             loop {
                 let r = avcodec_receive_packet(self.ctx, self.pkt);
                 if r == EAGAIN || r == AVERROR_EOF {
@@ -158,6 +404,12 @@ impl Drop for Encoder {
         unsafe {
             av_packet_free(&mut self.pkt);
             av_frame_free(&mut self.frame);
+            if !self.yuv.is_null() {
+                av_frame_free(&mut self.yuv);
+            }
+            if !self.sws.is_null() {
+                sws_freeContext(self.sws);
+            }
             avcodec_free_context(&mut self.ctx);
         }
     }
@@ -186,16 +438,21 @@ pub struct Decoder {
     /// The last picture really came out of the GPU decoder. FFmpeg quietly falls back to its software decoder
     /// when the GPU can't do this stream; then this stays false although `hardware` is true.
     pub hw_active: bool,
+    pub codec: Codec,
 }
 
 unsafe impl Send for Decoder {}
 
 impl Decoder {
-    pub fn new(allow_hw: bool) -> Result<Decoder> {
+    pub fn new(allow_hw: bool, kind: Codec) -> Result<Decoder> {
         unsafe {
-            let codec = avcodec_find_decoder(AVCodecID::AV_CODEC_ID_HEVC);
+            let id = match kind {
+                Codec::Hevc => AVCodecID::AV_CODEC_ID_HEVC,
+                Codec::H264 => AVCodecID::AV_CODEC_ID_H264,
+            };
+            let codec = avcodec_find_decoder(id);
             if codec.is_null() {
-                bail!("в FFmpeg нет декодера HEVC");
+                bail!("в FFmpeg нет декодера {kind:?}");
             }
             let ctx = avcodec_alloc_context3(codec);
             let mut hardware = false;
@@ -222,7 +479,7 @@ impl Decoder {
                 avcodec_free_context(&mut ctx);
                 bail!("avcodec_open2 (decoder): {}", av_err(r));
             }
-            Ok(Decoder { ctx, pkt: av_packet_alloc(), frame: av_frame_alloc(), sw: av_frame_alloc(), hardware, hw_active: false })
+            Ok(Decoder { ctx, pkt: av_packet_alloc(), frame: av_frame_alloc(), sw: av_frame_alloc(), hardware, hw_active: false, codec: kind })
         }
     }
 

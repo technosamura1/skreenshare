@@ -8,6 +8,9 @@ mod legacy;
 #[path = "../../../src/preview.rs"]
 #[allow(dead_code)]
 mod preview;
+#[path = "../../../src/encsel.rs"]
+#[allow(dead_code)]
+mod encsel;
 #[path = "../../../src/easy.rs"]
 #[allow(dead_code)]
 mod easy;
