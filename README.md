@@ -130,6 +130,15 @@ NVENC API (13.1, драйвер от 610), а у друга (RTX 3060) стоя�
 FFmpeg теперь **GPL** (в нём статически слинкован x264); `third_party/ffmpeg/LICENSE.txt` — GPLv2. Собирается скриптом
 `tools/build-ffmpeg.sh` (Linux, mingw-w64): FFmpeg n9.0.2 + nv-codec-headers n11.1.5.3 + x264.
 
+## «Не удаётся продолжить выполнение кода, поскольку система не обнаружила avcodec-63.dll» (0.7.3)
+
+Версии 0.7.1 и 0.7.2 на чистой Windows **не запускались** с этой ошибкой: библиотеки FFmpeg были подключены к exe
+обычным (статическим) импортом, и Windows искала `avcodec-63.dll` ещё до того, как программа успевала распаковать их
+из самого себя. Причина — GNU-библиотеки импорта от mingw-сборки FFmpeg, для которых /DELAYLOAD игнорируется; плюс
+`avformat-63.dll` не входила в комплект вовсе. В 0.7.3 библиотеки импорта MSVC-формата (`tools/make-import-libs.sh`),
+FFmpeg грузится отложенно, как в 0.7.0; сборка проверяется `tools/check-dlls.sh`. **Если у вас 0.7.1/0.7.2 — просто
+замените файл на 0.7.3.**
+
 ## Если звук трещит (0.7.2)
 
 Что исправлено в программе (звук идёт «хост → сеть → зритель», трещать может любое звено):
@@ -203,11 +212,13 @@ screenshare --help                            всё остальное
 
 Нужны Rust, Visual Studio Build Tools (C++), LLVM, и FFmpeg shared-сборка
 (собирается `tools/build-ffmpeg.sh`; готовая сборка с NVENC API 11.1 + x264 лежит в `third_party/ffmpeg`).
-У BtbN библиотеки импорта в формате GNU — один раз пересоздай их в формате MSVC (нужно для /DELAYLOAD):
+Библиотеки импорта FFmpeg должны быть в формате MSVC (иначе /DELAYLOAD не работает, см. 0.7.3). Один раз после новой
+сборки FFmpeg: на Windows `powershell -ExecutionPolicy Bypass -File tools\make-import-libs.ps1`, на Linux
+`tools/make-import-libs.sh`. Потом сборка и проверка зависимостей:
 
 ```
-powershell -ExecutionPolicy Bypass -File tools\make-import-libs.ps1
 cargo build --release
+tools/check-dlls.sh      # Linux/WSL/git-bash: упадёт, если exe или DLL требуют чего-то, чего нет на чистой Windows
 ```
 
 DLL FFmpeg встраиваются в exe (build.rs, zstd), грузятся отложенно и распаковываются при первом запуске

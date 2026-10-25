@@ -25,4 +25,4 @@ export PKG_CONFIG_PATH=$P/lib/pkgconfig
     --enable-hwaccel=hevc_d3d11va,hevc_d3d11va2,hevc_dxva2,h264_d3d11va,h264_d3d11va2,h264_dxva2 \
     --extra-cflags="-I$P/include" --extra-ldflags="-L$P/lib -static-libgcc" \
   && make -j"$(nproc)" && make install )
-echo "готово: $W/out (скопируй bin, lib, include в third_party/ffmpeg)"
+echo "готово: $W/out (скопируй bin, lib, include в third_party/ffmpeg, затем tools/make-import-libs.sh — иначе exe не запустится)"

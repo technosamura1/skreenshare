@@ -23,6 +23,15 @@ fn main() {
         })
         .collect();
     dlls.sort();
+    // The exe must link against MSVC-format import libs: GNU ones (libav*.dll.a) make the linker ignore
+    // /DELAYLOAD, the exe then imports the DLLs statically and does not even start (0.7.1/0.7.2 bug).
+    let lib = PathBuf::from(std::env::var("FFMPEG_DIR").unwrap()).join("lib");
+    for l in ["avcodec", "avutil", "swscale", "avformat"] {
+        assert!(lib.join(format!("{l}.lib")).exists(), "нет {l}.lib в {}: запусти tools/make-import-libs.sh", lib.display());
+        assert!(!lib.join(format!("lib{l}.dll.a")).exists(), "lib{l}.dll.a мешает /DELAYLOAD: запусти tools/make-import-libs.sh");
+    }
+    // ffmpeg-next links avformat although nothing calls it; it is not shipped, so it must never load at startup.
+    println!("cargo:rustc-link-arg=/DELAYLOAD:avformat-63.dll");
     assert_eq!(dlls.len(), NEEDED.len(), "не все DLL FFmpeg найдены в {}", bin.display());
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
