@@ -62,8 +62,44 @@ class ProtoTest {
         assertEquals(9, p.seq); assertEquals(1234, p.tsMs)
     }
 
+    @Test fun goldenAudioOpus() {
+        // the same bytes as the sender's golden test (proto/src/lib.rs golden_audio_opus)
+        val o = Proto.writeAudioOpus(7, 9, 1234, listOf(byteArrayOf(1, 2, 3), byteArrayOf(4)))
+        assertEquals("d713" + "07000000" + "09000000" + "d2040000" + "02" + "0300" + "010203" + "0100" + "04", hex(o))
+        val p = Proto.parseAudioOpus(o, o.size)!!
+        assertEquals(9, p.seq); assertEquals(1234, p.tsMs); assertEquals(2, p.frames.size)
+        assertEquals("010203", hex(p.frames[0])); assertEquals("04", hex(p.frames[1]))
+        // malformed input is rejected, never throws
+        assertNull(Proto.parseAudioOpus(o, o.size - 1))
+        assertNull(Proto.parseAudioOpus(o, Proto.HEADER_LEN + 8))
+        val zero = o.copyOf(); zero[Proto.HEADER_LEN + 8] = 0
+        assertNull(Proto.parseAudioOpus(zero, zero.size))
+        assertEquals(7, Proto.FEAT_NACK or Proto.FEAT_AUDIO_RED or Proto.FEAT_OPUS)
+    }
+
+    @Test fun opusRxRebuildsLostDatagramsFromTheRedundancy() {
+        fun fr(n: Int) = byteArrayOf(n.toByte())
+        // frame n has the timestamp 10*n; a datagram for seq s carries frames s, s-1, s-2, s-3
+        fun dg(s: Int) = (0..3).filter { s - it >= 0 }.map { fr(s - it) }
+        val rx = OpusRx(); val out = ArrayList<OpusRx.Frame>()
+        for (s in 0..2) rx.onDatagram(s, s * 10L, dg(s), out)
+        assertEquals(listOf(0, 1, 2), out.map { it.data[0].toInt() })
+        out.clear()
+        rx.onDatagram(5, 50, dg(5), out) // 3 and 4 were lost: both come back, oldest first, with their own times
+        assertEquals(listOf(3, 4, 5), out.map { it.data[0].toInt() })
+        assertEquals(listOf(30L, 40L, 50L), out.map { it.tsMs })
+        assertEquals(2, rx.recovered); assertEquals(0, rx.lost)
+        out.clear()
+        rx.onDatagram(5, 50, dg(5), out); rx.onDatagram(4, 40, dg(4), out) // duplicate and late: ignored
+        assertTrue(out.isEmpty())
+        rx.onDatagram(11, 110, dg(11), out) // 6..10 lost: only 3 can be rebuilt (8, 9, 10), 6 and 7 stay holes
+        assertEquals(listOf(8, 9, 10, 11), out.map { it.data[0].toInt() })
+        assertEquals(2, rx.lost); assertEquals(5, rx.recovered)
+    }
+
     @Test fun goldenReportPing() {
-        assertEquals("d724" + "01000000" + "1e00" + "0200" + "0100" + "0500" + "0400", hex(Proto.report(1, Proto.Report(30, 2, 1, 5, 4))))
+        assertEquals("d724" + "01000000" + "1e00" + "0200" + "0100" + "0500" + "0400" + "1f00" + "1d00",
+            hex(Proto.report(1, Proto.Report(30, 2, 1, 5, 4, 31, 29))))
         assertEquals("d721" + "01000000" + "0d0c0b0a", hex(Proto.ping(Proto.T_PING, 1, 0x0a0b0c0d)))
         assertEquals("d72001000000", hex(Proto.simple(Proto.T_KEYREQ, 1)))
     }

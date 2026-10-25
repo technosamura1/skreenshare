@@ -3,6 +3,7 @@ package ru.skreenshare.proektor
 import android.content.Context
 import android.media.MediaCodecList
 import android.os.Build
+import android.os.Process
 import android.util.Log
 import android.view.Surface
 import java.net.DatagramPacket
@@ -21,6 +22,8 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
     interface Listener {
         fun onStreaming(active: Boolean, info: String, width: Int = 0, height: Int = 0)
         fun onError(msg: String)
+        /** Once a second while streaming: a line of figures for the hidden stats overlay. */
+        fun onStats(text: String) {}
     }
 
     private class Session(val id: Int, val peer: InetSocketAddress, val start: Proto.Start, val features: Int)
@@ -38,6 +41,12 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
     private var reasm = Reassembler(this)
     private val keyPolicy = KeyPolicy()
     private var arx: AudioRx? = null
+    private var opusRx: OpusRx? = null
+    private var opusDec: OpusDecoder? = null
+    private val opusOut = ArrayList<OpusRx.Frame>(4)
+    private var recvFrames = 0
+    private var lastRecvFrames = 0
+    private var lastShown = 0
     private val audioOut = ArrayList<AudioRx.Chunk>(4)
     private val nackOut = ArrayList<Proto.NackItem>()
     private var awaitingKey = true
@@ -68,6 +77,8 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
     fun start() {
         if (running) return
         running = true
+        // Find out in the background whether this device decodes Opus (cached; beginSession needs the answer).
+        Thread({ OpusDecoder.selfTest() }, "opus-test").also { it.isDaemon = true; it.start() }
         thread = Thread({ run() }, "net").also { it.start() }
     }
 
@@ -79,12 +90,16 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
     }
 
     private fun run() {
+        // A busy projector must not let the Wi-Fi packets wait behind other work.
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) } catch (_: Throwable) {}
         val sock = try {
             DatagramSocket(null).apply {
                 reuseAddress = true
                 bind(InetSocketAddress(Proto.PORT))
                 broadcast = true
-                try { receiveBufferSize = 4 shl 20 } catch (_: Throwable) {}
+                // 8 MB: a keyframe burst (hundreds of packets) must fit while this thread is busy. The system may give less.
+                try { receiveBufferSize = 8 shl 20 } catch (_: Throwable) {}
+                Log.i(TAG, "udp receive buffer: ${try { receiveBufferSize } catch (_: Throwable) { -1 }}")
                 soTimeout = 3 // short: NACKs and the loss timers are driven from this loop
             }
         } catch (e: Throwable) {
@@ -164,6 +179,16 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
                             pl.push(t, c.data)
                         }
                     }
+                    Proto.T_AUDIO_OPUS -> {
+                        val dec = opusDec ?: return
+                        val rx = opusRx ?: return
+                        val a = Proto.parseAudioOpus(b, len) ?: return
+                        val ts = a.tsMs.toLong() and 0xFFFFFFFFL
+                        opusOut.clear()
+                        rx.onDatagram(a.seq, ts, a.frames, opusOut)
+                        if (cur.start.clockSync != 0 && opusOut.isNotEmpty()) clock?.arrival?.onTimestamp(ts, nowMs)
+                        for (f in opusOut) dec.submit(f.tsMs, f.data)
+                    }
                     Proto.T_PING -> send(sock, b.copyOf(len).also { it[1] = Proto.T_PONG.toByte() }, cur.peer)
                     Proto.T_BYE -> endSession(sendBye = false)
                 }
@@ -181,7 +206,18 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
         clock = mc
         arx = AudioRx(s.audioRate.coerceAtLeast(1), s.audioChannels.coerceAtLeast(1))
         // Only what the sender offered AND we can do; an older sender offers nothing and gets the v0.3 behaviour.
-        val features = s.features and (Proto.FEAT_NACK or Proto.FEAT_AUDIO_RED)
+        var features = s.features and (Proto.FEAT_NACK or Proto.FEAT_AUDIO_RED or Proto.FEAT_OPUS)
+        // Opus needs 48 kHz stereo, a codec that really decoded our test tone, and a working audio player to feed.
+        var opus = false
+        if (features and Proto.FEAT_OPUS != 0 && s.audioRate == 48000 && s.audioChannels == 2 && OpusDecoder.selfTest()) {
+            try {
+                val rx = OpusRx()
+                opusDec = OpusDecoder { ts, pcm -> audio?.push(ts, pcm) }
+                opusRx = rx
+                opus = true
+            } catch (e: Throwable) { Log.w(TAG, "opus decoder: $e") }
+        }
+        if (!opus) features = features and Proto.FEAT_OPUS.inv() // the sender then stays with PCM + redundancy
         reasm = Reassembler(this, if (features and Proto.FEAT_NACK != 0) Reassembler.Config() else Reassembler.Config.withoutNack())
         try {
             decoder = VideoDecoder(surf, s.width, s.height, s.fps, { needKey = true }, mc,
@@ -201,6 +237,7 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
         needKey = true
         lastPacketAt = System.nanoTime()
         lastReport = lastPacketAt
+        recvFrames = 0; lastRecvFrames = 0; lastShown = 0
         lastDecoded = 0; lastDropped = 0; lastLost = 0; lastNacked = 0; lastRecovered = 0
         send(sock, Proto.startAck(id, features), peer)
         listener.onStreaming(true, "${peer.address.hostAddress}  ${s.width}x${s.height} ${s.fps} к/с", s.width, s.height)
@@ -211,6 +248,7 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
         session = null
         if (sendBye) socket?.let { send(it, Proto.simple(Proto.T_BYE, s.id), s.peer) }
         decoder?.release(); decoder = null
+        opusDec?.release(); opusDec = null; opusRx = null
         audio?.release(); audio = null
         clock = null
         reasm.reset()
@@ -243,9 +281,22 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
                 val lost = reasm.lost
                 val nk = reasm.nackedPkts
                 val rc = reasm.recoveredPkts
+                val shown = d?.shown?.get() ?: 0
+                val rcv = recvFrames
                 send(sock, Proto.report(s.id, Proto.Report(dec - lastDecoded, lost - lastLost, drp - lastDropped,
-                    nk - lastNacked, rc - lastRecovered)), s.peer)
+                    nk - lastNacked, rc - lastRecovered, rcv - lastRecvFrames, shown - lastShown)), s.peer)
+                val ap = audio
+                val sound = when {
+                    ap == null -> "нет"
+                    opusDec != null -> "Opus"
+                    else -> "PCM"
+                }
+                listener.onStats("принято ${rcv - lastRecvFrames} · показано ${shown - lastShown} к/с · декодировано ${dec - lastDecoded}" +
+                    " · потеряно кадров ${lost - lastLost}, пропущено ${drp - lastDropped}" +
+                    " · перезапросов $nk, вернулось $rc" +
+                    " · звук $sound" + (if (ap != null) ", буфер ${ap.bufferedMs()}/${ap.startMs} мс, перебоев ${ap.underruns.get()}" else ""))
                 lastDecoded = dec; lastDropped = drp; lastLost = lost; lastNacked = nk; lastRecovered = rc
+                lastRecvFrames = rcv; lastShown = shown
             }
         }
         if ((now - lastHello) / 1_000_000 >= 1000) {
@@ -257,6 +308,7 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
     // ---- Reassembler.Sink (called on the network thread)
     override fun onFrame(frameId: Int, tsMs: Int, key: Boolean, data: ByteArray) {
         val d = decoder ?: return
+        recvFrames++
         clock?.arrival?.onTimestamp(tsMs.toLong() and 0xFFFFFFFFL, System.nanoTime() / 1_000_000)
         if (awaitingKey) {
             if (!key) return
@@ -285,6 +337,7 @@ class Engine(private val ctx: Context, private val listener: Listener) : Reassem
     }
 
     private fun detectCaps(): Caps {
+        if (Build.VERSION.SDK_INT < 21) return Caps(1280, 720, 30) // no codec list API before Android 5: be modest
         try {
             val infos = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
                 .filter { !it.isEncoder && it.supportedTypes.any { t -> t.equals("video/avc", true) } }

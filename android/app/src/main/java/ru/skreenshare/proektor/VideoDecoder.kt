@@ -3,6 +3,7 @@ package ru.skreenshare.proektor
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Process
 import android.util.Log
 import android.view.Surface
 import java.util.concurrent.ArrayBlockingQueue
@@ -32,6 +33,8 @@ class VideoDecoder(
     @Volatile private var running = true
     val decoded = AtomicInteger()
     val dropped = AtomicInteger()
+    /** Frames actually put on the screen. */
+    val shown = AtomicInteger()
     private val feeder: Thread
     private val drainer: Thread
 
@@ -71,6 +74,7 @@ class VideoDecoder(
     }
 
     private fun feedLoop() {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY) } catch (_: Throwable) {}
         try {
             while (running) {
                 val item = queue.poll(50, TimeUnit.MILLISECONDS) ?: continue
@@ -82,7 +86,7 @@ class VideoDecoder(
                     onNeedKey()
                     continue
                 }
-                val buf = codec.getInputBuffer(idx)!!
+                val buf = inputBuffer(idx)
                 buf.clear()
                 buf.put(item.data)
                 codec.queueInputBuffer(idx, 0, item.data.size, item.tsUs, 0)
@@ -92,7 +96,12 @@ class VideoDecoder(
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun inputBuffer(idx: Int) =
+        if (Build.VERSION.SDK_INT >= 21) codec.getInputBuffer(idx)!! else codec.inputBuffers[idx]
+
     private fun drainLoop() {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY) } catch (_: Throwable) {}
         val info = MediaCodec.BufferInfo()
         try {
             while (running) {
@@ -116,6 +125,7 @@ class VideoDecoder(
         var clockMs = c?.nowMs(now)
         if (c == null || clockMs == null) {
             codec.releaseOutputBuffer(idx, true)
+            shown.incrementAndGet()
             return
         }
         val d = VideoPacer.decide(ptsMs, clockMs, consecutiveDrops)
@@ -138,6 +148,7 @@ class VideoDecoder(
                 }
                 consecutiveDrops = 0
                 codec.releaseOutputBuffer(idx, true)
+                shown.incrementAndGet()
             }
         }
         val late = (clockMs ?: ptsMs) - ptsMs

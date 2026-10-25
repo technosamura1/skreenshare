@@ -25,6 +25,8 @@ class MainActivity : Activity(), Engine.Listener, SurfaceHolder.Callback {
     private lateinit var title: TextView
     private lateinit var hint: TextView
     private lateinit var addr: TextView
+    private lateinit var stats: TextView
+    private var statsOn = false
     private lateinit var engine: Engine
     private lateinit var nsd: Nsd
     private var multicast: WifiManager.MulticastLock? = null
@@ -57,6 +59,16 @@ class MainActivity : Activity(), Engine.Listener, SurfaceHolder.Callback {
         box.addView(title); box.addView(hint); box.addView(addr); box.addView(back)
         overlay = box
         root.addView(box, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        // Hidden by default; OK / Enter / Menu / Info on the remote (or a tap) shows the figures of the stream.
+        stats = TextView(this).apply {
+            textSize = 14f
+            setTextColor(0xFFE6FFE6.toInt())
+            setBackgroundColor(0xB0000000.toInt())
+            setPadding(16, 8, 16, 8)
+            visibility = View.GONE
+        }
+        root.addView(stats, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
+        root.setOnClickListener { toggleStats() }
         setContentView(root)
         // Rotation / split screen on a phone: re-fit the picture (letterboxed) to the new size.
         root.addOnLayoutChangeListener { _, l, tp, r, b, ol, ot, or, ob ->
@@ -122,6 +134,16 @@ class MainActivity : Activity(), Engine.Listener, SurfaceHolder.Callback {
         runOnUiThread { showStreaming(active, info, width, height) }
     }
 
+    override fun onStats(text: String) {
+        if (statsOn) runOnUiThread { stats.text = text }
+    }
+
+    private fun toggleStats() {
+        statsOn = !statsOn
+        stats.visibility = if (statsOn && streaming) View.VISIBLE else View.GONE
+        if (statsOn) stats.text = "Статистика включится через секунду…"
+    }
+
     override fun onError(msg: String) {
         runOnUiThread { title.text = getString(R.string.error); hint.text = msg; overlay.visibility = View.VISIBLE }
     }
@@ -147,6 +169,7 @@ class MainActivity : Activity(), Engine.Listener, SurfaceHolder.Callback {
         streaming = active
         if (active) fitSurface(w, h)
         overlay.visibility = if (active) View.GONE else View.VISIBLE
+        stats.visibility = if (active && statsOn) View.VISIBLE else View.GONE
         if (!active) {
             title.text = getString(R.string.waiting)
             hint.text = getString(R.string.hint)
@@ -162,6 +185,11 @@ class MainActivity : Activity(), Engine.Listener, SurfaceHolder.Callback {
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK) {
             finish()
+            return true
+        }
+        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER ||
+            keyCode == KeyEvent.KEYCODE_MENU || keyCode == KeyEvent.KEYCODE_INFO) {
+            if (event.repeatCount == 0) toggleStats()
             return true
         }
         return super.onKeyDown(keyCode, event)

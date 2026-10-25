@@ -21,6 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// Shown when this Windows cannot hide the yellow capture border of a shared window (no `IsBorderRequired`).
+const BORDER_NOTE: &str = "Жёлтую рамку Windows вокруг окна тут не убрать (нужна Windows 11) — для показа без рамки выберите «Весь экран».";
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     /// What to show: a monitor (None = primary) or one window.
@@ -69,6 +72,8 @@ struct Shared {
     target_kbps: AtomicU32,
     /// Features both sides agreed on in the handshake (`proto::FEAT_*`).
     features: AtomicU8,
+    /// The audio goes out as Opus (negotiated and the encoder started).
+    opus_on: AtomicBool,
     /// Last ~300 ms of video packets, for NACK re-sends.
     retx: Mutex<RetxBuffer>,
     retx_limit: Mutex<RetxLimiter>,
@@ -126,6 +131,7 @@ impl Stream {
             report_seq: AtomicU64::new(0),
             target_kbps: AtomicU32::new(20_000),
             features: AtomicU8::new(0),
+            opus_on: AtomicBool::new(false),
             retx: Mutex::new(RetxBuffer::new(300)),
             retx_limit: Mutex::new(RetxLimiter::new(24.0 * 1300.0)),
             sim: Mutex::new(LossSim::from_env(
@@ -232,7 +238,12 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
     crate::video::init()?;
     let (mut cap, window_title) = match &o.source {
         Source::Window { hwnd, title } => match WindowCapturer::new(*hwnd) {
-            Ok(w) => (Cap::Window(w), Some(title.clone())),
+            Ok(w) => {
+                if w.border == crate::wincap::BorderState::Unavailable {
+                    sh.set(|s| s.notice = BORDER_NOTE.into());
+                }
+                (Cap::Window(w), Some(title.clone()))
+            }
             Err(e) => {
                 return Ok(End::SourceLost(format!("Не удалось показать окно «{}»: {e:#}. Показываю весь экран.", crate::wincap::ellipsize_title(title))));
             }
@@ -269,7 +280,8 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
         audio_rate,
         audio_channels: 2,
         clock_sync: 1, // audio and video are stamped from the same clock (sh.start)
-        features: p::FEAT_NACK | p::FEAT_AUDIO_RED,
+        // Opus only for 48 kHz (the usual rate of the Windows mixer; other rates stay raw PCM, as before).
+        features: p::FEAT_NACK | p::FEAT_AUDIO_RED | if audio_rate == crate::opus::RATE { p::FEAT_OPUS } else { 0 },
     };
     sh.features.store(0, Ordering::Relaxed);
     sh.retx.lock().unwrap().clear();
@@ -335,11 +347,23 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
         let sock = sock.clone();
         let sh2 = sh.clone();
         let mut pending: Vec<i16> = Vec::new();
-        let mut pkt = Vec::with_capacity(1200);
+        let mut pkt = Vec::with_capacity(1400);
+        let feats = sh.features.load(Ordering::Relaxed);
+        // Opus (v0.5) when the projector passed its decode self-test: 10 ms frames, ~128 kbit/s, every datagram carries
+        // the newest frame and the three before it. If the encoder cannot start we quietly use the PCM path below.
+        let mut opus_enc = if feats & p::FEAT_OPUS != 0 { crate::opus::Encoder::new(128, 0).ok() } else { None };
+        let mut opus_recent: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+        let mut opus_buf: Vec<u8> = Vec::new();
         // With redundancy each packet carries two chunks, so chunks are 3 ms (two of them fit a packet easily and a
         // lost packet is covered by the next one); without it 5 ms as before.
-        let red = sh.features.load(Ordering::Relaxed) & p::FEAT_AUDIO_RED != 0;
-        let chunk = if red { ((audio_rate as f64 * 0.003).round() as u32).clamp(1, 300) * 2 } else { (audio_rate / 200).min(280) * 2 } as usize;
+        let red = feats & p::FEAT_AUDIO_RED != 0;
+        let chunk = if opus_enc.is_some() {
+            crate::opus::FRAME * 2
+        } else if red {
+            ((audio_rate as f64 * 0.003).round() as usize).clamp(1, 300) * 2
+        } else {
+            (audio_rate as usize / 200).min(280) * 2
+        };
         let mut prev_chunk: Vec<u8> = Vec::new();
         let mut cur_chunk: Vec<u8> = Vec::with_capacity(chunk * 2);
         let chunk_ms = (chunk / 2) as f64 * 1000.0 / audio_rate as f64;
@@ -348,6 +372,7 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
         // Capture time (ms on the stream clock) of pending[0]. Advances by sample count, so it is exact;
         // it is re-anchored on the wall clock only when it drifts or after a silent gap (loopback sends nothing then).
         let mut anchor: Option<f64> = None;
+        sh.opus_on.store(opus_enc.is_some(), Ordering::Relaxed);
         match crate::audio::start_capture(move |samples, _rate| {
             let now = sh2.now_ms_f();
             let new_start = now - (samples.len() / 2) as f64 * ms_per_frame;
@@ -361,6 +386,20 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
                 let a = anchor.unwrap_or(0.0);
                 let ts = (a + offset).max(0.0).round() as u32;
                 let n = seq.fetch_add(1, Ordering::Relaxed);
+                if let Some(enc) = opus_enc.as_mut() {
+                    // A silence gap in the capture re-anchors the clock; the frames before the gap keep their
+                    // own spacing relative to the newest one, which is fine (the receiver treats it as a hole).
+                    if enc.encode(&pending[..chunk], &mut opus_buf).is_ok() {
+                        opus_recent.push_front(opus_buf.clone());
+                        opus_recent.truncate(p::OPUS_DEPTH);
+                        let frames: Vec<&[u8]> = opus_recent.iter().map(|v| v.as_slice()).collect();
+                        p::write_audio_opus(session, n, ts, &frames, &mut pkt);
+                        sh2.send_media(&sock, peer, &pkt);
+                    }
+                    pending.drain(..chunk);
+                    anchor = Some(a + chunk_ms);
+                    continue;
+                }
                 if red {
                     cur_chunk.clear();
                     for s in pending.drain(..chunk) {
@@ -380,7 +419,8 @@ fn run_once(sh: &Arc<Shared>, peer: SocketAddr, limit: (u32, u32, u32), o: &Sett
         }) {
             Ok(s) => {
                 _audio_stream = Some(s);
-                sh.set(|s| s.audio = "Звук: передаётся весь звук компьютера".into());
+                let how = if sh.opus_on.load(Ordering::Relaxed) { "Opus" } else { "без сжатия" };
+                sh.set(|s| s.audio = format!("Звук: передаётся весь звук компьютера ({how})"));
             }
             Err(e) => sh.set(|s| s.audio = format!("Звук не захватывается: {e:#}")),
         }
@@ -627,7 +667,12 @@ fn capture_loop(
                 rtt,
             );
             if let Some(r) = rep.as_ref() {
-                st.push_str(&format!(" · проектор показывает {} к/с", r.decoded_fps));
+                if r.shown_fps > 0 || r.received_fps > 0 {
+                    // sent -> arrived whole -> shown: where frames are lost along the way
+                    st.push_str(&format!(" · отправлено {:.0} → принято {} → показано {} к/с", stat_frames as f64 / secs, r.received_fps, r.shown_fps));
+                } else {
+                    st.push_str(&format!(" · проектор показывает {} к/с", r.decoded_fps));
+                }
                 if r.lost_frames > 0 || r.dropped_frames > 0 {
                     st.push_str(&format!(" (потеряно {}, пропущено {})", r.lost_frames, r.dropped_frames));
                 }
@@ -661,9 +706,9 @@ fn capture_loop(
 }
 
 fn video_sender(sock: Arc<UdpSocket>, sh: Arc<Shared>, peer: SocketAddr, session: u32, rx: mpsc::Receiver<Frame>) {
-    // Smooth, not bursty: weak Wi-Fi drops packets when 100 of them arrive at once. Pace at 1.5x the encoder target
-    // (a frame takes ~2/3 of its slot to send), with a bucket of ~3 ms worth of packets.
-    let burst = 16.0 * 1300.0;
+    // Smooth, not bursty: weak Wi-Fi drops packets when 100 of them arrive at once. Pace at 1.6x the encoder target
+    // (room for keyframes and re-sends), with a bucket of 12 packets, never above 100 Mbit/s.
+    let burst = 12.0 * 1300.0;
     let mut tokens = burst;
     let mut last = Instant::now();
     let mut pkt = Vec::with_capacity(p::VIDEO_HEADER_LEN + p::MAX_PAYLOAD);
@@ -675,7 +720,7 @@ fn video_sender(sock: Arc<UdpSocket>, sh: Arc<Shared>, peer: SocketAddr, session
             pkt.extend_from_slice(chunk);
             let need = pkt.len() as f64;
             loop {
-                let rate = (sh.target_kbps.load(Ordering::Relaxed) as f64 * 125.0 * 1.5).max(250_000.0); // bytes/s
+                let rate = (sh.target_kbps.load(Ordering::Relaxed) as f64 * 125.0 * 1.6).clamp(250_000.0, 12_500_000.0); // bytes/s
                 let now = Instant::now();
                 tokens = (tokens + now.duration_since(last).as_secs_f64() * rate).min(burst);
                 last = now;

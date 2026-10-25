@@ -8,7 +8,30 @@ const NEEDED: &[&str] = &["avcodec-", "avutil-", "swscale-", "swresample-"];
 /// Loaded by our own code (directly imported); swresample is only pulled in by avcodec.
 const DIRECT: &[&str] = &["avcodec-", "avutil-", "swscale-"];
 
+/// libopus (vendor/opus) compiled straight into the exe: audio codec with built-in loss concealment and FEC.
+fn build_opus() {
+    let root = PathBuf::from("vendor/opus");
+    let mut b = cc::Build::new();
+    let mut n = 0;
+    for dir in ["celt", "silk", "silk/float", "src"] {
+        for e in std::fs::read_dir(root.join(dir)).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "c") {
+                b.file(&p);
+                n += 1;
+            }
+        }
+    }
+    assert!(n > 100, "vendor/opus неполный ({n} файлов)");
+    for inc in [".", "include", "celt", "silk", "silk/float", "src"] {
+        b.include(root.join(inc));
+    }
+    b.define("HAVE_CONFIG_H", None).warnings(false).opt_level(3).compile("opus");
+    println!("cargo:rerun-if-changed=vendor/opus");
+}
+
 fn main() {
+    build_opus();
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     println!("cargo:rerun-if-changed=build.rs");
     let ffmpeg_dir = std::env::var("FFMPEG_DIR").expect("FFMPEG_DIR не задан (см. .cargo/config.toml)");
@@ -23,6 +46,15 @@ fn main() {
         })
         .collect();
     dlls.sort();
+    // The exe must link against MSVC-format import libs: GNU ones (libav*.dll.a) make the linker ignore
+    // /DELAYLOAD, the exe then imports the DLLs statically and does not even start (0.7.1/0.7.2 bug).
+    let lib = PathBuf::from(std::env::var("FFMPEG_DIR").unwrap()).join("lib");
+    for l in ["avcodec", "avutil", "swscale", "avformat"] {
+        assert!(lib.join(format!("{l}.lib")).exists(), "нет {l}.lib в {}: запусти tools/make-import-libs.sh", lib.display());
+        assert!(!lib.join(format!("lib{l}.dll.a")).exists(), "lib{l}.dll.a мешает /DELAYLOAD: запусти tools/make-import-libs.sh");
+    }
+    // ffmpeg-next links avformat although nothing calls it; it is not shipped, so it must never load at startup.
+    println!("cargo:rustc-link-arg=/DELAYLOAD:avformat-63.dll");
     assert_eq!(dlls.len(), NEEDED.len(), "не все DLL FFmpeg найдены в {}", bin.display());
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());

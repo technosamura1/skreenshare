@@ -45,6 +45,9 @@ pub const T_VIDEO: u8 = 0x10;
 pub const T_AUDIO: u8 = 0x11;
 /// v0.4: audio with a copy of the previous chunk (negotiated with [`FEAT_AUDIO_RED`]).
 pub const T_AUDIO_RED: u8 = 0x12;
+/// v0.5: Opus audio, 10 ms frames, each datagram carries the newest frame and a few before it
+/// (negotiated with [`FEAT_OPUS`], only for 48 kHz stereo).
+pub const T_AUDIO_OPUS: u8 = 0x13;
 pub const T_KEYREQ: u8 = 0x20;
 pub const T_PING: u8 = 0x21;
 pub const T_PONG: u8 = 0x22;
@@ -59,6 +62,12 @@ pub const FLAG_RETX: u8 = 2;
 /// `Start::features` (what the sender can do) and the START_ACK body (what the receiver agreed to).
 pub const FEAT_NACK: u8 = 1;
 pub const FEAT_AUDIO_RED: u8 = 2;
+/// v0.5: the receiver can decode Opus (it ran a decode self-test). Without it audio stays raw PCM with redundancy.
+pub const FEAT_OPUS: u8 = 4;
+/// Length of one Opus frame, ms (and so the timestamp step between frames of one datagram).
+pub const OPUS_FRAME_MS: u32 = 10;
+/// Frames per Opus datagram (the newest + this many minus one older ones): covers a burst of 3 lost datagrams in a row.
+pub const OPUS_DEPTH: usize = 4;
 /// NACK item `idx` meaning "every fragment of this frame" (the receiver has seen none of it).
 pub const NACK_ALL: u16 = 0xFFFF;
 /// Items per NACK datagram (6 bytes each).
@@ -256,6 +265,10 @@ pub struct Report {
     pub nack_pkts: u16,
     /// v0.4: of those, how many arrived after all (retransmitted).
     pub recovered_pkts: u16,
+    /// v0.5: video frames fully received (before decoding) in the last second; 0 from older receivers.
+    pub received_fps: u16,
+    /// v0.5: frames actually put on the screen in the last second; 0 from older receivers.
+    pub shown_fps: u16,
 }
 
 pub fn write_report(session: u32, r: &Report, out: &mut Vec<u8>) {
@@ -265,6 +278,8 @@ pub fn write_report(session: u32, r: &Report, out: &mut Vec<u8>) {
     out.extend_from_slice(&r.dropped_frames.to_le_bytes());
     out.extend_from_slice(&r.nack_pkts.to_le_bytes());
     out.extend_from_slice(&r.recovered_pkts.to_le_bytes());
+    out.extend_from_slice(&r.received_fps.to_le_bytes());
+    out.extend_from_slice(&r.shown_fps.to_le_bytes());
 }
 
 pub fn parse_report(body: &[u8]) -> Option<Report> {
@@ -277,6 +292,8 @@ pub fn parse_report(body: &[u8]) -> Option<Report> {
         dropped_frames: u16::from_le_bytes([body[4], body[5]]),
         nack_pkts: if body.len() >= 8 { u16::from_le_bytes([body[6], body[7]]) } else { 0 },
         recovered_pkts: if body.len() >= 10 { u16::from_le_bytes([body[8], body[9]]) } else { 0 },
+        received_fps: if body.len() >= 12 { u16::from_le_bytes([body[10], body[11]]) } else { 0 },
+        shown_fps: if body.len() >= 14 { u16::from_le_bytes([body[12], body[13]]) } else { 0 },
     })
 }
 
@@ -330,6 +347,39 @@ pub fn parse_audio_red(body: &[u8]) -> Option<(u32, u32, &[u8], &[u8])> {
         prev,
         cur,
     ))
+}
+
+/// Opus audio: header + seq(4) ts_ms(4) n(1) + n x (len u16, Opus packet). Frame 0 is the newest (sequence `seq`,
+/// starts at `ts_ms`); frame k is `seq - k` and starts `k * OPUS_FRAME_MS` earlier.
+pub fn write_audio_opus(session: u32, seq: u32, ts_ms: u32, frames: &[&[u8]], out: &mut Vec<u8>) {
+    header(T_AUDIO_OPUS, session, out);
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&ts_ms.to_le_bytes());
+    out.push(frames.len() as u8);
+    for f in frames {
+        out.extend_from_slice(&(f.len() as u16).to_le_bytes());
+        out.extend_from_slice(f);
+    }
+}
+
+/// (seq, ts_ms, frames newest first)
+pub fn parse_audio_opus(body: &[u8]) -> Option<(u32, u32, Vec<&[u8]>)> {
+    if body.len() < 9 {
+        return None;
+    }
+    let n = body[8] as usize;
+    if n == 0 || n > 8 {
+        return None;
+    }
+    let mut at = 9;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = u16::from_le_bytes(body.get(at..at + 2)?.try_into().ok()?) as usize;
+        at += 2;
+        v.push(body.get(at..at + len)?);
+        at += len;
+    }
+    Some((u32::from_le_bytes(body[0..4].try_into().unwrap()), u32::from_le_bytes(body[4..8].try_into().unwrap()), v))
 }
 
 /// Splits one encoded access unit into datagram payload ranges (at least one, even for empty data).
@@ -396,8 +446,13 @@ mod tests {
     #[test]
     fn golden_report_ping() {
         let mut o = Vec::new();
-        write_report(1, &Report { decoded_fps: 30, lost_frames: 2, dropped_frames: 1, nack_pkts: 5, recovered_pkts: 4 }, &mut o);
-        assert_eq!(hex(&o), "d724".to_string() + "01000000" + "1e00" + "0200" + "0100" + "0500" + "0400");
+        write_report(1, &Report { decoded_fps: 30, lost_frames: 2, dropped_frames: 1, nack_pkts: 5, recovered_pkts: 4, received_fps: 31, shown_fps: 29 }, &mut o);
+        assert_eq!(hex(&o), "d724".to_string() + "01000000" + "1e00" + "0200" + "0100" + "0500" + "0400" + "1f00" + "1d00");
+        let r = parse_report(&o[HEADER_LEN..]).unwrap();
+        assert_eq!((r.received_fps, r.shown_fps), (31, 29));
+        // a v0.4 receiver's 10-byte report has no fps counters
+        let v04 = parse_report(&o[HEADER_LEN..HEADER_LEN + 10]).unwrap();
+        assert_eq!((v04.recovered_pkts, v04.received_fps, v04.shown_fps), (4, 0, 0));
         assert_eq!(parse_report(&o[HEADER_LEN..]).unwrap().recovered_pkts, 4);
         write_ping(T_PING, 1, 0x0a0b0c0d, &mut o);
         assert_eq!(hex(&o), "d721".to_string() + "01000000" + "0d0c0b0a");
@@ -406,6 +461,23 @@ mod tests {
         assert_eq!((old.decoded_fps, old.lost_frames, old.nack_pkts, old.recovered_pkts), (30, 2, 0, 0));
         write_simple(T_KEYREQ, 1, &mut o);
         assert_eq!(hex(&o), "d72001000000");
+    }
+
+    #[test]
+    fn golden_audio_opus() {
+        let mut o = Vec::new();
+        write_audio_opus(7, 9, 1234, &[&[1, 2, 3], &[4]], &mut o);
+        assert_eq!(hex(&o), "d713".to_string() + "07000000" + "09000000" + "d2040000" + "02" + "0300" + "010203" + "0100" + "04");
+        let (_, _, body) = parse_header(&o).unwrap();
+        let (seq, ts, f) = parse_audio_opus(body).unwrap();
+        assert_eq!((seq, ts, f), (9, 1234, vec![&[1u8, 2, 3][..], &[4u8][..]]));
+        // truncated / empty list / absurd count are rejected, never panic
+        assert!(parse_audio_opus(&body[..body.len() - 1]).is_none());
+        assert!(parse_audio_opus(&body[..8]).is_none());
+        let mut zero = body.to_vec();
+        zero[8] = 0;
+        assert!(parse_audio_opus(&zero).is_none());
+        assert_eq!(FEAT_NACK | FEAT_AUDIO_RED | FEAT_OPUS, 7);
     }
 
     #[test]

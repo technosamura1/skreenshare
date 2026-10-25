@@ -91,6 +91,44 @@ class AudioRx(private val rate: Int, channels: Int) {
 }
 
 /**
+ * Unpacks Opus datagrams (T_AUDIO_OPUS): each one carries the newest 10 ms frame and up to 3 before it, so up to 3 lost
+ * datagrams in a row are rebuilt from the next one that arrives. Frames come out oldest first, each with its own start
+ * time. A hole that cannot be rebuilt is simply skipped (the player's timeline fills it with concealment).
+ */
+class OpusRx {
+    class Frame(val tsMs: Long, val data: ByteArray)
+
+    private var haveLast = false
+    private var lastSeq = 0
+    var received = 0
+        private set
+    var recovered = 0
+        private set
+    var lost = 0
+        private set
+
+    fun reset() { haveLast = false }
+
+    /** [tsMs]: start of the newest frame (frames[0]); frames[k] is the one k sequence numbers earlier. */
+    fun onDatagram(seq: Int, tsMs: Long, frames: List<ByteArray>, out: MutableList<Frame>) {
+        val d = if (haveLast) seq - lastSeq else 1
+        if (d <= 0 || frames.isEmpty()) return // old or duplicate
+        haveLast = true
+        lastSeq = seq
+        received++
+        val missing = d - 1
+        val rebuilt = minOf(missing, frames.size - 1)
+        for (k in rebuilt downTo 1) {
+            if (frames[k].isEmpty()) continue
+            out.add(Frame(tsMs - k.toLong() * Proto.OPUS_FRAME_MS, frames[k]))
+            recovered++
+        }
+        lost += missing - rebuilt
+        out.add(Frame(tsMs, frames[0]))
+    }
+}
+
+/**
  * Audio packet loss concealment. A hole of [frames] sample frames is not left as hard silence (that clicks): the
  * last few milliseconds before it are repeated, fading out linearly over at most [MAX_FADE_MS]; the rest of a long
  * hole is silence. The result always has exactly the hole's length, so the timeline (and lip-sync) is untouched.

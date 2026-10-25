@@ -7,8 +7,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use windows::core::{factory, Interface};
+use windows::Foundation::Metadata::ApiInformation;
 use windows::Foundation::TypedEventHandler;
-use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFramePool, GraphicsCaptureAccess, GraphicsCaptureAccessKind, GraphicsCaptureItem, GraphicsCaptureSession,
+};
+use windows::core::HSTRING;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
@@ -103,6 +107,8 @@ pub struct WindowCapturer {
     d3d_device: IDirect3DDevice,
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
+    /// What became of the yellow capture border (see `BorderState`).
+    pub border: BorderState,
     arrived: Arc<(Mutex<bool>, Condvar)>,
     token: i64,
     pool_size: SizeInt32,
@@ -111,6 +117,43 @@ pub struct WindowCapturer {
     pub width: u32,
     pub height: u32,
     pixels: Vec<u8>,
+}
+
+/// The yellow frame Windows draws around a captured window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BorderState {
+    /// We asked Windows to leave it out (Windows 11 / build 20348+). Windows has the last word: for programs
+    /// without a package it follows Settings -> Privacy -> Screenshot borders -> «desktop apps».
+    Requested,
+    /// This Windows has no such switch (Windows 10 before build 20348): the frame can't be removed.
+    Unavailable,
+}
+
+/// Asks Windows not to draw the capture border: `IsBorderRequired = false`, only if the property exists
+/// (`ApiInformation`), after a best-effort `GraphicsCaptureAccess.RequestAccessAsync(Borderless)`.
+/// A program without a package can't declare the `graphicsCaptureWithoutBorder` capability, so that request may
+/// be refused; it is harmless. The property is then set anyway: Windows 11 lets desktop apps hide the border
+/// through its own setting, and ignores the request when that setting is off.
+fn remove_border(session: &GraphicsCaptureSession) -> BorderState {
+    let present = ApiInformation::IsPropertyPresent(
+        &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
+        &HSTRING::from("IsBorderRequired"),
+    )
+    .unwrap_or(false);
+    if !present {
+        return BorderState::Unavailable;
+    }
+    // The request can show a consent prompt or stall, so never wait for it more than a moment.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless).and_then(|op| op.join());
+        let _ = tx.send(r.map(|s| s.0));
+    });
+    let _ = rx.recv_timeout(Duration::from_millis(1500)); // refused or silent: try anyway, see above
+    match session.SetIsBorderRequired(false) {
+        Ok(()) => BorderState::Requested,
+        Err(_) => BorderState::Unavailable,
+    }
 }
 
 impl WindowCapturer {
@@ -162,6 +205,7 @@ impl WindowCapturer {
             ))?;
             let session = pool.CreateCaptureSession(&item)?;
             let _ = session.SetIsCursorCaptureEnabled(true);
+            let border = remove_border(&session);
             session.StartCapture()?;
             Ok(WindowCapturer {
                 hwnd: h,
@@ -170,6 +214,7 @@ impl WindowCapturer {
                 d3d_device,
                 pool,
                 session,
+                border,
                 arrived,
                 token,
                 pool_size: size,

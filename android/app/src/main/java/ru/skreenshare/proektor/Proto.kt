@@ -23,6 +23,8 @@ object Proto {
     const val T_AUDIO = 0x11
     /** v0.4: audio packet that also carries a copy of the previous chunk. */
     const val T_AUDIO_RED = 0x12
+    /** v0.5: Opus audio, 10 ms frames, each datagram carries the newest frame and a few before it. */
+    const val T_AUDIO_OPUS = 0x13
     const val T_KEYREQ = 0x20
     const val T_PING = 0x21
     const val T_PONG = 0x22
@@ -36,6 +38,9 @@ object Proto {
     const val FLAG_RETX = 2
     const val FEAT_NACK = 1
     const val FEAT_AUDIO_RED = 2
+    /** v0.5: this receiver decodes Opus (it passed a decode self-test on this device). */
+    const val FEAT_OPUS = 4
+    const val OPUS_FRAME_MS = 10
     const val NACK_ALL = 0xFFFF
     const val MAX_NACK_ITEMS = 150
     const val VCODEC_H264 = 1
@@ -108,11 +113,13 @@ object Proto {
     fun ping(type: Int, session: Int, t: Int): ByteArray = header(type, session).i32(t).toByteArray()
 
     /** Per-second figures. [nackPkts]: video packets that had to be asked for again; [recoveredPkts]: of those, how many arrived. */
-    class Report(val decodedFps: Int, val lostFrames: Int, val droppedFrames: Int, val nackPkts: Int = 0, val recoveredPkts: Int = 0)
+    class Report(val decodedFps: Int, val lostFrames: Int, val droppedFrames: Int, val nackPkts: Int = 0, val recoveredPkts: Int = 0,
+                 /** v0.5: frames received whole (before decoding) and frames put on the screen, per second. */
+                 val receivedFps: Int = 0, val shownFps: Int = 0)
 
     fun report(session: Int, r: Report): ByteArray =
         header(T_REPORT, session).u16(r.decodedFps).u16(r.lostFrames).u16(r.droppedFrames)
-            .u16(r.nackPkts).u16(r.recoveredPkts).toByteArray()
+            .u16(r.nackPkts).u16(r.recoveredPkts).u16(r.receivedFps).u16(r.shownFps).toByteArray()
 
     class NackItem(val frameId: Int, val idx: Int)
 
@@ -159,6 +166,34 @@ object Proto {
 
     fun writeAudio(session: Int, seq: Int, tsMs: Int, payload: ByteArray): ByteArray =
         header(T_AUDIO, session).i32(seq).i32(tsMs).bytes(payload).toByteArray()
+
+    /** AUDIO_OPUS: seq(4) ts_ms(4) n(1) + n x (len u16, Opus packet); frame k is sequence seq-k and starts k*10 ms earlier. */
+    class AudioOpus(val seq: Int, val tsMs: Int, val frames: List<ByteArray>)
+
+    fun writeAudioOpus(session: Int, seq: Int, tsMs: Int, frames: List<ByteArray>): ByteArray {
+        val w = header(T_AUDIO_OPUS, session).i32(seq).i32(tsMs).u8(frames.size)
+        for (f in frames) w.u16(f.size).bytes(f)
+        return w.toByteArray()
+    }
+
+    /** Null for anything malformed (truncated, no frames, more than 8 frames) - never throws. */
+    fun parseAudioOpus(b: ByteArray, len: Int): AudioOpus? {
+        val o = HEADER_LEN
+        if (len < o + 9) return null
+        val n = u8(b, o + 8)
+        if (n == 0 || n > 8) return null
+        var at = o + 9
+        val frames = ArrayList<ByteArray>(n)
+        for (i in 0 until n) {
+            if (at + 2 > len) return null
+            val l = u16(b, at)
+            at += 2
+            if (at + l > len) return null
+            frames.add(b.copyOfRange(at, at + l))
+            at += l
+        }
+        return AudioOpus(i32(b, o), i32(b, o + 4), frames)
+    }
 
     const val AUDIO_RED_HEADER_LEN = HEADER_LEN + 10
 

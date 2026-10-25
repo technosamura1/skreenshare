@@ -5,11 +5,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [ ! -d third_party/ffmpeg/bin ]; then
-  mkdir -p third_party && cd third_party
-  curl -L -o ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip
-  unzip -q ffmpeg.zip && mv ffmpeg-n9.0-latest-win64-lgpl-shared-9.0 ffmpeg && rm ffmpeg.zip
-  cd ..
-  tools/make-import-libs.sh
+  echo "нет third_party/ffmpeg: соберите его через tools/build-ffmpeg.sh (slim FFmpeg n9.0.2 с NVENC-заголовками n11.1.5.3, нужен NVIDIA-драйвер >= 471.41)" >&2
+  exit 1
 fi
 export LIBCLANG_PATH="${LIBCLANG_PATH:-$(dirname "$(ls /usr/lib/llvm-*/lib/libclang*.so* | head -1)")}"
 export XWIN_ACCEPT_LICENSE=1

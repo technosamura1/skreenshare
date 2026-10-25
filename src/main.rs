@@ -7,6 +7,7 @@ mod bundle;
 mod capture;
 mod discovery;
 mod gui;
+mod opus;
 mod stream;
 mod video;
 mod wincap;

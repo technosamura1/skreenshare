@@ -16,8 +16,10 @@ import java.util.concurrent.atomic.AtomicInteger
  * Chunks carry the sender's capture time. Holes (lost packets, PC silent) are filled with silence so that
  * "frames written" stays a faithful map of media time ([AudioTimeline]); [clockMs] turns the AudioTrack's real
  * playback position (what the speaker is playing now) into sender media time.
- * Small jitter buffer: wait for ~40 ms before starting, re-buffer after an underrun, drop the oldest audio
- * if the queue grows past ~150 ms.
+ * Jitter buffer of 80..120 ms: wait for [startMs] of audio before starting; every underrun (the queue ran dry)
+ * widens it by 10 ms up to 120 ms, 20 quiet seconds narrow it back by 5 ms toward 80 ms. The oldest audio is dropped
+ * if the queue grows [CATCHUP_MS] past that. The picture follows this clock (lip-sync), so a wider buffer costs
+ * latency, not sync.
  */
 class AudioPlayer(private val rate: Int, private val channels: Int) {
     private class Item(val tsMs: Double, val data: ByteArray?, val delayMs: Int)
@@ -26,6 +28,12 @@ class AudioPlayer(private val rate: Int, private val channels: Int) {
     private val queue = LinkedBlockingQueue<Item>()
     private val queued = AtomicInteger()
     @Volatile private var running = true
+    /** Current jitter-buffer target, ms (80..120). */
+    @Volatile var startMs = MIN_START_MS
+        private set
+    private var lastChangeNanos = System.nanoTime()
+    /** How often the queue ran dry since the start (a sign of a bad link or a slow decoder). */
+    val underruns = AtomicInteger()
     private val thread: Thread
     private val bytesPerMs = rate * channels * 2 / 1000
     private val frameBytes = channels * 2
@@ -60,6 +68,9 @@ class AudioPlayer(private val rate: Int, private val channels: Int) {
         track.play()
         thread = Thread({ loop() }, "audio-play").also { it.start() }
     }
+
+    /** Audio waiting in the jitter buffer, ms. */
+    fun bufferedMs(): Int = queued.get() / maxOf(bytesPerMs, 1)
 
     /** [tsMs]: sender capture time of the first sample in [pcm]. */
     fun push(tsMs: Long, pcm: ByteArray) {
@@ -123,24 +134,39 @@ class AudioPlayer(private val rate: Int, private val channels: Int) {
     }
 
     private fun loop() {
+        try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO) } catch (_: Throwable) {}
         var buffering = true
         var resync = true
+        var started = false
         try {
             while (running) {
                 if (buffering) {
-                    if (queued.get() >= bytesPerMs * START_MS) buffering = false
+                    if (queued.get() >= bytesPerMs * startMs) buffering = false
                     else { Thread.sleep(5); continue }
                 }
+                val nowN = System.nanoTime()
+                if (startMs > MIN_START_MS && nowN - lastChangeNanos > 20_000_000_000L) {
+                    startMs = maxOf(MIN_START_MS, startMs - 5)
+                    lastChangeNanos = nowN
+                }
                 // Too far behind (clock drift, burst): throw away the oldest audio and start a new time segment.
-                if (queued.get() > bytesPerMs * MAX_MS) {
-                    while (queued.get() > bytesPerMs * START_MS) {
+                if (queued.get() > bytesPerMs * (startMs + CATCHUP_MS)) {
+                    while (queued.get() > bytesPerMs * startMs) {
                         val d = queue.poll() ?: break
                         d.data?.let { queued.addAndGet(-it.size) }
                     }
                     resync = true
                 }
                 val item = queue.poll(30, TimeUnit.MILLISECONDS)
-                if (item == null) { buffering = true; resync = true; continue }
+                if (item == null) {
+                    if (started) {
+                        underruns.incrementAndGet()
+                        startMs = minOf(MAX_START_MS, startMs + 10)
+                        lastChangeNanos = System.nanoTime()
+                    }
+                    buffering = true; resync = true; continue
+                }
+                started = true
                 val data = item.data
                 if (data == null) {
                     writeSilence(timeline.insertDelay(item.delayMs.toDouble()))
@@ -171,7 +197,8 @@ class AudioPlayer(private val rate: Int, private val channels: Int) {
 
     companion object {
         private const val TAG = "SkpAudio"
-        private const val START_MS = 40
-        private const val MAX_MS = 150
+        const val MIN_START_MS = 80
+        const val MAX_START_MS = 120
+        private const val CATCHUP_MS = 110
     }
 }

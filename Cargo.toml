@@ -1,6 +1,6 @@
 [package]
 name = "skreenshare-proektor"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
@@ -21,14 +21,17 @@ members = ["proto"]
 
 [build-dependencies]
 zstd = "0.14"
+cc = "1"
 
 [dependencies.windows]
 version = "0.62"
 features = [
     "Foundation",
+    "Foundation_Metadata",
     "Graphics_Capture",
     "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",
+    "Security_Authorization_AppCapabilityAccess",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
