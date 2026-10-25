@@ -5,7 +5,7 @@ use crate::ratectl;
 use crate::reassembly::{KeyRequester, Reassembler, Stats};
 use crate::retx;
 use crate::ui::{self, Exchange};
-use crate::video::{Decoder, Scaler};
+use crate::video::{Decoder, OwnedFrame, Scaler};
 use crate::viewperf::{self, Acc, CostGovernor, HwWatch, JitterMeter};
 use anyhow::Result;
 use std::net::{SocketAddr, UdpSocket};
@@ -85,7 +85,21 @@ struct Picture {
     px: Vec<u32>,
     /// Sync test: this picture is the first bright one of a beacon flash.
     flash: bool,
+    /// Number of the frame this picture came from (converter threads can finish out of order).
+    seq: u64,
 }
+
+/// A decoded picture on its way to a converter thread.
+struct ConvJob {
+    seq: u64,
+    frame: OwnedFrame,
+    dw: u32,
+    dh: u32,
+}
+
+/// Converter threads: each picture's YUV -> RGB + scaling (20+ ms on a big window) runs on one of these, so
+/// the decoder isn't held up by it and two pictures convert at once.
+const CONVERTERS: usize = 2;
 
 struct Shared {
     running: AtomicBool,
@@ -105,6 +119,18 @@ struct Shared {
     audio_received: AtomicU64,
     audio_recovered: AtomicU64,
     audio_concealed: AtomicU64,
+    /// Opus audio datagrams found missing / expected (per-type loss for the status line).
+    audio_lost: AtomicU64,
+    audio_expected: AtomicU64,
+    audio_requested: AtomicU64,
+    /// Frames the host has sent so far (from the frame numbers seen), frames that arrived complete, frames decoded
+    /// (shown or not): the three steps between "host sent N fps" and "viewer shows M fps".
+    frames_sent: AtomicU64,
+    frames_complete: AtomicU64,
+    frames_decoded_all: AtomicU64,
+    /// Video size and size of the picture after fitting it into the window, (w << 32) | h.
+    video_size: AtomicU64,
+    shown_size: AtomicU64,
     /// Window client size, (w << 32) | h.
     win_size: AtomicU64,
     picture: Mutex<Picture>,
@@ -118,6 +144,8 @@ struct Shared {
     /// Frames lost because the decoder queue was full / decoded but not shown while catching up.
     dropped_full: AtomicU64,
     dropped_catchup: AtomicU64,
+    /// Decoded but not converted because both converter threads were busy.
+    dropped_busy: AtomicU64,
     /// Per-interval timings for the diagnostics line.
     diag: Mutex<Diag>,
 }
@@ -145,6 +173,10 @@ fn boost_thread() {
         use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
+}
+
+fn size_str(v: u64) -> String {
+    format!("{}x{}", v >> 32, v & 0xffff_ffff)
 }
 
 fn log_path() -> Option<PathBuf> {
@@ -223,13 +255,22 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         audio_received: AtomicU64::new(0),
         audio_recovered: AtomicU64::new(0),
         audio_concealed: AtomicU64::new(0),
+        audio_lost: AtomicU64::new(0),
+        audio_expected: AtomicU64::new(0),
+        audio_requested: AtomicU64::new(0),
+        frames_sent: AtomicU64::new(0),
+        frames_complete: AtomicU64::new(0),
+        frames_decoded_all: AtomicU64::new(0),
+        video_size: AtomicU64::new(0),
+        shown_size: AtomicU64::new(0),
         win_size: AtomicU64::new((1280u64 << 32) | 720),
-        picture: Mutex::new(Picture { w: 0, h: 0, px: Vec::new(), flash: false }),
+        picture: Mutex::new(Picture { w: 0, h: 0, px: Vec::new(), flash: false, seq: 0 }),
         qdepth: AtomicUsize::new(0),
         dec_mode: AtomicU8::new(0),
         want_resync: AtomicBool::new(false),
         dropped_full: AtomicU64::new(0),
         dropped_catchup: AtomicU64::new(0),
+        dropped_busy: AtomicU64::new(0),
         diag: Mutex::new(Diag::default()),
     });
     {
@@ -255,6 +296,11 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, bool, Instant)>(30);
     let sync_q = audio_q.clone();
     let diag_q = audio_q.clone();
+    let audio_on = audio_q.is_some();
+    {
+        let (r, s) = net::socket_buffers(&sock);
+        log_line(&format!("буферы сокета: приём {} КБ, отправка {} КБ", r / 1024, s / 1024));
+    }
 
     // Receiver: reassembly + audio.
     {
@@ -267,6 +313,8 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             let mut re = Reassembler::new();
             let mut ready = Vec::new();
             let mut arx = AudioRx::new();
+            let mut arx3 = if audio_q.is_some() { crate::opusaudio::Rx::new().ok() } else { None };
+            let (mut fid_base, mut fid_hi): (Option<u32>, u32) = (None, 0);
             let mut legacy_next: Option<u32> = None;
             let mut samples: Vec<i16> = Vec::with_capacity(960);
             while sh.running.load(Ordering::Relaxed) {
@@ -280,12 +328,26 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                                     let fid = u32::from_le_bytes(body[0..4].try_into().unwrap());
                                     let idx = u16::from_le_bytes([body[4], body[5]]);
                                     let count = u16::from_le_bytes([body[6], body[7]]);
+                                    match fid_base {
+                                        None => {
+                                            fid_base = Some(fid);
+                                            fid_hi = fid;
+                                        }
+                                        Some(_) if fid.wrapping_sub(fid_hi) < (1 << 31) => fid_hi = fid,
+                                        _ => {}
+                                    }
+                                    sh.frames_sent.store(fid_hi.wrapping_sub(fid_base.unwrap_or(fid_hi)) as u64 + 1, Ordering::Relaxed);
                                     re.on_fragment(Instant::now(), fid, idx, count, body[8] & 1 != 0, &body[9..], &mut ready);
                                 }
                                 // 0x92: redundant-copy audio (v0.5.1+); 0x91: the old format, no repair possible.
                                 net::PT_AUDIO2 => {
                                     if let Some(q) = &audio_q {
                                         arx.on_packet(body, |s, rate| q.push(s, rate));
+                                    }
+                                }
+                                net::PT_AUDIO3 => {
+                                    if let (Some(q), Some(rx3)) = (&audio_q, arx3.as_mut()) {
+                                        rx3.on_datagram(Instant::now(), body, &mut |s, rate| q.push(s, rate));
                                     }
                                 }
                                 net::PT_AUDIO if body.len() >= 10 => {
@@ -317,6 +379,14 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 }
                 let now = Instant::now();
                 let rtt = Duration::from_micros(sh.rtt_us.load(Ordering::Relaxed));
+                if let (Some(q), Some(rx3)) = (&audio_q, arx3.as_mut()) {
+                    rx3.set_rtt(rtt);
+                    rx3.tick(now, &mut |s, rate| q.push(s, rate));
+                    let want = rx3.nacks(now);
+                    if !want.is_empty() {
+                        let _ = sock.send_to(&crate::opusaudio::anack_packet(token, &want), peer);
+                    }
+                }
                 for (fid, idxs) in re.nacks(now, rtt) {
                     // One request per frame (a huge list is split so each datagram stays small).
                     for pkt in retx::nack_packets(token, fid, &idxs) {
@@ -328,6 +398,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     re.force_resync();
                 }
                 for (data, key) in ready.drain(..) {
+                    sh.frames_complete.fetch_add(1, Ordering::Relaxed);
                     sh.diag.lock().unwrap().jitter.feed(sh.start.elapsed().as_micros() as u64);
                     sh.qdepth.fetch_add(1, Ordering::Relaxed);
                     if frame_tx.try_send((data, key, Instant::now())).is_err() {
@@ -344,9 +415,13 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 sh.rx_recovered.store(st.recovered, Ordering::Relaxed);
                 sh.rx_residual.store(st.residual, Ordering::Relaxed);
                 sh.rx_gave_up.store(st.gave_up, Ordering::Relaxed);
-                sh.audio_received.store(arx.stats.received, Ordering::Relaxed);
-                sh.audio_recovered.store(arx.stats.recovered, Ordering::Relaxed);
-                sh.audio_concealed.store(arx.stats.concealed, Ordering::Relaxed);
+                let a3 = arx3.as_ref().map(|r| r.stats).unwrap_or_default();
+                sh.audio_received.store(arx.stats.received + a3.received, Ordering::Relaxed);
+                sh.audio_recovered.store(arx.stats.recovered + a3.recovered, Ordering::Relaxed);
+                sh.audio_concealed.store(arx.stats.concealed + a3.concealed, Ordering::Relaxed);
+                sh.audio_lost.store(a3.lost_datagrams, Ordering::Relaxed);
+                sh.audio_expected.store(a3.expected_datagrams, Ordering::Relaxed);
+                sh.audio_requested.store(a3.requested, Ordering::Relaxed);
             }
         });
     }
@@ -361,6 +436,8 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             let mut tick = 0u64;
             let mut stat_t = Instant::now();
             let (mut b0, mut f0) = (0u64, 0u64);
+            // Totals at the previous status line: sent / complete / decoded frames, video fragments, audio datagrams.
+            let (mut sent0, mut comp0, mut dec0, mut vrx0, mut vmiss0, mut alost0, mut aexp0) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
             let (mut au0, mut arec0, mut aconc0) = (crate::playout::PlayStats::default(), 0u64, 0u64);
             let mut keyreq = KeyRequester::new();
             // Ping right away: the first round-trip time sets the retry timing for lost packets.
@@ -373,6 +450,12 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     net::write_header(&mut out, net::PT_KEYREQ, token);
                     let _ = sock.send_to(&out, peer);
                     sh.keyreqs.store(keyreq.sent, Ordering::Relaxed);
+                }
+                if audio_on && tick % 10 == 1 {
+                    // Tell the host which audio formats we understand (it only sends Opus to viewers that say so).
+                    net::write_header(&mut out, net::PT_CAPS, token);
+                    out.push(net::CAP_OPUS);
+                    let _ = sock.send_to(&out, peer);
                 }
                 if tick % 5 == 0 {
                     send_ping(&sock, peer, token, &sh, &mut out);
@@ -402,17 +485,31 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         sh.rx_missed.load(Ordering::Relaxed),
                         sh.rx_recovered.load(Ordering::Relaxed),
                     );
+                    let (sent, comp, decall) = (
+                        sh.frames_sent.load(Ordering::Relaxed),
+                        sh.frames_complete.load(Ordering::Relaxed),
+                        sh.frames_decoded_all.load(Ordering::Relaxed),
+                    );
+                    let (alost, aexp) = (sh.audio_lost.load(Ordering::Relaxed), sh.audio_expected.load(Ordering::Relaxed));
+                    let pct = |a: u64, b: u64| a as f64 * 100.0 / b.max(1) as f64;
                     ui::stat(&format!(
-                        "{:.0} кадров/с · {:.1} Мбит/с · пинг {:.0} мс · потери сети {:.1}% (докачано {}, ключевых запросов {}) · звук: восст. {}, заглушено {}",
+                        "{:.0} кадров/с показано (хост отправил {:.0} → дошло целиком {:.0} → декодировано {:.0}) · {:.1} Мбит/с · пинг {:.0} мс · потери за 5 с: видео {:.1}% / звук {:.1}% (с начала: видео {:.1}%, докачано {}, ключевых запросов {}) · звук: восст. {}, заглушено {}, запрошено {}",
                         (f - f0) as f64 / secs,
+                        (sent - sent0) as f64 / secs,
+                        (comp - comp0) as f64 / secs,
+                        (decall - dec0) as f64 / secs,
                         (b - b0) as f64 * 8.0 / secs / 1e6,
                         sh.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0,
-                        miss as f64 * 100.0 / (rx + miss).max(1) as f64,
+                        pct(miss - vmiss0, (rx - vrx0) + (miss - vmiss0)),
+                        pct(alost - alost0, aexp - aexp0),
+                        pct(miss, rx + miss),
                         rec,
                         sh.keyreqs.load(Ordering::Relaxed),
                         sh.audio_recovered.load(Ordering::Relaxed),
                         sh.audio_concealed.load(Ordering::Relaxed),
+                        sh.audio_requested.load(Ordering::Relaxed),
                     ));
+                    (sent0, comp0, dec0, vrx0, vmiss0, alost0, aexp0) = (sent, comp, decall, rx, miss, alost, aexp);
                     let fps = (f - f0) as f64 / secs;
                     let (dec_ms, dec_max, _) = d.decode.take();
                     let (conv_ms, conv_max, _) = d.convert.take();
@@ -422,11 +519,14 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     drop(d);
                     let mode = sh.dec_mode.load(Ordering::Relaxed) as usize;
                     let diag = format!(
-                        "Декодер: {} · декод {:.1}/{:.0} мс · цвет+масштаб {:.1}/{:.0} мс · показ {:.1}/{:.0} мс · очередь {:.1}/{:.0} кадр. · пропущено: догоняя {}, переполнение {} · разброс кадров {:.1} мс, макс. пауза {:.0} мс, пауз >0,1 с: {}",
+                        "Декодер: {} · картинка {} → {} · декод {:.1}/{:.0} мс · цвет+масштаб {:.1}/{:.0} мс · показ {:.1}/{:.0} мс · очередь {:.1}/{:.0} кадр. · пропущено: догоняя {}, переполнение {}, конвертер занят {} · разброс кадров {:.1} мс, макс. пауза {:.0} мс, пауз >0,1 с: {}",
                         DEC_NAMES[mode.min(3)],
+                        size_str(sh.video_size.load(Ordering::Relaxed)),
+                        size_str(sh.shown_size.load(Ordering::Relaxed)),
                         dec_ms, dec_max, conv_ms, conv_max, pres_ms, pres_max, q_avg, q_max,
                         sh.dropped_catchup.load(Ordering::Relaxed),
                         sh.dropped_full.load(Ordering::Relaxed),
+                        sh.dropped_busy.load(Ordering::Relaxed),
                         jit, gap, stalls,
                     );
                     ui::diag(&diag);
@@ -486,7 +586,56 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             println!("Декодирование: {}", if dec.hardware { "видеокарта (D3D11VA)" } else { "процессор" });
             let mut scaler = Scaler::new();
             let mut full = Scaler::new();
-            let mut gov = CostGovernor::new();
+            let gov = Arc::new(Mutex::new(CostGovernor::new()));
+            // Pictures are converted on converter threads, except when a test wants every picture in order
+            // (screenshot after N frames, A/V sync beacon).
+            let pooled = frames_limit.is_none() && !crate::avsync::enabled();
+            let busy = Arc::new(AtomicUsize::new(0));
+            let mut seq = 0u64;
+            let job_tx = {
+                let (tx, rx) = mpsc::sync_channel::<ConvJob>(1);
+                let rx = Arc::new(Mutex::new(rx));
+                if pooled {
+                    for _ in 0..CONVERTERS {
+                        let (rx, sh, gov, busy, proxy) = (rx.clone(), sh.clone(), gov.clone(), busy.clone(), proxy.clone());
+                        std::thread::spawn(move || {
+                            let mut scaler = Scaler::new();
+                            let mut px: Vec<u32> = Vec::new();
+                            loop {
+                                let job = match rx.lock().unwrap().recv() {
+                                    Ok(j) => j,
+                                    Err(_) => break,
+                                };
+                                let tc = Instant::now();
+                                scaler.fast = gov.lock().unwrap().fast;
+                                if scaler.convert(job.frame.get(), job.dw, job.dh, &mut px).is_ok() {
+                                    let us = tc.elapsed().as_micros() as u64;
+                                    gov.lock().unwrap().feed(us as f64 / 1000.0);
+                                    sh.diag.lock().unwrap().convert.add(us);
+                                    sh.shown_size.store(((job.dw as u64) << 32) | job.dh as u64, Ordering::Relaxed);
+                                    let fresh = {
+                                        let mut p = sh.picture.lock().unwrap();
+                                        let fresh = job.seq >= p.seq;
+                                        if fresh {
+                                            p.seq = job.seq;
+                                            p.w = job.dw;
+                                            p.h = job.dh;
+                                            std::mem::swap(&mut p.px, &mut px);
+                                        }
+                                        fresh
+                                    };
+                                    if fresh {
+                                        let _ = proxy.send_event(UserEv::Frame);
+                                        sh.frames_decoded.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                busy.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        });
+                    }
+                }
+                tx
+            };
             let mut watch = HwWatch::new();
             let mut gpu_failed = false;
             let mut errs = 0u32;
@@ -515,19 +664,19 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 // Behind by a few frames: still decode (P-frames need it) but skip the readback, colour
                 // conversion and drawing. The picture on screen then jumps to the newest frame instead of
                 // lagging by the whole backlog.
-                let show = viewperf::should_show(waiting);
+                //
+                // Lip sync: sound sits in its jitter buffer for a while, so every frame is held just as long
+                // after its arrival. That keeps several frames queued, which is normal and not "behind": a frame
+                // counts as late only when it is already past its own due time.
+                let hold = sync_q.as_ref().map_or(Duration::ZERO, |q| q.delay().saturating_sub(DECODE_TIME).min(MAX_SYNC_HOLD));
+                let due = arrived + hold;
+                let now = Instant::now();
+                let show = viewperf::should_show(waiting, now.saturating_duration_since(due));
                 if !show {
                     sh.dropped_catchup.fetch_add(1, Ordering::Relaxed);
                 }
-                // Lip sync: sound sits in its jitter buffer for a while, so hold each frame just as long
-                // (only when we're not already behind: a backlog is late enough).
-                if let (true, Some(q)) = (waiting == 0, &sync_q) {
-                    let hold = q.delay().saturating_sub(DECODE_TIME).min(MAX_SYNC_HOLD);
-                    let due = arrived + hold;
-                    let now = Instant::now();
-                    if due > now {
-                        std::thread::sleep(due - now);
-                    }
+                if due > now {
+                    std::thread::sleep(due - now);
                 }
                 if done {
                     break;
@@ -535,6 +684,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 let t0 = Instant::now();
                 let mut conv_us = 0u64;
                 let r = dec.decode(&data, show, |f| {
+                    sh.video_size.store(((f.width.max(0) as u64) << 32) | f.height.max(0) as u64, Ordering::Relaxed);
                     let ws = sh.win_size.load(Ordering::Relaxed);
                     let (ww, wh) = ((ws >> 32) as u32, ws as u32);
                     if ww == 0 || wh == 0 || f.width <= 0 || f.height <= 0 {
@@ -543,13 +693,30 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     let (fw, fh) = (f.width as u32, f.height as u32);
                     let s = (ww as f64 / fw as f64).min(wh as f64 / fh as f64);
                     let (dw, dh) = (((fw as f64 * s) as u32).max(1), ((fh as f64 * s) as u32).max(1));
+                    if pooled {
+                        // Hand the picture to a converter thread; if both are busy this one isn't shown.
+                        if busy.load(Ordering::Relaxed) > CONVERTERS {
+                            sh.dropped_busy.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        if let Ok(frame) = OwnedFrame::copy_of(f) {
+                            seq += 1;
+                            busy.fetch_add(1, Ordering::Relaxed);
+                            if job_tx.try_send(ConvJob { seq, frame, dw, dh }).is_err() {
+                                busy.fetch_sub(1, Ordering::Relaxed);
+                                sh.dropped_busy.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        return;
+                    }
                     let tc = Instant::now();
-                    scaler.fast = gov.fast;
+                    scaler.fast = gov.lock().unwrap().fast;
                     if scaler.convert(f, dw, dh, &mut px).is_err() {
                         return;
                     }
                     conv_us = tc.elapsed().as_micros() as u64;
-                    gov.feed(conv_us as f64 / 1000.0);
+                    sh.shown_size.store(((dw as u64) << 32) | dh as u64, Ordering::Relaxed);
+                    gov.lock().unwrap().feed(conv_us as f64 / 1000.0);
                     let is_flash = crate::avsync::enabled() && {
                         let bytes = unsafe { std::slice::from_raw_parts(px.as_ptr() as *const u8, px.len() * 4) };
                         flash.rising(crate::avsync::luma(bytes, dw as usize * 4, dw as usize, dh as usize))
@@ -578,6 +745,9 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     }
                 });
                 let total = t0.elapsed().as_micros() as u64;
+                if r.is_ok() {
+                    sh.frames_decoded_all.fetch_add(1, Ordering::Relaxed);
+                }
                 {
                     let mut d = sh.diag.lock().unwrap();
                     d.decode.add(total.saturating_sub(conv_us));

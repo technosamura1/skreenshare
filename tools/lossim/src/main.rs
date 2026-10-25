@@ -5,6 +5,10 @@
 #[path = "../../../src/audiopkt.rs"]
 mod audiopkt;
 mod legacy;
+#[path = "../../../src/opus.rs"]
+mod opus;
+#[path = "../../../src/opusaudio.rs"]
+mod opusaudio;
 #[path = "../../../src/plc.rs"]
 #[allow(dead_code)]
 mod plc;

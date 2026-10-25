@@ -15,6 +15,8 @@ pub const PT_VIDEO: u8 = 0x90;
 pub const PT_AUDIO: u8 = 0x91; // legacy (v0.5.0 and older): seq u32 | rate u32 | samples
 /// Audio with loss protection, see audiopkt.rs.
 pub const PT_AUDIO2: u8 = 0x92;
+/// Opus audio (v0.7.4+), see opusaudio.rs. Only sent to viewers that announced it with PT_CAPS.
+pub const PT_AUDIO3: u8 = 0x93;
 pub const PT_KEYREQ: u8 = 0xA0;
 pub const PT_PING: u8 = 0xA1;
 pub const PT_PONG: u8 = 0xA2;
@@ -24,6 +26,11 @@ pub const PT_NACK: u8 = 0xA4;
 /// Client -> host: running totals (u64 each): fragments received | found missing | still missing after a
 /// repeat request | frames given up on. Older clients send only the first two.
 pub const PT_REPORT: u8 = 0xA5;
+/// Client -> host: resend these audio datagrams. n u8 | n × seq u32.
+pub const PT_ANACK: u8 = 0xA6;
+/// Client -> host: what this viewer understands (sent about once a second): flags u8, bit 0 = Opus audio.
+pub const PT_CAPS: u8 = 0xA7;
+pub const CAP_OPUS: u8 = 1;
 
 pub const ROLE_HOST: u8 = 1;
 pub const ROLE_CLIENT: u8 = 2;
@@ -105,6 +112,12 @@ pub fn is_benign(e: &std::io::Error) -> bool {
         e.kind(),
         ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ConnectionReset | ErrorKind::Interrupted
     )
+}
+
+/// Socket buffer sizes Windows actually granted (recv, send), in bytes: the requested sizes are only a wish.
+pub fn socket_buffers(s: &UdpSocket) -> (usize, usize) {
+    let r = socket2::SockRef::from(s);
+    (r.recv_buffer_size().unwrap_or(0), r.send_buffer_size().unwrap_or(0))
 }
 
 pub fn bind_socket() -> Result<UdpSocket> {
@@ -333,7 +346,7 @@ pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], t
                 }
             }
             // The other side already decided we're connected and started talking.
-            PT_VIDEO | PT_AUDIO | PT_AUDIO2 | PT_KEYREQ | PT_PING | PT_PONG | PT_NACK | PT_REPORT => return Ok(from),
+            PT_VIDEO | PT_AUDIO | PT_AUDIO2 | PT_AUDIO3 | PT_KEYREQ | PT_PING | PT_PONG | PT_NACK | PT_REPORT | PT_ANACK | PT_CAPS => return Ok(from),
             _ => {}
         }
     }

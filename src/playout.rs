@@ -7,22 +7,22 @@
 //    another click; now an underrun fades out over 3 ms, re-buffers, and fades back in;
 //  - a full buffer dropped the oldest audio in one go (a click); now it fades out, skips, fades in;
 //  - the 40..50 ms buffer was too small for bursty networks; now the buffer target adapts between
-//    40 and 100 ms (grows 20 ms per underrun, shrinks 5 ms per 30 quiet seconds);
+//    80 and 120 ms (grows 20 ms per underrun, shrinks 5 ms per 30 quiet seconds);
 //  - drift was only chased by a proportional controller; now a PI controller learns the drift (ppm) and
 //    keeps the delay steady while changing the playback speed by tiny, smooth amounts;
 //  - linear interpolation (aliasing "grit", worst for 48 -> 44.1 kHz) is replaced by an 8-tap Kaiser-windowed
 //    sinc resampler (>60 dB clean up to ~10 kHz).
 use std::collections::VecDeque;
 
-pub const MIN_TARGET: f64 = 0.040;
-pub const START_TARGET: f64 = 0.060;
-pub const MAX_TARGET: f64 = 0.100;
+pub const MIN_TARGET: f64 = 0.080;
+pub const START_TARGET: f64 = 0.090;
+pub const MAX_TARGET: f64 = 0.120;
 const TARGET_UP: f64 = 0.020;
 const TARGET_DOWN: f64 = 0.005;
 /// This long without an underrun lets the target shrink one step.
 const CALM_SEC: f64 = 30.0;
 /// Above target + this the oldest audio is skipped (with a fade).
-const TRIM_OVER: f64 = 0.120;
+const TRIM_OVER: f64 = 0.150;
 /// Fade length for starts, stops and skips.
 const FADE_SEC: f64 = 0.003;
 /// Largest speed correction (0.8%: ~14 cents, only reached while catching up after a burst).
@@ -487,18 +487,18 @@ mod tests {
     #[test]
     fn target_shrinks_back_when_calm() {
         let mut s = Sim::new(48000.0, 0.0, 440.0);
-        s.feed(70.0);
+        s.feed(100.0);
         s.play(20.0);
         for _ in 0..30 {
             s.play(10.0);
         } // starve once
-        assert!(s.p.stats.target_ms > 60.0);
+        assert!(s.p.stats.target_ms > 100.0, "{}", s.p.stats.target_ms);
         s.feed(150.0);
         for _ in 0..(CALM_SEC as usize * 100 * 3) {
             s.feed(10.0);
             s.play(10.0);
         }
-        assert!(s.p.stats.target_ms <= 70.0 && s.p.stats.target_ms >= MIN_TARGET * 1000.0, "{}", s.p.stats.target_ms);
+        assert!(s.p.stats.target_ms <= 100.0 && s.p.stats.target_ms >= MIN_TARGET * 1000.0, "{}", s.p.stats.target_ms);
     }
 
     #[test]

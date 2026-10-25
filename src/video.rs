@@ -675,3 +675,74 @@ impl Drop for BgraScaler {
         }
     }
 }
+
+/// A decoded picture copied out of the decoder's reusable frame, so it can be converted on another thread
+/// while the decoder moves on to the next packet.
+pub struct OwnedFrame(*mut AVFrame);
+
+unsafe impl Send for OwnedFrame {}
+
+impl OwnedFrame {
+    /// Copies the pixels and the colour properties (~1 ms for 1080p NV12).
+    pub fn copy_of(f: &AVFrame) -> Result<OwnedFrame> {
+        unsafe {
+            let n = av_frame_alloc();
+            if n.is_null() {
+                bail!("av_frame_alloc");
+            }
+            let o = OwnedFrame(n);
+            (*n).format = f.format;
+            (*n).width = f.width;
+            (*n).height = f.height;
+            if av_frame_get_buffer(n, 32) < 0 || av_frame_copy(n, f) < 0 || av_frame_copy_props(n, f) < 0 {
+                bail!("копия кадра не удалась");
+            }
+            Ok(o)
+        }
+    }
+
+    pub fn get(&self) -> &AVFrame {
+        unsafe { &*self.0 }
+    }
+}
+
+impl Drop for OwnedFrame {
+    fn drop(&mut self) {
+        unsafe { av_frame_free(&mut self.0) };
+    }
+}
+
+/// `convbench`: how long the viewer's NV12 -> window-size BGR0 conversion takes on this machine.
+pub fn convert_bench(vw: i32, vh: i32, dw: u32, dh: u32) -> Result<()> {
+    unsafe {
+        let mut f = av_frame_alloc();
+        (*f).format = AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+        (*f).width = vw;
+        (*f).height = vh;
+        if av_frame_get_buffer(f, 32) < 0 {
+            bail!("av_frame_get_buffer");
+        }
+        for p in 0..2 {
+            let n = (*f).linesize[p] as usize * if p == 0 { vh } else { vh / 2 } as usize;
+            for i in 0..n {
+                *(*f).data[p].add(i) = (i.wrapping_mul(31) >> 3) as u8;
+            }
+        }
+        (*f).colorspace = AVColorSpace::AVCOL_SPC_BT709;
+        (*f).color_range = AVColorRange::AVCOL_RANGE_MPEG;
+        let mut out = Vec::new();
+        for (name, fast) in [("бикубик", false), ("билинейный", true)] {
+            let mut sc = Scaler::new();
+            sc.fast = fast;
+            sc.convert(&*f, dw, dh, &mut out)?; // warm-up, builds the context
+            let t = std::time::Instant::now();
+            let n = 20;
+            for _ in 0..n {
+                sc.convert(&*f, dw, dh, &mut out)?;
+            }
+            println!("{vw}x{vh} -> {dw}x{dh}, {name}: {:.1} мс/кадр", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+        }
+        av_frame_free(&mut f);
+    }
+    Ok(())
+}

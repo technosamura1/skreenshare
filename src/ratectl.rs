@@ -59,6 +59,11 @@ impl ReportTracker {
 /// Share of lost fragments whose repair failed that plain random loss explains away (a lost request or a lost
 /// resend each cost one more round; at 5% loss each way it is ~15%).
 const REPAIR_FAIL: f64 = 0.4;
+/// Raw loss that is repaired fine but still hurts (retransmissions, delay, late audio) and is often caused by our own
+/// sending rate on a Wi-Fi/ISP link: back off gently (x0.85 per step), but only down to this share of the maximum;
+/// below that only failing repairs cut further, so a link that is simply lossy keeps decent quality.
+const SOFT_LOSS: f64 = 0.04;
+const SOFT_FLOOR: f64 = 0.6;
 
 pub struct RateControl {
     max: f64,
@@ -102,7 +107,7 @@ impl RateControl {
         let before = self.cur;
         let factor = if d.gave_up > 0 || res > 0.02 || raw > 0.25 {
             Some(0.7)
-        } else if (res > 0.004 && res > REPAIR_FAIL * raw) || raw > 0.12 {
+        } else if (res > 0.004 && res > REPAIR_FAIL * raw) || raw > 0.12 || (raw > SOFT_LOSS && self.cur > self.max * SOFT_FLOOR) {
             // Repairs fail much more often than plain random loss would explain (a lost request or a lost
             // resend is ~2x the loss rate): the path is congested, not just lossy.
             Some(0.85)
@@ -119,7 +124,7 @@ impl RateControl {
                 self.last_down = Some(now);
             }
             self.clean_since = now;
-        } else if res > 0.0 && res > REPAIR_FAIL * raw || raw > 0.08 {
+        } else if res > 0.0 && res > REPAIR_FAIL * raw || raw > 0.03 {
             self.clean_since = now; // not clean enough to raise, not bad enough to cut
         } else if now.duration_since(self.clean_since) >= self.hold {
             self.cur = (self.cur * 1.08).max(self.cur + 0.3).min(self.max);
@@ -145,10 +150,35 @@ mod tests {
         let t = Instant::now();
         let mut rc = RateControl::new(30.0, t);
         for i in 1..=60 {
-            // 5% raw loss, every loss repaired on the first try
-            assert_eq!(rc.update(t + Duration::from_millis(500 * i), d(950, 50, 0, 0)), None);
+            // 3% raw loss, every loss repaired on the first try
+            assert_eq!(rc.update(t + Duration::from_millis(500 * i), d(970, 30, 0, 0)), None);
         }
         assert_eq!(rc.cur, 30.0);
+    }
+
+    #[test]
+    fn steady_loss_of_5_percent_backs_off_gently_but_not_below_the_floor() {
+        let t = Instant::now();
+        let mut rc = RateControl::new(30.0, t);
+        let mut cuts = 0;
+        for i in 1..=200 {
+            if rc.update(t + Duration::from_millis(500 * i), d(950, 50, 0, 0)).is_some() {
+                cuts += 1;
+            }
+        }
+        assert!(cuts >= 1);
+        assert!(rc.cur >= 30.0 * SOFT_FLOOR * 0.85 - 1e-9 && rc.cur < 30.0, "got {}", rc.cur);
+    }
+
+    #[test]
+    fn three_percent_loss_does_not_cut_but_does_not_raise_either() {
+        let t = Instant::now();
+        let mut rc = RateControl::new(30.0, t);
+        rc.cur = 20.0;
+        for i in 1..=100 {
+            assert_eq!(rc.update(t + Duration::from_millis(500 * i), d(965, 35, 0, 0)), None);
+        }
+        assert_eq!(rc.cur, 20.0);
     }
 
     #[test]
@@ -156,8 +186,8 @@ mod tests {
         let t = Instant::now();
         let mut rc = RateControl::new(30.0, t);
         for i in 1..=60 {
-            // 5% loss each way: ~10% of the lost fragments need a second request
-            assert_eq!(rc.update(t + Duration::from_millis(500 * i), d(950, 50, 5, 0)), None);
+            // 3% loss each way: ~10% of the lost fragments need a second request
+            assert_eq!(rc.update(t + Duration::from_millis(500 * i), d(970, 30, 3, 0)), None);
         }
         assert_eq!(rc.cur, 30.0);
     }

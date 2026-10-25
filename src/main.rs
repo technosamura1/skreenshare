@@ -13,6 +13,8 @@ mod loopback;
 mod easy;
 mod encsel;
 mod net;
+mod opus;
+mod opusaudio;
 mod playout;
 mod plc;
 mod ntfy;
@@ -110,7 +112,7 @@ fn host_opts(a: &mut Args) -> Result<host::HostOpts> {
     Ok(host::HostOpts {
         window: a.value("--window")?.map(|v| v.parse::<isize>()).transpose().context("--window")?,
         monitor: a.value("--monitor")?.map(|v| v.parse::<usize>()).transpose().context("--monitor")?,
-        bitrate_mbps: a.num("--bitrate", 20)?,
+        bitrate_mbps: a.num("--bitrate", 15)?,
         fps: a.num("--fps", 60)?,
         preset: a.value("--preset")?.unwrap_or_else(|| "p4".into()),
         max_send_mbps: a.num("--max-send", 80)?,
@@ -166,6 +168,18 @@ fn run(mut a: Args) -> Result<()> {
             selftest::bitrate_switch_test(&preset)?;
             let m = host::pick_monitor(mon, false)?;
             selftest::capture_test(m, bitrate, &preset, hw, &out)?;
+        }
+        "convbench" => {
+            let w = a.num::<i32>("--video-w", 1920)?;
+            let h = a.num::<i32>("--video-h", 1080)?;
+            let dw = a.num::<u32>("--window-w", 2560)?;
+            let dh = a.num::<u32>("--window-h", 1440)?;
+            a.finish()?;
+            video::convert_bench(w, h, dw, dh)?;
+        }
+        "opustest" => {
+            a.finish()?;
+            opus::selftest()?;
         }
         "avbeacon" => {
             let secs = a.num::<u64>("--seconds", 20)?;

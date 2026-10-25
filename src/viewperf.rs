@@ -25,13 +25,20 @@ impl Acc {
     }
 }
 
-/// Frames that are this many frames behind the newest one are decoded but not shown (catch-up).
-pub const CATCHUP_DEPTH: usize = 3;
+/// A frame that is later than this past its due time (arrival + the lip-sync hold) is "behind".
+pub const LATE_LIMIT: std::time::Duration = std::time::Duration::from_millis(50);
+/// Whatever the clocks say, a backlog this deep is always caught up on.
+pub const HARD_BACKLOG: usize = 12;
 
-/// Whether a frame with `waiting` more frames queued behind it should be converted and shown.
-/// A frame is always decoded (P-frames depend on each other); only the expensive part is skipped.
-pub fn should_show(waiting: usize) -> bool {
-    waiting < CATCHUP_DEPTH
+/// Whether a frame should be converted and shown. `waiting` frames are queued behind it, `late` is how long
+/// past its due time it is. A frame is always decoded (P-frames depend on each other); only the expensive
+/// part is skipped, and only when we are really late.
+///
+/// The old rule looked at the queue depth alone. But holding every frame back for lip sync (sound sits ~80-120 ms
+/// in its jitter buffer) legitimately keeps 5-7 frames queued at 60 fps, so that rule dropped 2 of 3 frames in
+/// steady state: "host sends 50, viewer shows 25-30" with a 2 ms decode.
+pub fn should_show(waiting: usize, late: std::time::Duration) -> bool {
+    waiting < 2 || (late <= LATE_LIMIT && waiting < HARD_BACKLOG)
 }
 
 /// Arrival jitter of completed frames: smoothed mean absolute deviation of the frame interval, the longest gap
@@ -111,8 +118,8 @@ pub struct CostGovernor {
 }
 
 impl CostGovernor {
-    pub const ENTER_MS: f64 = 9.0;
-    pub const LEAVE_MS: f64 = 3.5;
+    pub const ENTER_MS: f64 = 14.0;
+    pub const LEAVE_MS: f64 = 5.0;
 
     pub fn new() -> Self {
         CostGovernor { ema_ms: 0.0, fast: false }
@@ -145,9 +152,15 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_shows_only_near_the_newest() {
-        assert!(should_show(0) && should_show(CATCHUP_DEPTH - 1));
-        assert!(!should_show(CATCHUP_DEPTH) && !should_show(40));
+    fn catch_up_skips_only_when_really_late() {
+        use std::time::Duration as D;
+        // lip-sync hold keeps a deep queue, but every frame is on time: show all of them
+        assert!(should_show(6, D::ZERO) && should_show(11, D::from_millis(10)));
+        // late and with a backlog: skip the expensive part
+        assert!(!should_show(3, D::from_millis(80)) && !should_show(2, D::from_millis(51)));
+        // late but alone in the queue: show it (nothing newer to jump to)
+        assert!(should_show(0, D::from_millis(200)) && should_show(1, D::from_millis(200)));
+        assert!(!should_show(HARD_BACKLOG, D::ZERO));
     }
 
     #[test]
@@ -210,11 +223,11 @@ mod tests {
         }
         assert!(!g.fast);
         for _ in 0..30 {
-            g.feed(14.0);
+            g.feed(20.0);
         }
         assert!(g.fast);
         for _ in 0..10 {
-            g.feed(6.0); // between the thresholds: stays fast
+            g.feed(8.0); // between the thresholds: stays fast
         }
         assert!(g.fast);
         for _ in 0..60 {

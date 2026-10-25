@@ -8,7 +8,30 @@ const NEEDED: &[&str] = &["avcodec-", "avutil-", "swscale-", "swresample-"];
 /// Loaded by our own code (directly imported); swresample is only pulled in by avcodec.
 const DIRECT: &[&str] = &["avcodec-", "avutil-", "swscale-"];
 
+/// libopus (vendor/opus) compiled straight into the exe: audio codec with built-in loss concealment and FEC.
+fn build_opus() {
+    let root = PathBuf::from("vendor/opus");
+    let mut b = cc::Build::new();
+    let mut n = 0;
+    for dir in ["celt", "silk", "silk/float", "src"] {
+        for e in std::fs::read_dir(root.join(dir)).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "c") {
+                b.file(&p);
+                n += 1;
+            }
+        }
+    }
+    assert!(n > 100, "vendor/opus неполный ({n} файлов)");
+    for inc in [".", "include", "celt", "silk", "silk/float", "src"] {
+        b.include(root.join(inc));
+    }
+    b.define("HAVE_CONFIG_H", None).warnings(false).opt_level(3).compile("opus");
+    println!("cargo:rerun-if-changed=vendor/opus");
+}
+
 fn main() {
+    build_opus();
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     println!("cargo:rerun-if-changed=build.rs");
     let ffmpeg_dir = std::env::var("FFMPEG_DIR").expect("FFMPEG_DIR не задан (см. .cargo/config.toml)");

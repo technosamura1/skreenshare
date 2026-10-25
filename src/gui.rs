@@ -394,7 +394,7 @@ impl GuiApp {
             choice: Choice::Screen,
             choice_label: "Весь экран".into(),
             windows: wincap::list_windows(),
-            bitrate: 20,
+            bitrate: 15,
             audio: true,
             fullscreen: true,
             host: None,
@@ -666,7 +666,7 @@ impl GuiApp {
             ui.add_space(8.0);
             ui.label(RichText::new("Качество").font(bold(15.0)));
             ui.horizontal(|ui| {
-                for (name, v) in [("Для друга по интернету · 20", 20), ("Хороший интернет · 40", 40), ("Одна сеть · 60", 60)] {
+                for (name, v) in [("Для друга по интернету · 15", 15), ("Хороший интернет · 40", 40), ("Одна сеть · 60", 60)] {
                     if ui.selectable_label(self.bitrate == v, name).clicked() {
                         self.bitrate = v;
                     }

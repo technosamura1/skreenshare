@@ -10,9 +10,9 @@ use crate::wincap::WindowCapturer;
 use crate::preview;
 use anyhow::{bail, Result};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct HostOpts {
@@ -52,6 +52,9 @@ pub fn pick_monitor(choice: Option<usize>, interactive: bool) -> Result<MonitorI
     Ok(mons.swap_remove(i))
 }
 
+/// Frames waiting for the paced sender beyond which new screen updates are skipped (the channel holds 6).
+const MAX_BACKLOG: usize = 3;
+
 struct Shared {
     running: AtomicBool,
     keyreq: AtomicBool,
@@ -63,6 +66,14 @@ struct Shared {
     loss_bp: AtomicU32,
     /// Pacer rate, bytes per second.
     send_rate: AtomicU64,
+    /// The viewer announced (PT_CAPS) that it plays Opus audio.
+    peer_opus: AtomicBool,
+    /// Recent Opus frames, for answering the viewer's audio NACKs (set once the Opus sender exists).
+    audio_hist: Mutex<Option<crate::opusaudio::History>>,
+    /// Encoded video frames the paced sender has not finished sending yet (in the channel or being sent).
+    backlog: AtomicUsize,
+    /// Frames skipped because the sender was still busy (instead of encoding them and breaking the chain).
+    skipped_busy: AtomicU64,
 }
 
 impl Shared {
@@ -93,7 +104,11 @@ type AudioSink = Box<dyn FnMut(&[i16], u32) + Send>;
 
 fn audio_sender(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, sh: Arc<Shared>, seq: Arc<AtomicU32>) -> AudioSink {
     // Every datagram carries the previous one's samples too (see audiopkt.rs), so one lost packet is rebuilt.
-    let mut tx = AudioTx::new(token, seq);
+    let mut tx = AudioTx::new(token, seq.clone());
+    // Opus (v0.7.4+) for viewers that announced it; 48 kHz only (the usual rate of the process loopback capture),
+    // anything else keeps the older mu-law format that every viewer understands.
+    let mut opus_tx: Option<crate::opusaudio::Tx> = None;
+    let mut opus_failed = false;
     let mut beep = crate::avsync::BeepEdge::new(48_000);
     Box::new(move |samples, rate| {
         if crate::avsync::enabled() {
@@ -105,10 +120,29 @@ fn audio_sender(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, sh: Arc<Shar
                 }
             }
         }
-        tx.push(samples, rate, |pkt| {
+        let mut send = |pkt: &[u8]| {
             net::send_media(&sock, pkt, peer);
             sh.sent_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
-        });
+        };
+        if rate == 48_000 && sh.peer_opus.load(Ordering::Relaxed) && !opus_failed {
+            if opus_tx.is_none() {
+                match crate::opusaudio::Tx::new(token, seq.clone(), 128) {
+                    Ok(t) => {
+                        *sh.audio_hist.lock().unwrap() = Some(t.history.clone());
+                        opus_tx = Some(t);
+                    }
+                    Err(e) => {
+                        eprintln!("Opus недоступен ({e:#}), звук идёт в старом формате");
+                        opus_failed = true;
+                    }
+                }
+            }
+            if let Some(t) = opus_tx.as_mut() {
+                t.push(samples, &mut send);
+                return;
+            }
+        }
+        tx.push(samples, rate, &mut send);
     })
 }
 
@@ -266,6 +300,10 @@ pub fn run(o: HostOpts) -> Result<()> {
     println!("Показываю монитор {}x{} ({})", monitor.width, monitor.height, monitor.adapter);
 
     let sock = Arc::new(net::bind_socket()?);
+    {
+        let (r, s) = net::socket_buffers(&sock);
+        println!("Буферы сокета: приём {} КБ, отправка {} КБ", r / 1024, s / 1024);
+    }
     println!("Определяю адрес в интернете...");
     let nat = net::stun_discover(&sock);
     ui::report_nat(&nat);
@@ -298,6 +336,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         resent: AtomicU64::new(0),
         loss_bp: AtomicU32::new(0),
         send_rate: AtomicU64::new(pacer_rate(o.bitrate_mbps as f64, o.max_send_mbps)),
+        peer_opus: AtomicBool::new(false),
+        audio_hist: Mutex::new(None),
+        backlog: AtomicUsize::new(0),
+        skipped_busy: AtomicU64::new(0),
     });
     {
         let sh = sh.clone();
@@ -339,6 +381,21 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
                         let _ = sock.send_to(&out, from);
                     }
                     net::PT_PUNCH => net::answer_punch(&sock, token, net::ROLE_HOST, body, from),
+                    net::PT_CAPS => {
+                        sh.peer_opus.store(body.first().is_some_and(|f| f & net::CAP_OPUS != 0), Ordering::Relaxed);
+                    }
+                    net::PT_ANACK => {
+                        // Resend audio the viewer is still missing (a few per request: it only asks for what it needs).
+                        let hist = sh.audio_hist.lock().unwrap().clone();
+                        if let Some(h) = hist {
+                            for seq in crate::opusaudio::parse_anack(body).into_iter().take(8) {
+                                if h.datagram(token, seq, &mut out) {
+                                    net::send_media(&sock, &out, from);
+                                    sh.sent_bytes.fetch_add(out.len() as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
                     net::PT_NACK => {
                         if let Some(n) = retx::parse_nack(body) {
                             let _ = nack_tx.send(n);
@@ -376,7 +433,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
                 }
                 if !s.busy() && !closed {
                     match rx.try_recv() {
-                        Ok((data, key, fid)) => s.push_frame(fid, key, &data),
+                        Ok((data, key, fid)) => {
+                            sh.backlog.fetch_sub(1, Ordering::Relaxed);
+                            s.push_frame(fid, key, &data)
+                        }
                         Err(mpsc::TryRecvError::Empty) => {}
                         Err(mpsc::TryRecvError::Disconnected) => closed = true,
                     }
@@ -391,7 +451,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
                     Poll::Wait(_) => std::thread::yield_now(),
                     Poll::Idle if closed => break,
                     Poll::Idle => match rx.recv_timeout(Duration::from_millis(2)) {
-                        Ok((data, key, fid)) => s.push_frame(fid, key, &data),
+                        Ok((data, key, fid)) => {
+                            sh.backlog.fetch_sub(1, Ordering::Relaxed);
+                            s.push_frame(fid, key, &data)
+                        }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => closed = true,
                     },
@@ -459,6 +522,8 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
     let mut flash = crate::avsync::FlashEdge::default();
     let mut rc = RateControl::new(o.bitrate_mbps as f64, Instant::now());
     let mut stat_resent0 = 0u64;
+    let mut stat_updates = 0u32;
+    let mut stat_skipped0 = 0u64;
 
     while sh.running.load(Ordering::Relaxed) {
         let loss = sh.loss_bp.load(Ordering::Relaxed) as f64 / 10_000.0;
@@ -492,7 +557,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
             },
         };
         match ev {
-            Event::Updated => dirty = true,
+            Event::Updated => {
+                dirty = true;
+                stat_updates += 1;
+            }
             Event::Reset => {
                 dirty = true;
                 if let Cap::Screen(c) = &cap {
@@ -535,6 +603,14 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         if !dirty || now < next_due {
             // Idle moment: the right time for a preview of the last sent frame (never delays an encode).
             pv.maybe(enc.as_ref(), canvas, sh.now_ms(), 0);
+            continue;
+        }
+        // The paced sender is still working through earlier frames (a big keyframe, retransmissions): don't pile more
+        // on. Skipping *before* encoding keeps the reference chain intact; the old way (encode, then drop the
+        // finished frame when the queue was full) forced a new keyframe, which is the biggest burst there is.
+        if enc.is_some() && !force_key && sh.backlog.load(Ordering::Relaxed) >= MAX_BACKLOG {
+            sh.skipped_busy.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(1));
             continue;
         }
         if enc.is_none() {
@@ -585,10 +661,12 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         }
         let key_now = force_key;
         e.encode(key_now, |data, key| {
+            sh.backlog.fetch_add(1, Ordering::Relaxed);
             if tx.try_send((data.to_vec(), key, fid)).is_ok() {
                 fid = fid.wrapping_add(1);
             } else {
-                // Network can't keep up: drop this frame, restart the chain with a keyframe.
+                // Still full (it is deeper than MAX_BACKLOG, so this is rare): drop the frame, restart the chain.
+                sh.backlog.fetch_sub(1, Ordering::Relaxed);
                 sh.keyreq.store(true, Ordering::Relaxed);
             }
         })?;
@@ -608,17 +686,23 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
             let bytes = sh.sent_bytes.load(Ordering::Relaxed);
             let resent = sh.resent.load(Ordering::Relaxed);
             let glitches = crate::audio::CAPTURE_GLITCHES.load(Ordering::Relaxed);
+            let skipped = sh.skipped_busy.load(Ordering::Relaxed);
             ui::stat(&format!(
-                "{enc_short} · {:.0} кадров/с · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · кодирование {:.1} мс{}",
+                "{enc_short} · {:.0} кадров/с (экран обновился {:.0}/с, отложено из-за сети {}) · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · кодирование {:.1} мс · звук {}{}",
                 stat_frames as f64 / secs,
+                stat_updates as f64 / secs,
+                skipped - stat_skipped0,
                 (bytes - stat_bytes0) as f64 * 8.0 / secs / 1e6,
                 rc.cur,
                 loss * 100.0,
                 resent - stat_resent0,
                 if stat_frames > 0 { stat_enc.as_secs_f64() * 1000.0 / stat_frames as f64 } else { 0.0 },
+                if sh.peer_opus.load(Ordering::Relaxed) { "Opus" } else { "обычный" },
                 if glitches > 0 { format!(" · пропуски в захвате звука: {glitches}") } else { String::new() },
             ));
             stat_resent0 = resent;
+            stat_updates = 0;
+            stat_skipped0 = skipped;
             stat_t = Instant::now();
             stat_frames = 0;
             stat_enc = Duration::ZERO;

@@ -11,7 +11,7 @@ const HISTORY_BYTES: usize = 48 << 20;
 /// A packet that was just resent is not resent again for this long (duplicate requests).
 const RESEND_DEDUPE: Duration = Duration::from_millis(8);
 /// Retransmissions may use at most this share of the pacer rate (the rest is for new frames).
-const RESEND_SHARE: f64 = 0.5;
+const RESEND_SHARE: f64 = 0.25;
 
 struct Sent {
     pkt: Vec<u8>,
@@ -76,7 +76,9 @@ struct Pacer {
 }
 
 impl Pacer {
-    const BURST: f64 = 48.0 * 1300.0;
+    /// Back-to-back packets allowed after a quiet moment. 48 (62 KB, the old value) overflowed small Wi-Fi/ISP queues
+    /// and made the loss we then had to repair; ~12 packets is ~1 ms at 100 Mbit/s.
+    const BURST: f64 = 12.0 * 1300.0;
 
     fn new(now: Instant) -> Pacer {
         Pacer { tokens: Self::BURST, last: now }
@@ -259,7 +261,7 @@ pub fn parse_nack(body: &[u8]) -> Option<(u32, Vec<u16>)> {
 
 /// Pacer speed for a given video bitrate: room for keyframe bursts and retransmissions, within the cap.
 pub fn pacer_rate(bitrate_mbps: f64, max_send_mbps: u32) -> u64 {
-    ((bitrate_mbps * 2.0).max(10.0).min(max_send_mbps as f64) * 125_000.0) as u64
+    ((bitrate_mbps * 1.6).max(10.0).min(max_send_mbps as f64) * 125_000.0) as u64
 }
 
 #[cfg(test)]
