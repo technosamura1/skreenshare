@@ -13,6 +13,8 @@ mod loopback;
 mod easy;
 mod encsel;
 mod net;
+mod playout;
+mod plc;
 mod ntfy;
 mod preview;
 mod ratectl;

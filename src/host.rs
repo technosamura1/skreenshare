@@ -607,14 +607,16 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
             let secs = stat_t.elapsed().as_secs_f64();
             let bytes = sh.sent_bytes.load(Ordering::Relaxed);
             let resent = sh.resent.load(Ordering::Relaxed);
+            let glitches = crate::audio::CAPTURE_GLITCHES.load(Ordering::Relaxed);
             ui::stat(&format!(
-                "{enc_short} · {:.0} кадров/с · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · кодирование {:.1} мс",
+                "{enc_short} · {:.0} кадров/с · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · кодирование {:.1} мс{}",
                 stat_frames as f64 / secs,
                 (bytes - stat_bytes0) as f64 * 8.0 / secs / 1e6,
                 rc.cur,
                 loss * 100.0,
                 resent - stat_resent0,
                 if stat_frames > 0 { stat_enc.as_secs_f64() * 1000.0 / stat_frames as f64 } else { 0.0 },
+                if glitches > 0 { format!(" · пропуски в захвате звука: {glitches}") } else { String::new() },
             ));
             stat_resent0 = resent;
             stat_t = Instant::now();

@@ -12,6 +12,7 @@ use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, BLOB, COINIT_MULTITHREADED};
 use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use std::sync::atomic::Ordering as AtomicOrdering;
 use windows::Win32::System::Variant::VT_BLOB;
 
 pub const RATE: u32 = 48_000;
@@ -92,6 +93,7 @@ pub fn start(pid: u32, mode: Mode, mut on_audio: impl FnMut(&[i16], u32) + Send 
     let stop2 = stop.clone();
     let thread = std::thread::spawn(move || unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        crate::audio::boost_audio_thread();
         let r = run(pid, mode, &stop2, &ready_tx, &mut on_audio);
         if let Err(e) = r {
             let _ = ready_tx.send(Err(e));
@@ -167,7 +169,7 @@ unsafe fn run(
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-            200_000, // 20 ms
+            1_000_000, // 100 ms of slack: the capture thread may be late by a few periods without losing samples
             0,
             &fmt,
             None,
@@ -178,6 +180,7 @@ unsafe fn run(
         client.Start()?;
         let _ = ready.send(Ok(()));
         let mut silence: Vec<i16> = Vec::new();
+        let mut fixed: Vec<i16> = Vec::new();
         while !stop.load(Ordering::Relaxed) {
             WaitForSingleObject(ev, 100);
             loop {
@@ -193,6 +196,18 @@ unsafe fn run(
                     silence.clear();
                     silence.resize(frames as usize * 2, 0);
                     on_audio(&silence, RATE);
+                } else if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
+                    // Samples were lost before this buffer: ramp it in so the splice does not click.
+                    crate::audio::CAPTURE_GLITCHES.fetch_add(1, AtomicOrdering::Relaxed);
+                    fixed.clear();
+                    fixed.extend_from_slice(std::slice::from_raw_parts(data as *const i16, frames as usize * 2));
+                    let ramp = (RATE as usize / 1000).min(fixed.len() / 2);
+                    for i in 0..ramp {
+                        let g = i as f32 / ramp as f32;
+                        fixed[i * 2] = (fixed[i * 2] as f32 * g) as i16;
+                        fixed[i * 2 + 1] = (fixed[i * 2 + 1] as f32 * g) as i16;
+                    }
+                    on_audio(&fixed, RATE);
                 } else {
                     on_audio(std::slice::from_raw_parts(data as *const i16, frames as usize * 2), RATE);
                 }

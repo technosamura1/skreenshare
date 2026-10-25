@@ -3,8 +3,8 @@
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI64, Ordering};
+use crate::playout::{PlayStats, Playout};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,8 +26,8 @@ pub fn start_capture(mut on_audio: impl FnMut(&[i16], u32) + Send + 'static) -> 
                 for f in data.chunks(ch) {
                     let l = f[0];
                     let r = if ch > 1 { f[1] } else { l };
-                    stereo.push((l.clamp(-1.0, 1.0) * 32767.0) as i16);
-                    stereo.push((r.clamp(-1.0, 1.0) * 32767.0) as i16);
+                    stereo.push((l.clamp(-1.0, 1.0) * 32767.0).round() as i16);
+                    stereo.push((r.clamp(-1.0, 1.0) * 32767.0).round() as i16);
                 }
                 on_audio(&stereo, rate);
             },
@@ -53,50 +53,43 @@ pub fn start_capture(mut on_audio: impl FnMut(&[i16], u32) + Send + 'static) -> 
     Ok(stream)
 }
 
-struct JitterBuf {
-    /// Interleaved stereo at `src_rate`.
-    q: VecDeque<f32>,
-    src_rate: u32,
-    playing: bool,
-    pos: f64,
-}
+/// Capture-side glitches seen on this machine (WASAPI DATA_DISCONTINUITY: samples were lost before we read them).
+pub static CAPTURE_GLITCHES: AtomicU64 = AtomicU64::new(0);
 
-/// Start playing once this much is buffered.
-const START_SEC: f64 = 0.04;
-/// Level the drift control steers to.
-const TARGET_SEC: f64 = 0.05;
-/// Safety valve for bursts: above this, drop the oldest audio down to the start level.
-const MAX_SEC: f64 = 0.25;
-/// Largest playback speed correction (0.4% = ~7 cents: inaudible, fixes ±4000 ppm of clock drift).
-const MAX_SPEED_FIX: f64 = 0.004;
+/// Puts the calling (audio) thread into the Windows "Pro Audio" MMCSS class, so a busy game or encoder
+/// cannot starve it (starved audio threads are a classic source of crackle). Falls back to the highest
+/// plain priority when MMCSS refuses.
+pub fn boost_audio_thread() {
+    use windows::core::w;
+    use windows::Win32::System::Threading::{AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
+    unsafe {
+        let mut task = 0u32;
+        if AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task).is_err() {
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AudioQueue {
-    buf: Arc<Mutex<JitterBuf>>,
+    buf: Arc<Mutex<Playout>>,
     /// How long a sample pushed now takes to reach the speakers (buffer + device), in µs.
     delay_us: Arc<AtomicI64>,
 }
 
 impl AudioQueue {
     pub fn push(&self, samples: &[i16], rate: u32) {
-        let mut b = self.buf.lock().unwrap();
-        if b.src_rate != rate {
-            b.q.clear();
-            b.src_rate = rate;
-            b.playing = false;
-        }
-        b.q.extend(samples.iter().map(|&s| s as f32 / 32768.0));
-        let max = (rate as f64 * MAX_SEC) as usize * 2;
-        if b.q.len() > max {
-            let keep = (rate as f64 * START_SEC) as usize * 2;
-            let drop = b.q.len() - keep;
-            b.q.drain(..drop);
-        }
+        self.buf.lock().unwrap().push(samples, rate);
     }
 
     /// Current audio delay on this side; the video waits this long so lips match the sound.
     pub fn delay(&self) -> Duration {
         Duration::from_micros(self.delay_us.load(Ordering::Relaxed).max(0) as u64)
+    }
+
+    /// Playback health counters for viewer.log.
+    pub fn stats(&self) -> PlayStats {
+        self.buf.lock().unwrap().stats
     }
 }
 
@@ -114,52 +107,31 @@ pub fn start_playback() -> Result<Player> {
     }
     let ch = cfg.channels() as usize;
     let dst_rate = cfg.sample_rate() as f64;
-    let queue = AudioQueue {
-        buf: Arc::new(Mutex::new(JitterBuf { q: VecDeque::new(), src_rate: 48000, playing: false, pos: 0.0 })),
-        delay_us: Arc::new(AtomicI64::new(0)),
-    };
+    let queue = AudioQueue { buf: Arc::new(Mutex::new(Playout::new())), delay_us: Arc::new(AtomicI64::new(0)) };
     let q2 = queue.clone();
     let probe = crate::avsync::enabled();
     let mut beep = crate::avsync::BeepEdge::new(dst_rate as u32);
+    let mut boosted = false;
     let stream = dev.build_output_stream::<f32, _, _>(
         cfg.config(),
         move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
+            if !boosted {
+                boosted = true;
+                boost_audio_thread();
+            }
             let ts = info.timestamp();
             let device_us = ts.playback.duration_since(ts.callback).as_micros() as i64;
             let t0 = if probe { crate::avsync::now_us() + device_us } else { 0 };
-            let mut b = q2.buf.lock().unwrap();
-            let src = b.src_rate as f64;
-            let level = (b.q.len() / 2) as f64 / src;
-            q2.delay_us.store((level * 1e6) as i64 + device_us, Ordering::Relaxed);
-            if !b.playing && level >= START_SEC {
-                b.playing = true;
+            {
+                let mut b = q2.buf.lock().unwrap();
+                q2.delay_us.store((b.level_sec() * 1e6) as i64 + device_us, Ordering::Relaxed);
+                b.render(out, ch, dst_rate);
             }
-            // Drift control: the sender's and our sound card clocks never match exactly, so play a hair
-            // faster when the buffer grows and slower when it shrinks, holding the delay steady.
-            let fix = ((level - TARGET_SEC) / TARGET_SEC * MAX_SPEED_FIX).clamp(-MAX_SPEED_FIX, MAX_SPEED_FIX);
-            let step = src / dst_rate * (1.0 + fix);
-            for (k, f) in out.chunks_mut(ch).enumerate() {
-                f.fill(0.0);
-                if !b.playing || b.q.len() < 4 {
-                    b.playing = b.playing && b.q.len() >= 4; // underrun: rebuffer
-                    if probe {
-                        beep.feed(0.0);
+            if probe {
+                for (k, f) in out.chunks(ch).enumerate() {
+                    if beep.feed(f[0]) {
+                        crate::avsync::log("client_audio", t0 + (k as f64 * 1e6 / dst_rate) as i64);
                     }
-                    continue;
-                }
-                let t = b.pos as f32;
-                f[0] = b.q[0] + (b.q[2] - b.q[0]) * t;
-                if ch > 1 {
-                    f[1] = b.q[1] + (b.q[3] - b.q[1]) * t;
-                }
-                if probe && beep.feed(f[0]) {
-                    crate::avsync::log("client_audio", t0 + (k as f64 * 1e6 / dst_rate) as i64);
-                }
-                b.pos += step;
-                while b.pos >= 1.0 && b.q.len() >= 2 {
-                    b.q.pop_front();
-                    b.q.pop_front();
-                    b.pos -= 1.0;
                 }
             }
         },

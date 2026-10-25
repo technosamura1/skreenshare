@@ -254,6 +254,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
     // bound is only the last resort and costs a keyframe resync, so it is shorter than before: 0.5 s of video.)
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, bool, Instant)>(30);
     let sync_q = audio_q.clone();
+    let diag_q = audio_q.clone();
 
     // Receiver: reassembly + audio.
     {
@@ -360,6 +361,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             let mut tick = 0u64;
             let mut stat_t = Instant::now();
             let (mut b0, mut f0) = (0u64, 0u64);
+            let (mut au0, mut arec0, mut aconc0) = (crate::playout::PlayStats::default(), 0u64, 0u64);
             let mut keyreq = KeyRequester::new();
             // Ping right away: the first round-trip time sets the retry timing for lost packets.
             send_ping(&sock, peer, token, &sh, &mut out);
@@ -429,6 +431,23 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     );
                     ui::diag(&diag);
                     log_line(&format!("[{}] {:.0} к/с · {}", sh.now_ms() / 1000, fps, diag));
+                    if let Some(q) = &diag_q {
+                        // Audio health, for finding the cause of crackle (see README: "Если звук трещит").
+                        let a = q.stats();
+                        let (conc, rec) = (sh.audio_concealed.load(Ordering::Relaxed), sh.audio_recovered.load(Ordering::Relaxed));
+                        log_line(&format!(
+                            "[{}] звук: буфер {:.0} мс (цель {:.0}) · опустошений +{} (всего {}) · переполнений +{} · тишины {} мс · дрейф {:+.0} ppm · вывод {} Гц, колбэк до {} кадр. · потерянных пакетов: восст. +{}, заглушено +{} (всего {}/{})",
+                            sh.now_ms() / 1000, a.level_ms, a.target_ms,
+                            a.underruns - au0.underruns, a.underruns,
+                            a.trims - au0.trims,
+                            (a.starved_frames - au0.starved_frames) * 1000 / a.out_rate.max(1) as u64,
+                            a.drift_ppm, a.out_rate, a.cb_frames,
+                            rec - arec0, conc - aconc0, rec, conc,
+                        ));
+                        au0 = a;
+                        arec0 = rec;
+                        aconc0 = conc;
+                    }
                     let short = match mode {
                         1 => "GPU",
                         0 => "CPU",
