@@ -29,6 +29,7 @@ mod source;
 mod ui;
 mod video;
 mod viewperf;
+mod volume;
 mod wincap;
 
 use anyhow::{bail, Context, Result};

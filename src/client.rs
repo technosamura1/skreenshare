@@ -9,6 +9,7 @@ use crate::retx;
 use crate::ui::{self, Exchange};
 use crate::video::{self, Decoder, OwnedFrame, Scaler};
 use ffmpeg_next::ffi::{AVFrame, AVPixelFormat};
+use crate::volume::{self, Hit, Panel, VolumeCtl};
 use crate::viewperf::{self, Acc, CostGovernor, HwWatch, JitterMeter};
 use anyhow::Result;
 use std::net::{SocketAddr, UdpSocket};
@@ -19,8 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
@@ -873,6 +874,9 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         proxy,
         start_fullscreen: !o.windowed,
         last_click: None,
+        volume: player.as_ref().map(|p| p.volume.clone()),
+        overlay: None,
+        cursor: (0, 0),
     };
     event_loop.run_app(&mut app)?;
 
@@ -894,9 +898,53 @@ struct App {
     proxy: EventLoopProxy<UserEv>,
     start_fullscreen: bool,
     last_click: Option<Instant>,
+    /// Level and mute of the sound (None when there is no audio output).
+    volume: Option<Arc<VolumeCtl>>,
+    /// The volume panel a right click opens.
+    overlay: Option<Overlay>,
+    cursor: (i32, i32),
 }
 
+/// The open volume panel.
+struct Overlay {
+    panel: Panel,
+    /// The left button is held on the slider.
+    dragging: bool,
+    /// Hides itself this long after the last touch.
+    last_touch: Instant,
+}
+
+const OVERLAY_HIDE: Duration = Duration::from_secs(4);
+
 impl App {
+    fn redraw(&self) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    fn open_overlay(&mut self) {
+        let (Some(w), Some(_)) = (&self.window, &self.volume) else { return };
+        let size = w.inner_size();
+        let s = w.scale_factor().round() as i32;
+        let panel = Panel::place(size.width as i32, size.height as i32, self.cursor.0, self.cursor.1, s);
+        self.overlay = Some(Overlay { panel, dragging: false, last_touch: Instant::now() });
+        w.set_cursor_visible(true);
+        w.request_redraw();
+    }
+
+    fn close_overlay(&mut self) {
+        if self.overlay.take().is_some() {
+            if let Some(v) = &self.volume {
+                volume::save(v);
+            }
+            if let Some(w) = &self.window {
+                w.set_cursor_visible(w.fullscreen().is_none());
+                w.request_redraw();
+            }
+        }
+    }
+
     fn toggle_fullscreen(&self) {
         let Some(w) = &self.window else { return };
         let fs = w.fullscreen().is_none();
@@ -912,7 +960,7 @@ impl ApplicationHandler<UserEv> for App {
             return;
         }
         let mut attrs = Window::default_attributes()
-            .with_title("screenshare — F11 или двойной клик: полный экран / окно")
+            .with_title("screenshare — F11 или двойной клик: полный экран / окно · правая кнопка: громкость")
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         if self.start_fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
@@ -952,6 +1000,7 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
                 match event.logical_key {
                     Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
+                    Key::Named(NamedKey::Escape) if self.overlay.is_some() => self.close_overlay(),
                     Key::Named(NamedKey::Escape) => {
                         if self.window.as_ref().is_some_and(|w| w.fullscreen().is_some()) {
                             self.toggle_fullscreen();
@@ -959,6 +1008,77 @@ impl ApplicationHandler<UserEv> for App {
                     }
                     _ => {}
                 }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as i32, position.y as i32);
+                if let (Some(ov), Some(v)) = (&mut self.overlay, &self.volume) {
+                    if ov.dragging {
+                        v.set_level(ov.panel.level_at(self.cursor.0));
+                        v.set_muted(false);
+                        ov.last_touch = Instant::now();
+                        self.redraw();
+                    }
+                }
+            }
+            // Right click: the volume panel (the left button keeps its double-click-for-fullscreen job).
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                if self.overlay.is_some() {
+                    self.close_overlay();
+                } else {
+                    self.open_overlay();
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                if let Some(ov) = &mut self.overlay {
+                    if ov.dragging {
+                        ov.dragging = false;
+                        if let Some(v) = &self.volume {
+                            volume::save(v);
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.overlay.is_some() => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y / 40.0) as f32,
+                };
+                if let (Some(ov), Some(v)) = (&mut self.overlay, &self.volume) {
+                    v.set_level((v.level() + dy * 0.05).max(0.0));
+                    v.set_muted(false);
+                    ov.last_touch = Instant::now();
+                    volume::save(v);
+                }
+                self.redraw();
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. }
+                if self.overlay.is_some() =>
+            {
+                let hit = self.overlay.as_ref().map_or(Hit::Outside, |o| o.panel.hit(self.cursor.0, self.cursor.1));
+                match hit {
+                    Hit::Outside => self.close_overlay(),
+                    Hit::Mute => {
+                        if let Some(v) = &self.volume {
+                            v.toggle_mute();
+                            volume::save(v);
+                        }
+                    }
+                    Hit::Slider(level) => {
+                        if let Some(v) = &self.volume {
+                            v.set_level(level);
+                            v.set_muted(false);
+                        }
+                        if let Some(o) = &mut self.overlay {
+                            o.dragging = true;
+                        }
+                    }
+                    Hit::Inside => {}
+                }
+                if let Some(o) = &mut self.overlay {
+                    o.last_touch = Instant::now();
+                }
+                self.last_click = None;
+                self.redraw();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let now = Instant::now();
@@ -971,6 +1091,22 @@ impl ApplicationHandler<UserEv> for App {
             }
             WindowEvent::RedrawRequested => self.draw(),
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // The panel hides itself a few seconds after the last touch (a still picture sends no frames to wake us).
+        match &self.overlay {
+            Some(o) if !o.dragging => {
+                let deadline = o.last_touch + OVERLAY_HIDE;
+                if Instant::now() >= deadline {
+                    self.close_overlay();
+                    el.set_control_flow(ControlFlow::Wait);
+                } else {
+                    el.set_control_flow(ControlFlow::WaitUntil(deadline));
+                }
+            }
+            _ => el.set_control_flow(ControlFlow::Wait),
         }
     }
 }
@@ -1003,6 +1139,9 @@ impl App {
             buf[(oy + ph) * ww..].fill(0);
         }
         drop(p);
+        if let (Some(o), Some(v)) = (&self.overlay, &self.volume) {
+            volume::draw_panel(&mut buf, ww as i32, wh as i32, &o.panel, v.level(), v.muted());
+        }
         let _ = buf.present();
         self.sh.diag.lock().unwrap().present.add(t0.elapsed().as_micros() as u64);
         if flash {

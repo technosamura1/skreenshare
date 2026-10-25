@@ -95,6 +95,8 @@ impl AudioQueue {
 
 pub struct Player {
     pub queue: AudioQueue,
+    /// Level and mute (the viewer's right-click panel changes it; the callback below applies it).
+    pub volume: Arc<crate::volume::VolumeCtl>,
     _stream: Stream,
 }
 
@@ -109,6 +111,10 @@ pub fn start_playback() -> Result<Player> {
     let dst_rate = cfg.sample_rate() as f64;
     let queue = AudioQueue { buf: Arc::new(Mutex::new(Playout::new())), delay_us: Arc::new(AtomicI64::new(0)) };
     let q2 = queue.clone();
+    let (lvl, muted) = crate::volume::load(&crate::volume::read_settings());
+    let volume = Arc::new(crate::volume::VolumeCtl::new(lvl, muted));
+    let vol2 = volume.clone();
+    let mut gain_now = volume.gain();
     let probe = crate::avsync::enabled();
     let mut beep = crate::avsync::BeepEdge::new(dst_rate as u32);
     let mut boosted = false;
@@ -127,6 +133,7 @@ pub fn start_playback() -> Result<Player> {
                 q2.delay_us.store((b.level_sec() * 1e6) as i64 + device_us, Ordering::Relaxed);
                 b.render(out, ch, dst_rate);
             }
+            crate::volume::apply_gain(out, ch, &mut gain_now, vol2.gain());
             if probe {
                 for (k, f) in out.chunks(ch).enumerate() {
                     if beep.feed(f[0]) {
@@ -139,5 +146,5 @@ pub fn start_playback() -> Result<Player> {
         None,
     )?;
     stream.play()?;
-    Ok(Player { queue, _stream: stream })
+    Ok(Player { queue, volume, _stream: stream })
 }

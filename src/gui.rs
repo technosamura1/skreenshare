@@ -278,26 +278,12 @@ impl Session {
     }
 }
 
-/// Tiny settings file (just the preview switch): %LOCALAPPDATA%\\screenshare\\gui.ini
-fn settings_path() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")?;
-    Some(std::path::PathBuf::from(base).join("screenshare").join("gui.ini"))
-}
-
 fn load_show_preview() -> bool {
-    settings_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| !t.lines().any(|l| l.trim() == "preview=0"))
-        .unwrap_or(true)
+    crate::volume::ini_get(&crate::volume::read_settings(), "preview") != Some("0")
 }
 
 fn save_show_preview(on: bool) {
-    if let Some(p) = settings_path() {
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let _ = std::fs::write(p, format!("preview={}\n", on as u8));
-    }
+    crate::volume::write_setting("preview", if on { "1" } else { "0" });
 }
 
 /// Keeps the preview of `s` (the process that streams) alive. Only while the switch is on and this window is

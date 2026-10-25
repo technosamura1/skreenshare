@@ -30,6 +30,9 @@ mod viewperf;
 #[path = "../../../src/gpulogic.rs"]
 #[allow(dead_code)]
 mod gpulogic;
+#[path = "../../../src/volume.rs"]
+#[allow(dead_code)]
+mod volume;
 #[path = "../../../src/net.rs"]
 mod net;
 #[path = "../../../src/ratectl.rs"]
