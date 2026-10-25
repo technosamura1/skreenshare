@@ -1,6 +1,7 @@
 // Launcher window (egui). Streaming itself runs in child processes (`host --ipc` / `client --ipc`),
 // which keeps the fast viewer path untouched and lets the GUI stop them cleanly.
 use crate::capture;
+use crate::easy;
 use crate::preview;
 use crate::source::{self, Choice, WinEntry};
 use crate::wincap;
@@ -160,7 +161,11 @@ struct Session {
     status: String,
     code: Option<String>,
     connected: bool,
+    /// Short room code of the simple pairing (beta), when this session uses it.
+    room: Option<String>,
     stats: String,
+    /// Viewer diagnostics (`@DIAG`): decoder type, timings, queue, jitter.
+    diag: String,
     audio: String,
     /// What is shown (window / screen) and whether that is a fallback warning.
     source: String,
@@ -184,7 +189,9 @@ impl Session {
             status: "Запускаю...".into(),
             code: None,
             connected: false,
+            room: None,
             stats: String::new(),
+            diag: String::new(),
             audio: String::new(),
             source: String::new(),
             source_warn: false,
@@ -208,6 +215,8 @@ impl Session {
                 self.bad_code = None;
             } else if let Some(s) = l.strip_prefix("@STATS ") {
                 self.stats = s.to_string();
+            } else if let Some(d) = l.strip_prefix("@DIAG ") {
+                self.diag = d.to_string();
             } else if let Some(a) = l.strip_prefix("@AUDIO ") {
                 self.audio = a.to_string();
             } else if let Some(p) = l.strip_prefix("@PREVIEW ") {
@@ -260,20 +269,64 @@ impl Session {
     }
 }
 
-/// The micro preview of what is being sent: a 320x180 box, the picture centred in it, and what it shows.
-fn preview_box(ui: &mut egui::Ui, s: &Session) {
-    let scale = (ui.available_width() / preview::BOX_W as f32).min(1.0);
-    let size = Vec2::new(preview::BOX_W as f32, preview::BOX_H as f32) * scale;
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(8), FIELD);
+/// Tiny settings file (just the preview switch): %LOCALAPPDATA%\\screenshare\\gui.ini
+fn settings_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    Some(std::path::PathBuf::from(base).join("screenshare").join("gui.ini"))
+}
+
+fn load_show_preview() -> bool {
+    settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| !t.lines().any(|l| l.trim() == "preview=0"))
+        .unwrap_or(true)
+}
+
+fn save_show_preview(on: bool) {
+    if let Some(p) = settings_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, format!("preview={}\n", on as u8));
+    }
+}
+
+/// Keeps the preview of `s` (the process that streams) alive. Only while the switch is on and this window is
+/// visible does anything happen: the heartbeat is what makes the host produce pictures at all, so with the
+/// switch off (or minimized) the host does no scaling, no compression and writes nothing to the pipe.
+fn drive_preview(ctx: &egui::Context, on: bool, s: &mut Session) {
+    if !s.connected || s.ended {
+        return;
+    }
+    let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+    if on && !minimized {
+        s.preview_heartbeat();
+        ctx.request_repaint_after(Duration::from_millis(1000)); // keep the heartbeat going on a still screen
+        s.update_preview(ctx);
+    } else {
+        s.preview_raw = None; // drop anything still in flight; the texture stays for when it comes back
+    }
+}
+
+/// Under the "Остановить" button: the switch and, when on, the live thumbnail (no frame, no background) with
+/// what it shows.
+fn preview_block(ui: &mut egui::Ui, on: &mut bool, s: &Session) {
+    ui.add_space(10.0);
+    if ui.checkbox(on, "Показывать превью").changed() {
+        save_show_preview(*on);
+    }
+    if !*on || !s.connected || s.ended {
+        return;
+    }
+    ui.add_space(4.0);
     match &s.preview_tex {
         Some(t) => {
-            let ts = t.size_vec2() * scale;
-            let r = egui::Rect::from_center_size(rect.center(), ts);
-            ui.painter().image(t.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            let scale = (ui.available_width() / preview::BOX_W as f32).min(1.0);
+            let (rect, _) = ui.allocate_exact_size(t.size_vec2() * scale, Sense::hover());
+            ui.painter().image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         }
         None => {
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "предпросмотр загружается…", FontId::proportional(13.0), MUTED);
+            ui.label(RichText::new("превью загружается…").color(MUTED).size(13.0));
         }
     }
     if !s.preview_label.is_empty() {
@@ -307,6 +360,9 @@ struct GuiApp {
     host: Option<Session>,
     join: Option<Session>,
     test: Option<(Session, Session, bool, bool)>,
+    show_preview: bool,
+    /// Host option: short room code instead of two long codes (beta).
+    easy: bool,
     input: String,
     copied_at: Option<Instant>,
     start_error: Option<String>,
@@ -329,12 +385,14 @@ impl GuiApp {
             choice: Choice::Screen,
             choice_label: "Весь экран".into(),
             windows: wincap::list_windows(),
-            bitrate: 40,
+            bitrate: 20,
             audio: true,
             fullscreen: true,
             host: None,
             join: None,
             test: None,
+            show_preview: load_show_preview(),
+            easy: false,
             input: String::new(),
             copied_at: None,
             start_error: None,
@@ -489,6 +547,51 @@ fn code_box(ui: &mut egui::Ui, code: &str, copied_at: &mut Option<Instant>) {
     }
 }
 
+/// The old two-code flow on the host page: my code, then the friend's answer.
+fn classic_host_codes(ui: &mut egui::Ui, s: &mut Session, input: &mut String, copied_at: &mut Option<Instant>) {
+    section(ui, |ui| {
+        step(ui, 1, "Отправь другу этот код");
+        match &s.code {
+            Some(c) => code_box(ui, c, copied_at),
+            None => spinner_line(ui, &s.status),
+        }
+    });
+    if s.code.is_some() {
+        section(ui, |ui| {
+            step(ui, 2, "Вставь код ответа от друга");
+            code_input(ui, input, "C...");
+            if let Some(e) = &s.bad_code {
+                error_text(ui, e);
+            }
+            let sent = s.status.starts_with("Соединяюсь");
+            if sent && s.bad_code.is_none() {
+                spinner_line(ui, "Соединяюсь...");
+            } else if big_button(ui, "Подключить", ACCENT, !input.trim().is_empty()) {
+                s.bad_code = None;
+                s.proc.send(input.trim());
+            }
+        });
+    }
+}
+
+/// The short room code, large, with a copy button.
+fn code_box_big(ui: &mut egui::Ui, code: &str, copied_at: &mut Option<Instant>) {
+    egui::Frame::new().fill(FIELD).corner_radius(10).inner_margin(Margin::same(14)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(code).monospace().size(34.0).color(TEXT));
+        });
+    });
+    let copied = copied_at.is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+    if big_button(ui, if copied { "Скопировано ✓" } else { "Скопировать код" }, if copied { GREEN } else { ACCENT }, true) {
+        ui.ctx().copy_text(code.to_string());
+        *copied_at = Some(Instant::now());
+    }
+    if copied {
+        ui.ctx().request_repaint_after(Duration::from_millis(300));
+    }
+}
+
 fn code_input(ui: &mut egui::Ui, input: &mut String, hint: &str) {
     ui.add(
         egui::TextEdit::singleline(input)
@@ -553,11 +656,21 @@ impl GuiApp {
             }
             ui.add_space(8.0);
             ui.label(RichText::new("Качество").font(bold(15.0)));
-            ui.add(egui::Slider::new(&mut self.bitrate, 15..=80).suffix(" Мбит/с"));
+            ui.horizontal(|ui| {
+                for (name, v) in [("Для друга по интернету · 20", 20), ("Хороший интернет · 40", 40), ("Одна сеть · 60", 60)] {
+                    if ui.selectable_label(self.bitrate == v, name).clicked() {
+                        self.bitrate = v;
+                    }
+                }
+            });
+            ui.add(egui::Slider::new(&mut self.bitrate, 8..=80).suffix(" Мбит/с"));
             ui.label(
-                RichText::new("Больше — чётче мелкий текст, но нужен быстрый интернет на отдачу. 40 — оптимально.")
-                    .color(MUTED)
-                    .size(13.0),
+                RichText::new(
+                    "Это потолок: программа сама снижает качество, если у друга не успевает интернет. \
+                     Если у друга лагает — поставь 10–15. 40 и больше — только когда у обоих быстрый интернет.",
+                )
+                .color(MUTED)
+                .size(13.0),
             );
             if with_audio {
                 ui.add_space(8.0);
@@ -599,9 +712,25 @@ impl GuiApp {
             if let Some(e) = &self.start_error {
                 error_text(ui, e);
             }
+            ui.checkbox(&mut self.easy, "Простое подключение (beta): один короткий код вместо двух длинных");
+            if self.easy {
+                ui.label(
+                    RichText::new("Коды обмениваются через публичный сервер ntfy.sh в зашифрованном виде. Обычные коды тоже останутся — на случай, если не сработает.")
+                        .color(MUTED)
+                        .size(12.5),
+                );
+            }
             if big_button(ui, "Начать", ACCENT, !self.monitors.is_empty()) {
-                match Session::start(ui.ctx(), self.host_args("host")) {
-                    Ok(s) => self.host = Some(s),
+                let mut args = self.host_args("host");
+                let room = self.easy.then(easy::new_room_code);
+                if let Some(r) = &room {
+                    args.extend(["--room".to_string(), r.clone()]);
+                }
+                match Session::start(ui.ctx(), args) {
+                    Ok(mut s) => {
+                        s.room = room;
+                        self.host = Some(s);
+                    }
                     Err(e) => self.start_error = Some(e),
                 }
             }
@@ -609,19 +738,12 @@ impl GuiApp {
         };
 
         if s.connected && !s.ended {
-            // The preview is made only while this window is visible (minimized = no heartbeat = host does nothing).
-            let minimized = ui.ctx().input(|i| i.viewport().minimized).unwrap_or(false);
-            if !minimized {
-                s.preview_heartbeat();
-                ui.ctx().request_repaint_after(Duration::from_millis(1000)); // keep the heartbeat going on a still screen
-                s.update_preview(ui.ctx());
-            }
+            // The preview is made only while this window is visible and the switch is on.
+            drive_preview(ui.ctx(), self.show_preview, s);
             let s = &*s;
             section(ui, |ui| {
                 status_dot(ui, GREEN, "Идёт трансляция");
                 ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
-                ui.add_space(6.0);
-                preview_box(ui, s);
                 ui.add_space(6.0);
                 if !s.source.is_empty() && s.source_warn {
                     ui.label(RichText::new(&s.source).color(if s.source_warn { RED } else { TEXT }));
@@ -634,6 +756,10 @@ impl GuiApp {
             });
             if big_button(ui, "Остановить", RED, true) {
                 self.go_home();
+                return;
+            }
+            if let Some(s) = &self.host {
+                preview_block(ui, &mut self.show_preview, s);
             }
             return;
         }
@@ -652,28 +778,24 @@ impl GuiApp {
             return;
         }
 
-        section(ui, |ui| {
-            step(ui, 1, "Отправь другу этот код");
-            match &s.code {
-                Some(c) => code_box(ui, c, &mut self.copied_at),
-                None => spinner_line(ui, &s.status),
-            }
-        });
-        if s.code.is_some() {
+        if let Some(room) = s.room.clone() {
             section(ui, |ui| {
-                step(ui, 2, "Вставь код ответа от друга");
-                code_input(ui, &mut self.input, "C...");
-                if let Some(e) = &s.bad_code {
-                    error_text(ui, e);
-                }
-                let sent = s.status.starts_with("Соединяюсь");
-                if sent && s.bad_code.is_none() {
-                    spinner_line(ui, "Соединяюсь...");
-                } else if big_button(ui, "Подключить", ACCENT, !self.input.trim().is_empty()) {
-                    s.bad_code = None;
-                    s.proc.send(self.input.trim());
-                }
+                step(ui, 1, "Назови другу этот код");
+                code_box_big(ui, &room, &mut self.copied_at);
+                ui.label(
+                    RichText::new("Друг вводит его в «Смотреть экран друга» — больше ничего пересылать не нужно. Код живёт 15 минут.")
+                        .color(MUTED)
+                        .size(13.0),
+                );
+                spinner_line(ui, &s.status);
             });
+            if s.code.is_some() {
+                egui::CollapsingHeader::new("Не подключается? Обычный способ с длинными кодами").show(ui, |ui| {
+                    classic_host_codes(ui, s, &mut self.input, &mut self.copied_at);
+                });
+            }
+        } else {
+            classic_host_codes(ui, s, &mut self.input, &mut self.copied_at);
         }
         if big_button(ui, "Отмена", CARD_HOVER, true) {
             self.go_home();
@@ -694,6 +816,11 @@ impl GuiApp {
                     status_dot(ui, GREEN, "Подключено");
                     ui.label("Окно просмотра открыто. F11 или двойной клик — переключить полный экран.");
                     ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
+                    if !s.diag.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&s.diag).color(MUTED).size(12.0));
+                        ui.label(RichText::new("Журнал: %LOCALAPPDATA%\\screenshare\\viewer.log").color(MUTED).size(12.0));
+                    }
                 });
                 if big_button(ui, "Отключиться", RED, true) {
                     self.go_home();
@@ -717,11 +844,26 @@ impl GuiApp {
             }
         }
 
+        if let Some(s) = self.join.as_ref().filter(|s| s.room.is_some()) {
+            section(ui, |ui| {
+                step(ui, 1, &format!("Код {} — подключаюсь к другу", s.room.as_deref().unwrap_or("")));
+                spinner_line(ui, if s.code.is_some() { "Нашёл друга, соединяюсь..." } else { &s.status });
+                ui.label(
+                    RichText::new("Друг должен держать окно «Показать мой экран» открытым. Если не выходит дольше минуты — отмени и используй обычный длинный код.")
+                        .color(MUTED)
+                        .size(13.0),
+                );
+            });
+            if big_button(ui, "Отмена", CARD_HOVER, true) {
+                self.go_home();
+            }
+            return;
+        }
         let have_reply = self.join.as_ref().is_some_and(|s| s.code.is_some());
         if !have_reply {
             section(ui, |ui| {
-                step(ui, 1, "Вставь код друга");
-                code_input(ui, &mut self.input, "H...");
+                step(ui, 1, "Введи код друга");
+                code_input(ui, &mut self.input, "короткий код (K7QM-X2PD, beta) или длинный H...");
                 if let Some(e) = self.join.as_ref().and_then(|s| s.bad_code.as_ref()) {
                     error_text(ui, e);
                 }
@@ -741,9 +883,19 @@ impl GuiApp {
                         if !self.fullscreen {
                             args.push("--windowed".into());
                         }
+                        // A short room code needs no pasting at all: the client fetches the offer itself.
+                        let room = easy::normalize(&code);
+                        if let Some(r) = &room {
+                            args.extend(["--room".to_string(), r.clone()]);
+                        }
                         match Session::start(ui.ctx(), args) {
                             Ok(mut s) => {
-                                s.proc.send(&code);
+                                if room.is_some() {
+                                    s.room = room;
+                                    s.status = "Ищу друга по короткому коду...".into();
+                                } else {
+                                    s.proc.send(&code);
+                                }
                                 self.join = Some(s);
                             }
                             Err(e) => self.start_error = Some(e),
@@ -771,6 +923,9 @@ impl GuiApp {
         }
         title(ui, "Проверить на этом ПК", "Трансляция и просмотр на одном компьютере — как увидит друг");
 
+        if let Some((h, _, _, _)) = &mut self.test {
+            drive_preview(ui.ctx(), self.show_preview, h); // the streaming side makes the pictures
+        }
         let Some((h, c, _, _)) = &self.test else {
             self.settings(ui, false);
             section(ui, |ui| {
@@ -823,6 +978,9 @@ impl GuiApp {
             line(ui, "Трансляция", h);
             ui.add_space(6.0);
             line(ui, "Просмотр", c);
+            if !c.diag.is_empty() {
+                ui.label(RichText::new(&c.diag).color(MUTED).size(12.0));
+            }
             fps_hint(ui);
         });
         if h.connected && c.connected {
@@ -830,6 +988,10 @@ impl GuiApp {
         }
         if big_button(ui, "Остановить", RED, true) {
             self.go_home();
+            return;
+        }
+        if let Some((h, _, _, _)) = &self.test {
+            preview_block(ui, &mut self.show_preview, h);
         }
     }
 }

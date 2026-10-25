@@ -8,6 +8,12 @@ mod legacy;
 #[path = "../../../src/preview.rs"]
 #[allow(dead_code)]
 mod preview;
+#[path = "../../../src/easy.rs"]
+#[allow(dead_code)]
+mod easy;
+#[path = "../../../src/viewperf.rs"]
+#[allow(dead_code)]
+mod viewperf;
 #[path = "../../../src/net.rs"]
 mod net;
 #[path = "../../../src/ratectl.rs"]

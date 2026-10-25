@@ -181,7 +181,11 @@ pub struct Decoder {
     pkt: *mut AVPacket,
     frame: *mut AVFrame,
     sw: *mut AVFrame,
+    /// Hardware decoding was set up (the GPU device exists).
     pub hardware: bool,
+    /// The last picture really came out of the GPU decoder. FFmpeg quietly falls back to its software decoder
+    /// when the GPU can't do this stream; then this stays false although `hardware` is true.
+    pub hw_active: bool,
 }
 
 unsafe impl Send for Decoder {}
@@ -218,12 +222,15 @@ impl Decoder {
                 avcodec_free_context(&mut ctx);
                 bail!("avcodec_open2 (decoder): {}", av_err(r));
             }
-            Ok(Decoder { ctx, pkt: av_packet_alloc(), frame: av_frame_alloc(), sw: av_frame_alloc(), hardware })
+            Ok(Decoder { ctx, pkt: av_packet_alloc(), frame: av_frame_alloc(), sw: av_frame_alloc(), hardware, hw_active: false })
         }
     }
 
-    /// Decodes one access unit and calls `out` with each software frame (NV12 or YUV420P).
-    pub fn decode(&mut self, data: &[u8], mut out: impl FnMut(&AVFrame)) -> Result<()> {
+    /// Decodes one access unit and calls `out` with each software frame (NV12 or YUV420P). With `show = false`
+    /// the picture is decoded (later frames depend on it) but not read back from the GPU or handed out: catch-up
+    /// after falling behind skips the expensive part this way. Returns how many pictures the packet produced.
+    pub fn decode(&mut self, data: &[u8], show: bool, mut out: impl FnMut(&AVFrame)) -> Result<u32> {
+        let mut pictures = 0;
         unsafe {
             check(av_new_packet(self.pkt, data.len() as i32), "av_new_packet")?;
             ptr::copy_nonoverlapping(data.as_ptr(), (*self.pkt).data, data.len());
@@ -236,9 +243,18 @@ impl Decoder {
                     break;
                 }
                 check(r, "avcodec_receive_frame")?;
-                if (*self.frame).format == AVPixelFormat::AV_PIX_FMT_D3D11 as i32 {
+                pictures += 1;
+                let is_hw = (*self.frame).format == AVPixelFormat::AV_PIX_FMT_D3D11 as i32;
+                self.hw_active = is_hw;
+                if !show {
+                    // nothing to do: dropping the reference below is enough
+                } else if is_hw {
                     av_frame_unref(self.sw);
-                    check(av_hwframe_transfer_data(self.sw, self.frame, 0), "av_hwframe_transfer_data")?;
+                    let t = av_hwframe_transfer_data(self.sw, self.frame, 0);
+                    if t < 0 {
+                        av_frame_unref(self.frame);
+                        check(t, "av_hwframe_transfer_data")?;
+                    }
                     (*self.sw).colorspace = (*self.frame).colorspace;
                     (*self.sw).color_range = (*self.frame).color_range;
                     out(&*self.sw);
@@ -248,7 +264,7 @@ impl Decoder {
                 av_frame_unref(self.frame);
             }
         }
-        Ok(())
+        Ok(pictures)
     }
 }
 
@@ -266,19 +282,22 @@ impl Drop for Decoder {
 /// YUV frame -> BGRA (as u32 0x00RRGGBB, what softbuffer wants) with scaling.
 pub struct Scaler {
     sws: *mut SwsContext,
-    key: (i32, i32, i32, u32, u32, i32, i32),
+    key: (i32, i32, i32, u32, u32, i32, i32, i32),
+    /// Cheaper filter (bilinear) instead of bicubic; set when conversion gets too slow.
+    pub fast: bool,
 }
 
 unsafe impl Send for Scaler {}
 
 impl Scaler {
     pub fn new() -> Scaler {
-        Scaler { sws: ptr::null_mut(), key: (0, 0, 0, 0, 0, 0, 0) }
+        Scaler { sws: ptr::null_mut(), key: (0, 0, 0, 0, 0, 0, 0, 0), fast: false }
     }
 
     pub fn convert(&mut self, f: &AVFrame, dw: u32, dh: u32, out: &mut Vec<u32>) -> Result<()> {
         unsafe {
-            let key = (f.width, f.height, f.format, dw, dh, f.colorspace as i32, f.color_range as i32);
+            let flags = if self.fast { 2 } else { 4 }; // SWS_BILINEAR / SWS_BICUBIC (enums in the FFmpeg 8 bindings)
+            let key = (f.width, f.height, f.format, dw, dh, f.colorspace as i32, f.color_range as i32, flags);
             if self.sws.is_null() || key != self.key {
                 if !self.sws.is_null() {
                     sws_freeContext(self.sws);
@@ -291,7 +310,7 @@ impl Scaler {
                     dw as i32,
                     dh as i32,
                     AVPixelFormat::AV_PIX_FMT_BGR0,
-                    4, // SWS_BICUBIC (an enum in FFmpeg 8 bindings): keeps text crisp when downscaling
+                    flags, // bicubic keeps text crisp when downscaling; bilinear is the cheap fallback
                     ptr::null_mut(),
                     ptr::null_mut(),
                     ptr::null(),

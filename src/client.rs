@@ -6,12 +6,13 @@ use crate::reassembly::{KeyRequester, Reassembler, Stats};
 use crate::retx;
 use crate::ui::{self, Exchange};
 use crate::video::{Decoder, Scaler};
+use crate::viewperf::{self, Acc, CostGovernor, HwWatch, JitterMeter};
 use anyhow::Result;
 use std::net::{SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -107,6 +108,63 @@ struct Shared {
     /// Window client size, (w << 32) | h.
     win_size: AtomicU64,
     picture: Mutex<Picture>,
+    /// Frames waiting for the decoder (the channel can't tell us).
+    qdepth: AtomicUsize,
+    /// 0 = CPU decoder, 1 = GPU (D3D11VA), 2 = GPU requested but FFmpeg fell back to its CPU decoder,
+    /// 3 = GPU decoder failed at run time and we switched to the CPU.
+    dec_mode: AtomicU8,
+    /// The decoder asks the receiver for a fresh keyframe (after switching decoders).
+    want_resync: AtomicBool,
+    /// Frames lost because the decoder queue was full / decoded but not shown while catching up.
+    dropped_full: AtomicU64,
+    dropped_catchup: AtomicU64,
+    /// Per-interval timings for the diagnostics line.
+    diag: Mutex<Diag>,
+}
+
+#[derive(Default)]
+struct Diag {
+    decode: Acc,
+    convert: Acc,
+    present: Acc,
+    queue: Acc,
+    jitter: JitterMeter,
+}
+
+const DEC_NAMES: [&str; 4] = [
+    "процессор",
+    "видеокарта (D3D11VA)",
+    "процессор (видеокарта не потянула этот поток)",
+    "процессор (видеокарта отказала, переключился)",
+];
+
+/// Windows: render/decode threads get a bit more priority so a busy PC (a game running next to the viewer)
+/// doesn't make them miss frames.
+fn boost_thread() {
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
+
+fn log_path() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("screenshare").join("viewer.log"))
+}
+
+/// Appends a line to %LOCALAPPDATA%\screenshare\viewer.log (cut when it grows past 1 MB): something a friend
+/// can send over when "it lags".
+fn log_line(line: &str) {
+    use std::io::Write;
+    let Some(p) = log_path() else { return };
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if std::fs::metadata(&p).is_ok_and(|m| m.len() > 1 << 20) {
+        let _ = std::fs::remove_file(&p);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 impl Shared {
@@ -118,6 +176,7 @@ impl Shared {
 #[derive(Debug)]
 enum UserEv {
     Frame,
+    Title(String),
     Exit,
 }
 
@@ -166,6 +225,12 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         audio_concealed: AtomicU64::new(0),
         win_size: AtomicU64::new((1280u64 << 32) | 720),
         picture: Mutex::new(Picture { w: 0, h: 0, px: Vec::new(), flash: false }),
+        qdepth: AtomicUsize::new(0),
+        dec_mode: AtomicU8::new(0),
+        want_resync: AtomicBool::new(false),
+        dropped_full: AtomicU64::new(0),
+        dropped_catchup: AtomicU64::new(0),
+        diag: Mutex::new(Diag::default()),
     });
     {
         let sh = sh.clone();
@@ -185,8 +250,9 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
     };
     let audio_q = player.as_ref().map(|p| p.queue.clone());
 
-    // Room for the lip-sync hold (up to MAX_SYNC_HOLD of frames) plus slack.
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, bool, Instant)>(48);
+    // (If the decoder falls behind, it catches up by decoding without showing, see viewperf::should_show; this
+    // bound is only the last resort and costs a keyframe resync, so it is shorter than before: 0.5 s of video.)
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, bool, Instant)>(30);
     let sync_q = audio_q.clone();
 
     // Receiver: reassembly + audio.
@@ -194,6 +260,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         let sock = sock.clone();
         let sh = sh.clone();
         std::thread::spawn(move || {
+            boost_thread();
             let _ = sock.set_read_timeout(Some(Duration::from_millis(10)));
             let mut buf = [0u8; 2048];
             let mut re = Reassembler::new();
@@ -256,9 +323,16 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     }
                 }
                 re.check_timeout(now, rtt, &mut ready);
+                if sh.want_resync.swap(false, Ordering::Relaxed) {
+                    re.force_resync();
+                }
                 for (data, key) in ready.drain(..) {
+                    sh.diag.lock().unwrap().jitter.feed(sh.start.elapsed().as_micros() as u64);
+                    sh.qdepth.fetch_add(1, Ordering::Relaxed);
                     if frame_tx.try_send((data, key, Instant::now())).is_err() {
-                        // Decoder fell behind: skip ahead to a fresh keyframe.
+                        // Decoder fell far behind: skip ahead to a fresh keyframe.
+                        sh.qdepth.fetch_sub(1, Ordering::Relaxed);
+                        sh.dropped_full.fetch_add(1, Ordering::Relaxed);
                         re.force_resync();
                     }
                 }
@@ -317,6 +391,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     sh.running.store(false, Ordering::Relaxed);
                 }
                 if stat_t.elapsed() >= Duration::from_secs(5) {
+                    let mut d = sh.diag.lock().unwrap();
                     let secs = stat_t.elapsed().as_secs_f64();
                     let b = sh.recv_bytes.load(Ordering::Relaxed);
                     let f = sh.frames_decoded.load(Ordering::Relaxed);
@@ -336,6 +411,33 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         sh.audio_recovered.load(Ordering::Relaxed),
                         sh.audio_concealed.load(Ordering::Relaxed),
                     ));
+                    let fps = (f - f0) as f64 / secs;
+                    let (dec_ms, dec_max, _) = d.decode.take();
+                    let (conv_ms, conv_max, _) = d.convert.take();
+                    let (pres_ms, pres_max, _) = d.present.take();
+                    let (q_avg, q_max, _) = d.queue.take();
+                    let (jit, gap, stalls) = d.jitter.take();
+                    drop(d);
+                    let mode = sh.dec_mode.load(Ordering::Relaxed) as usize;
+                    let diag = format!(
+                        "Декодер: {} · декод {:.1}/{:.0} мс · цвет+масштаб {:.1}/{:.0} мс · показ {:.1}/{:.0} мс · очередь {:.1}/{:.0} кадр. · пропущено: догоняя {}, переполнение {} · разброс кадров {:.1} мс, макс. пауза {:.0} мс, пауз >0,1 с: {}",
+                        DEC_NAMES[mode.min(3)],
+                        dec_ms, dec_max, conv_ms, conv_max, pres_ms, pres_max, q_avg, q_max,
+                        sh.dropped_catchup.load(Ordering::Relaxed),
+                        sh.dropped_full.load(Ordering::Relaxed),
+                        jit, gap, stalls,
+                    );
+                    ui::diag(&diag);
+                    log_line(&format!("[{}] {:.0} к/с · {}", sh.now_ms() / 1000, fps, diag));
+                    let short = match mode {
+                        1 => "GPU",
+                        0 => "CPU",
+                        _ => "CPU (GPU не работает)",
+                    };
+                    let _ = proxy.send_event(UserEv::Title(format!(
+                        "screenshare — {short} · {fps:.0} к/с · декод {dec_ms:.1} мс · пинг {:.0} мс — F11: полный экран",
+                        sh.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0
+                    )));
                     (b0, f0) = (b, f);
                     stat_t = Instant::now();
                 }
@@ -352,6 +454,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         let screenshot = o.screenshot.clone();
         let frames_limit = o.frames;
         std::thread::spawn(move || {
+            boost_thread();
             let mut dec = match Decoder::new(hw) {
                 Ok(d) => d,
                 Err(e) => {
@@ -360,15 +463,29 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     return;
                 }
             };
+            sh.dec_mode.store(dec.hardware as u8, Ordering::Relaxed);
             println!("Декодирование: {}", if dec.hardware { "видеокарта (D3D11VA)" } else { "процессор" });
             let mut scaler = Scaler::new();
             let mut full = Scaler::new();
+            let mut gov = CostGovernor::new();
+            let mut watch = HwWatch::new();
+            let mut gpu_failed = false;
+            let mut errs = 0u32;
             let mut px: Vec<u32> = Vec::new();
             let mut done = false;
             let mut flash = crate::avsync::FlashEdge::default();
             for (data, _key, arrived) in frame_rx {
-                // Lip sync: sound sits in its jitter buffer for a while, so hold each frame just as long.
-                if let Some(q) = &sync_q {
+                let waiting = sh.qdepth.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                // Behind by a few frames: still decode (P-frames need it) but skip the readback, colour
+                // conversion and drawing. The picture on screen then jumps to the newest frame instead of
+                // lagging by the whole backlog.
+                let show = viewperf::should_show(waiting);
+                if !show {
+                    sh.dropped_catchup.fetch_add(1, Ordering::Relaxed);
+                }
+                // Lip sync: sound sits in its jitter buffer for a while, so hold each frame just as long
+                // (only when we're not already behind: a backlog is late enough).
+                if let (true, Some(q)) = (waiting == 0, &sync_q) {
                     let hold = q.delay().saturating_sub(DECODE_TIME).min(MAX_SYNC_HOLD);
                     let due = arrived + hold;
                     let now = Instant::now();
@@ -379,7 +496,9 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 if done {
                     break;
                 }
-                let r = dec.decode(&data, |f| {
+                let t0 = Instant::now();
+                let mut conv_us = 0u64;
+                let r = dec.decode(&data, show, |f| {
                     let ws = sh.win_size.load(Ordering::Relaxed);
                     let (ww, wh) = ((ws >> 32) as u32, ws as u32);
                     if ww == 0 || wh == 0 || f.width <= 0 || f.height <= 0 {
@@ -388,9 +507,13 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     let (fw, fh) = (f.width as u32, f.height as u32);
                     let s = (ww as f64 / fw as f64).min(wh as f64 / fh as f64);
                     let (dw, dh) = (((fw as f64 * s) as u32).max(1), ((fh as f64 * s) as u32).max(1));
+                    let tc = Instant::now();
+                    scaler.fast = gov.fast;
                     if scaler.convert(f, dw, dh, &mut px).is_err() {
                         return;
                     }
+                    conv_us = tc.elapsed().as_micros() as u64;
+                    gov.feed(conv_us as f64 / 1000.0);
                     let is_flash = crate::avsync::enabled() && {
                         let bytes = unsafe { std::slice::from_raw_parts(px.as_ptr() as *const u8, px.len() * 4) };
                         flash.rising(crate::avsync::luma(bytes, dw as usize * 4, dw as usize, dh as usize))
@@ -418,8 +541,43 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         sh.running.store(false, Ordering::Relaxed);
                     }
                 });
-                if let Err(e) = r {
-                    eprintln!("декодер: {e:#}");
+                let total = t0.elapsed().as_micros() as u64;
+                {
+                    let mut d = sh.diag.lock().unwrap();
+                    d.decode.add(total.saturating_sub(conv_us));
+                    if conv_us > 0 {
+                        d.convert.add(conv_us);
+                    }
+                    d.queue.add(waiting as u64 * 1000); // as "ms" in the Acc: frames, shown with the same scale
+                }
+                let (ok, pictures) = match &r {
+                    Ok(n) => (true, *n),
+                    Err(e) => {
+                        errs += 1;
+                        if errs <= 5 || errs % 100 == 0 {
+                            eprintln!("декодер: {e:#}");
+                        }
+                        (false, 0)
+                    }
+                };
+                if dec.hardware && !gpu_failed {
+                    // FFmpeg may have quietly used its CPU decoder although the GPU device exists.
+                    if pictures > 0 && !dec.hw_active && sh.dec_mode.load(Ordering::Relaxed) == 1 {
+                        sh.dec_mode.store(2, Ordering::Relaxed);
+                        println!("Видеокарта не смогла декодировать этот поток — работает процессор.");
+                    }
+                    if watch.on_packet(ok, pictures) && sh.dec_mode.load(Ordering::Relaxed) != 2 {
+                        gpu_failed = true;
+                        match Decoder::new(false) {
+                            Ok(d) => {
+                                println!("Декодер видеокарты не работает — перехожу на процессор.");
+                                dec = d;
+                                sh.dec_mode.store(3, Ordering::Relaxed);
+                                sh.want_resync.store(true, Ordering::Relaxed); // the new decoder needs a keyframe
+                            }
+                            Err(e) => eprintln!("декодер процессора: {e:#}"),
+                        }
+                    }
                 }
             }
         });
@@ -493,6 +651,11 @@ impl ApplicationHandler<UserEv> for App {
                     w.request_redraw();
                 }
             }
+            UserEv::Title(t) => {
+                if let Some(w) = &self.window {
+                    w.set_title(&t);
+                }
+            }
             UserEv::Exit => el.exit(),
         }
     }
@@ -531,6 +694,7 @@ impl ApplicationHandler<UserEv> for App {
 
 impl App {
     fn draw(&mut self) {
+        let t0 = Instant::now();
         let (Some(w), Some(surface)) = (&self.window, &mut self.surface) else { return };
         let size = w.inner_size();
         let (Some(ww), Some(wh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
@@ -557,6 +721,7 @@ impl App {
         }
         drop(p);
         let _ = buf.present();
+        self.sh.diag.lock().unwrap().present.add(t0.elapsed().as_micros() as u64);
         if flash {
             crate::avsync::log("client_video", crate::avsync::now_us());
         }

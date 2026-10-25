@@ -10,7 +10,9 @@ mod client;
 mod gui;
 mod host;
 mod loopback;
+mod easy;
 mod net;
+mod ntfy;
 mod preview;
 mod ratectl;
 mod reassembly;
@@ -19,6 +21,7 @@ mod selftest;
 mod source;
 mod ui;
 mod video;
+mod viewperf;
 mod wincap;
 
 use anyhow::{bail, Context, Result};
@@ -87,8 +90,14 @@ fn setup_console() {
 }
 
 fn exchange(a: &mut Args) -> Result<Exchange> {
+    let room = a.value("--room")?;
     Ok(match a.value("--exchange-dir")? {
         Some(d) => Exchange::Dir(PathBuf::from(d)),
+        None if room.is_some() => {
+            let r = easy::Room::from_code(room.as_deref().unwrap_or(""))
+                .context("короткий код неправильный — это 8 символов вроде K7QM-X2PD")?;
+            Exchange::Relay(std::sync::Arc::new(r))
+        }
         None if ui::ipc() => Exchange::Ipc,
         None => Exchange::Console,
     })
@@ -98,7 +107,7 @@ fn host_opts(a: &mut Args) -> Result<host::HostOpts> {
     Ok(host::HostOpts {
         window: a.value("--window")?.map(|v| v.parse::<isize>()).transpose().context("--window")?,
         monitor: a.value("--monitor")?.map(|v| v.parse::<usize>()).transpose().context("--monitor")?,
-        bitrate_mbps: a.num("--bitrate", 40)?,
+        bitrate_mbps: a.num("--bitrate", 20)?,
         fps: a.num("--fps", 60)?,
         preset: a.value("--preset")?.unwrap_or_else(|| "p4".into()),
         max_send_mbps: a.num("--max-send", 80)?,
@@ -145,7 +154,7 @@ fn run(mut a: Args) -> Result<()> {
         }
         "selftest" => {
             let mon = a.value("--monitor")?.map(|v| v.parse::<usize>()).transpose().context("--monitor")?;
-            let bitrate = a.num::<u64>("--bitrate", 40)? * 1_000_000;
+            let bitrate = a.num::<u64>("--bitrate", 20)? * 1_000_000;
             let preset = a.value("--preset")?.unwrap_or_else(|| "p4".into());
             let hw = !a.flag("--cpu-decode");
             let out = PathBuf::from(a.value("--out")?.unwrap_or_else(|| "selftest.bmp".into()));

@@ -39,7 +39,7 @@ pub fn color_test(bitrate: u64, preset: &str, hw: bool) -> Result<()> {
         enc.encode(i == 0, |d, k| packets.push((d.to_vec(), k)))?;
         for (p, k) in packets {
             keys += k as u32;
-            dec.decode(&p, |f| {
+            dec.decode(&p, true, |f| {
                 let _ = sc.convert(f, w, h, &mut last);
             })?;
         }
@@ -121,7 +121,7 @@ pub fn capture_test(monitor: crate::capture::MonitorInfo, bitrate: u64, preset: 
         for (p, _) in &packets {
             bytes += p.len();
             max_frame = max_frame.max(p.len());
-            dec.decode(p, |f| {
+            dec.decode(p, true, |f| {
                 let _ = sc.convert(f, w, h, &mut img);
             })?;
         }

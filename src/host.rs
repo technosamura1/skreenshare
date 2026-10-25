@@ -189,6 +189,8 @@ struct Preview {
     /// The encoder holds a real frame (not the blank buffer of a just-created encoder).
     has_frame: bool,
     was_on: bool,
+    /// When the last picture was made (host clock, ms).
+    last_ms: u64,
 }
 
 impl Preview {
@@ -210,6 +212,7 @@ impl Preview {
             stale: false,
             has_frame: false,
             was_on: false,
+            last_ms: 0,
         };
         (p, th)
     }
@@ -226,7 +229,13 @@ impl Preview {
         self.stale = true;
     }
 
-    fn maybe(&mut self, enc: Option<&Encoder>, canvas: (u32, u32), now_ms: u64) {
+    /// `starved_after_ms`: 0 = called in an idle moment; otherwise called right after an encode and only works
+    /// if no picture was made for that long. A busy stream (encoder running behind the capture rate, e.g. a
+    /// game at 50 fps) has no idle moments at all, and the preview used to starve there.
+    fn maybe(&mut self, enc: Option<&Encoder>, canvas: (u32, u32), now_ms: u64, starved_after_ms: u64) {
+        if starved_after_ms > 0 && now_ms < self.last_ms + starved_after_ms {
+            return;
+        }
         let on = ui::preview_wanted();
         if on && !self.was_on {
             self.stale = self.has_frame; // window shown again: one fresh picture right away
@@ -246,6 +255,7 @@ impl Preview {
         preview::pack_rgb(&self.small, pw, ph, pw as usize * 4, &mut self.rgb);
         let _ = self.tx.try_send((pw, ph, std::mem::take(&mut self.rgb))); // busy thread: skip this one
         self.stale = false;
+        self.last_ms = now_ms;
         self.gate.done(now_ms, t0.elapsed().as_micros() as u64);
     }
 }
@@ -522,7 +532,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         let now = Instant::now();
         if !dirty || now < next_due {
             // Idle moment: the right time for a preview of the last sent frame (never delays an encode).
-            pv.maybe(enc.as_ref(), canvas, sh.now_ms());
+            pv.maybe(enc.as_ref(), canvas, sh.now_ms(), 0);
             continue;
         }
         if enc.is_none() {
@@ -570,6 +580,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
         force_key = false;
         dirty = false;
         pv.note_frame();
+        pv.maybe(enc.as_ref(), canvas, sh.now_ms(), 400); // busy stream: no idle moments, so make one here
         next_due = if now.duration_since(next_due) > period { now + period } else { next_due + period };
         stat_frames += 1;
 

@@ -15,6 +15,8 @@ pub enum Exchange {
     Console,
     Dir(PathBuf),
     Ipc,
+    /// Simple pairing (beta): the codes travel sealed through the relay; the GUI/console still works as a fallback.
+    Relay(std::sync::Arc<crate::easy::Room>),
 }
 
 static IPC: AtomicBool = AtomicBool::new(false);
@@ -31,6 +33,15 @@ pub fn ipc() -> bool {
 pub fn stat(text: &str) {
     if ipc() {
         println!("@STATS {text}");
+    } else {
+        println!("{text}");
+    }
+}
+
+/// Viewer diagnostics line (decoder type, timings, queue, jitter): `@DIAG` for the GUI.
+pub fn diag(text: &str) {
+    if ipc() {
+        println!("@DIAG {text}");
     } else {
         println!("{text}");
     }
@@ -87,10 +98,44 @@ pub fn connected() {
     }
 }
 
+type StopCb = Box<dyn FnOnce() + Send>;
+static STOP_CB: std::sync::Mutex<Option<StopCb>> = std::sync::Mutex::new(None);
+static STOP_REQ: AtomicBool = AtomicBool::new(false);
+
+fn request_stop() {
+    STOP_REQ.store(true, Ordering::Relaxed);
+    let cb = STOP_CB.lock().ok().and_then(|mut g| g.take());
+    if let Some(f) = cb {
+        f();
+    }
+}
+
+/// A control line from the GUI (`STOP`, or the `PREVIEW` heartbeat). Returns true for STOP.
+/// Also used by the relay code-wait, whose stdin reader may swallow one line after the pairing finished.
+pub fn control_line(l: &str) -> bool {
+    match l.trim() {
+        "STOP" => {
+            request_stop();
+            true
+        }
+        "PREVIEW" => {
+            PREVIEW_BEAT.store(clock_ms() + 1, Ordering::Relaxed);
+            false
+        }
+        _ => false,
+    }
+}
+
 /// In IPC mode the GUI stops us by writing STOP (or by closing our stdin); `PREVIEW` lines are its heartbeat.
 pub fn on_stop(f: impl FnOnce() + Send + 'static) {
     if !ipc() {
         return;
+    }
+    if let Ok(mut g) = STOP_CB.lock() {
+        *g = Some(Box::new(f));
+    }
+    if STOP_REQ.load(Ordering::Relaxed) {
+        request_stop(); // STOP arrived before we were listening
     }
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -99,13 +144,19 @@ pub fn on_stop(f: impl FnOnce() + Send + 'static) {
             line.clear();
             match stdin.lock().read_line(&mut line) {
                 Ok(0) | Err(_) => break,
-                Ok(_) if line.trim() == "STOP" => break,
-                Ok(_) if line.trim() == "PREVIEW" => PREVIEW_BEAT.store(clock_ms() + 1, Ordering::Relaxed),
+                Ok(_) if control_line(&line) => return,
                 Ok(_) => {}
             }
         }
-        f();
+        request_stop();
     });
+}
+
+struct Finish(std::sync::Arc<AtomicBool>);
+impl Drop for Finish {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 pub fn read_line() -> String {
@@ -134,6 +185,31 @@ pub fn show_code(ex: &Exchange, code: &str, file: &str, title: &str) -> Result<(
             }
         }
         Exchange::Ipc => println!("@CODE {code}"),
+        Exchange::Relay(room) => {
+            // The ordinary code is still shown (GUI: under "не работает?"), the relay copy is the shortcut.
+            if ipc() {
+                println!("@CODE {code}");
+            }
+            let kind = if code.starts_with('H') { crate::easy::KIND_OFFER } else { crate::easy::KIND_ANSWER };
+            let msg = room.seal(kind, code);
+            let mut last = None;
+            for attempt in 0..3 {
+                match crate::ntfy::post(&room.topic, &msg) {
+                    Ok(()) => {
+                        last = None;
+                        break;
+                    }
+                    Err(e) => {
+                        last = Some(e);
+                        std::thread::sleep(Duration::from_millis(800 * (attempt + 1)));
+                    }
+                }
+            }
+            match last {
+                None => println!("Короткий код опубликован — жду друга..."),
+                Some(e) => println!("Простое подключение не сработало ({e:#}). Используй обычные длинные коды."),
+            }
+        }
         Exchange::Dir(d) => {
             std::fs::create_dir_all(d)?;
             let tmp = d.join(format!("{file}.tmp"));
@@ -188,6 +264,78 @@ pub fn read_code(
                 }
                 if ticks > 3000 {
                     bail!("не дождался файла {}", path.display());
+                }
+            }
+        }
+        Exchange::Relay(room) => {
+            // Poll the relay for the peer's sealed code, and still accept a pasted code (the fallback).
+            let kind = if want_role == net::ROLE_HOST { crate::easy::KIND_OFFER } else { crate::easy::KIND_ANSWER };
+            let (tx, rx) = mpsc::channel();
+            let finished = std::sync::Arc::new(AtomicBool::new(false));
+            let fin = finished.clone();
+            std::thread::spawn(move || loop {
+                let l = read_line();
+                if fin.load(Ordering::Relaxed) {
+                    // Pairing is over; this blocked read swallowed a control line meant for on_stop.
+                    if l.is_empty() {
+                        request_stop();
+                    } else {
+                        control_line(&l);
+                    }
+                    break;
+                }
+                let eof = l.is_empty();
+                if tx.send(l).is_err() || eof {
+                    break;
+                }
+            });
+            let _done = Finish(finished);
+            let started = std::time::Instant::now();
+            let mut attempt = 0u32;
+            let mut warned = false;
+            let mut last_keepalive = std::time::Instant::now();
+            let mut next_poll = std::time::Instant::now();
+            loop {
+                if started.elapsed() > Duration::from_secs(crate::easy::ROOM_LIFETIME_SECS) {
+                    bail!("короткий код устарел (15 минут) — создай новый");
+                }
+                if std::time::Instant::now() >= next_poll {
+                    match crate::ntfy::poll(&room.topic) {
+                        Ok(msgs) => {
+                            warned = false;
+                            if let Some(code) = room.find(kind, msgs.iter()) {
+                                match validate(&code) {
+                                    Ok(c) => return Ok(c),
+                                    // Stale/foreign message: ignore, keep waiting (a bad one must not end the room).
+                                    Err(e) => eprintln!("пропускаю сообщение из комнаты: {e:#}"),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if !warned {
+                                println!("Нет связи с сервером подключения: {e:#}. Пробую ещё...");
+                                warned = true;
+                            }
+                        }
+                    }
+                    next_poll = std::time::Instant::now() + Duration::from_millis(crate::easy::poll_delay_ms(attempt));
+                    attempt += 1;
+                }
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(l) if l.is_empty() => bail!("интерфейс закрыт"),
+                    Ok(l) if l == "STOP" => bail!("остановлено"),
+                    Ok(l) if l == "PREVIEW" => {}
+                    Ok(l) => match validate(&l) {
+                        Ok(c) => return Ok(c),
+                        Err(e) if ipc() => println!("@BADCODE {e:#}"),
+                        Err(e) => println!("Не подошло: {e:#}"),
+                    },
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => bail!("ввод закрыт"),
+                }
+                if last_keepalive.elapsed() >= Duration::from_secs(10) {
+                    net::stun_keepalive(sock, keepalive);
+                    last_keepalive = std::time::Instant::now();
                 }
             }
         }
