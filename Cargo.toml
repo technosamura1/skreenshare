@@ -1,6 +1,6 @@
 [package]
 name = "screenshare"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 
 [dependencies]
@@ -24,6 +24,8 @@ zstd = "0.14"
 version = "0.62"
 features = [
     "Foundation",
+    "Foundation_Metadata",
+    "Security_Authorization_AppCapabilityAccess",
     "Graphics_Capture",
     "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",

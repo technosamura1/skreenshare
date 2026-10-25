@@ -404,8 +404,17 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, monitor: MonitorIn
             let title = crate::wincap::title_of(h);
             match open_window(h) {
                 Ok(c) => {
+                    let note = match &c {
+                        Cap::Window(w) if w.border == crate::wincap::BorderState::Unavailable => crate::source::BORDER_NOTE,
+                        _ => "",
+                    };
                     ui::source_status(
-                        &format!("Показываю окно «{}» (в кадре {}×{})", crate::source::ellipsize(&title, 50), canvas.0, canvas.1),
+                        &format!(
+                            "Показываю окно «{}» (в кадре {}×{}){note}",
+                            crate::source::ellipsize(&title, 50),
+                            canvas.0,
+                            canvas.1
+                        ),
                         false,
                     );
                     ui::source_label(&crate::source::source_label(Some(&title)));

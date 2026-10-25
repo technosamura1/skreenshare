@@ -51,6 +51,9 @@ pub fn window_label(w: &WinEntry) -> String {
     }
 }
 
+/// Added to the status when this Windows can't hide the yellow capture border (no `IsBorderRequired`).
+pub const BORDER_NOTE: &str = ". Жёлтую рамку Windows тут не убрать (нужна Windows 11) — для показа без рамки выбери «Весь экран»";
+
 /// The label under the self-preview: "Окно: <заголовок>" or "Весь экран". Same wording as in the menu.
 pub fn source_label(window_title: Option<&str>) -> String {
     match window_title {
@@ -220,6 +223,12 @@ mod tests {
         let l = window_label(&win(1, &"я".repeat(200), false));
         assert_eq!(l.chars().count(), "Окно: ".chars().count() + 60);
         assert!(l.ends_with('…'));
+    }
+
+    #[test]
+    fn border_note_is_short_and_mentions_the_way_out() {
+        assert!(BORDER_NOTE.contains("Windows 11") && BORDER_NOTE.contains("Весь экран"));
+        assert!(BORDER_NOTE.chars().count() < 120);
     }
 
     #[test]

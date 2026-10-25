@@ -5,7 +5,7 @@ use crate::preview;
 use crate::source::{self, Choice, WinEntry};
 use crate::wincap;
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Sense, Stroke, StrokeKind, Vec2,
+    self, Align2, Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Sense, Stroke, Vec2,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::process::CommandExt;
@@ -78,7 +78,7 @@ fn setup_style(ctx: &egui::Context) {
         v.widgets.inactive.weak_bg_fill = CARD_HOVER;
         v.widgets.inactive.bg_fill = CARD_HOVER;
         v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x2e, 0x32, 0x40);
-        v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
+        v.widgets.hovered.bg_stroke = Stroke::NONE; // no outlines: hover shows by the fill
         v.widgets.active.weak_bg_fill = ACCENT;
         s.spacing.item_spacing = Vec2::new(10.0, 10.0);
         s.spacing.button_padding = Vec2::new(14.0, 8.0);
@@ -276,7 +276,6 @@ fn preview_box(ui: &mut egui::Ui, s: &Session) {
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, "предпросмотр загружается…", FontId::proportional(13.0), MUTED);
         }
     }
-    ui.painter().rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, CARD_HOVER), StrokeKind::Inside);
     if !s.preview_label.is_empty() {
         ui.add_space(4.0);
         ui.label(RichText::new(&s.preview_label).color(if s.source_warn { RED } else { TEXT }));
@@ -407,9 +406,6 @@ fn card_button(ui: &mut egui::Ui, title: &str, subtitle: &str) -> bool {
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let p = ui.painter();
     p.rect_filled(rect, 14.0, if resp.hovered() { CARD_HOVER } else { CARD });
-    if resp.hovered() {
-        p.rect_stroke(rect, 14.0, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
-    }
     p.text(rect.left_top() + Vec2::new(22.0, 18.0), Align2::LEFT_TOP, title, bold(19.0), TEXT);
     p.text(rect.left_top() + Vec2::new(22.0, 48.0), Align2::LEFT_TOP, subtitle, FontId::proportional(14.0), MUTED);
     p.text(rect.right_center() - Vec2::new(22.0, 2.0), Align2::RIGHT_CENTER, "›", FontId::proportional(30.0), MUTED);

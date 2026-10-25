@@ -121,6 +121,17 @@
       (рекурсивный «тоннель»), `WDA_EXCLUDEFROMCAPTURE` сознательно не используем — друг перестал бы видеть окно программы.
       **Не проверено:** Windows-рантайм (exe только кросс-собран): текстура/GUI, пульс при свёрнутом окне,
       реальная нагрузка на CPU и сглаженность `SWS_AREA`, валидность `last_input()` сразу после `encode`.
+- [x] v0.6.2: убираем жёлтую рамку WGC. `wincap::remove_border`: `ApiInformation::IsPropertyPresent(
+      GraphicsCaptureSession, IsBorderRequired)` → best-effort `GraphicsCaptureAccess::RequestAccessAsync(Borderless)`
+      (в отдельном потоке, ждём ≤1,5 с; без пакета/capability `graphicsCaptureWithoutBorder` может отказать — не страшно)
+      → `SetIsBorderRequired(false)`. Для exe без пакета решает настройка Windows 11 «desktop apps turn off the screenshot
+      border» (`ConsentStore\graphicsCaptureProgrammatic\NonPackaged`). Windows 10 (<20348) свойства нет → `BorderState::
+      Unavailable` → в статусе `source::BORDER_NOTE`. Фолбэк «DXGI-кадр экрана, вырезанный по rect окна» не делаем
+      (утечка перекрывающих окон другу, мусор при сворачивании, окно на втором мониторе). Убраны обводки GUI: рамка
+      предпросмотра и подсветка карточек/кнопок при наведении. Features windows-rs: `Foundation_Metadata`,
+      `Security_Authorization_AppCapabilityAccess`.
+      **Не проверено:** Windows-рантайм вообще; реально ли Windows 11 снимает рамку для нашего exe (зависит от настройки),
+      что отдаёт `RequestAccessAsync` без пакета.
 
 ## Известные косяки (TODO)
 - **HDR (важно, отложено по просьбе пользователя 2026-10-24):** при включённом HDR в Windows картинка в стриме
