@@ -1,6 +1,6 @@
 [package]
 name = "screenshare"
-version = "0.7.7"
+version = "0.8.0"
 edition = "2021"
 
 [dependencies]
@@ -42,6 +42,7 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_Media",
     "Win32_Media_Audio",
+    "Win32_Storage_Xps",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",

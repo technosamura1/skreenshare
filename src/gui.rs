@@ -4,12 +4,15 @@ use crate::audiosel;
 use crate::capture;
 use crate::netq;
 use crate::easy;
+use crate::guilogic::{self as lg, Step, STEPS};
 use crate::preview;
 use crate::source::{self, Choice, WinEntry};
+use crate::thumbs::{Key, Target, Thumbs};
 use crate::wincap;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Sense, Stroke, Vec2,
 };
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -161,6 +164,10 @@ impl Drop for Proc {
 
 struct Session {
     proc: Proc,
+    /// This side shows the screen (`host`), not watches it (`client`).
+    is_host: bool,
+    started: Instant,
+    connected_at: Option<Instant>,
     status: String,
     code: Option<String>,
     connected: bool,
@@ -195,6 +202,9 @@ impl Session {
     fn start(ctx: &egui::Context, args: Vec<String>) -> Result<Session, String> {
         let proc = Proc::spawn(ctx, &args).map_err(|e| format!("не удалось запустить: {e}"))?;
         Ok(Session {
+            is_host: args.first().is_some_and(|a| a == "host"),
+            started: Instant::now(),
+            connected_at: None,
             proc,
             status: "Запускаю...".into(),
             code: None,
@@ -226,6 +236,7 @@ impl Session {
                 self.code = Some(c.to_string());
             } else if l == "@CONNECTED" {
                 self.connected = true;
+                self.connected_at = Some(Instant::now());
                 self.bad_code = None;
             } else if let Some(s) = l.strip_prefix("@STATS ") {
                 self.stats = s.to_string();
@@ -355,15 +366,100 @@ enum Page {
     Test,
 }
 
+/// The picker's pictures: the background worker plus the egui textures made from what it produced.
+struct ThumbStore {
+    worker: Thumbs,
+    tex: HashMap<Key, (egui::TextureHandle, u64)>,
+    icons: HashMap<isize, Option<egui::TextureHandle>>,
+    last_list: Instant,
+}
+
+impl ThumbStore {
+    fn new() -> ThumbStore {
+        ThumbStore { worker: Thumbs::new(), tex: HashMap::new(), icons: HashMap::new(), last_list: Instant::now() }
+    }
+
+    /// Tells the worker what is on screen and uploads whatever it finished since the last frame.
+    fn sync(&mut self, ctx: &egui::Context, targets: Vec<Target>, keys: &[Key]) {
+        self.worker.want(targets);
+        let seen: HashMap<Key, u64> = self.tex.iter().map(|(k, (_, v))| (*k, *v)).collect();
+        for (k, p) in self.worker.news(&seen) {
+            let img = egui::ColorImage::from_rgba_unmultiplied([p.w, p.h], &p.rgba);
+            match self.tex.get_mut(&k) {
+                Some((t, v)) => {
+                    t.set(img, egui::TextureOptions::LINEAR);
+                    *v = p.version;
+                }
+                None => {
+                    let t = ctx.load_texture(format!("th{k:?}"), img, egui::TextureOptions::LINEAR);
+                    self.tex.insert(k, (t, p.version));
+                }
+            }
+        }
+        let iseen: HashMap<isize, bool> = self.icons.keys().map(|k| (*k, true)).collect();
+        for (h, p) in self.worker.new_icons(&iseen) {
+            let t = p.map(|p| {
+                ctx.load_texture(format!("ic{h}"), egui::ColorImage::from_rgba_unmultiplied([p.w, p.h], &p.rgba), egui::TextureOptions::LINEAR)
+            });
+            self.icons.insert(h, t);
+        }
+        self.tex.retain(|k, _| keys.contains(k));
+        // The picker is alive: look again soon so new pictures appear, but never faster than the worker makes them.
+        ctx.request_repaint_after(Duration::from_millis(700));
+    }
+}
+
+/// One card of the picker.
+struct Pick {
+    choice: Choice,
+    key: Key,
+    title: String,
+    sub: String,
+    hwnd: Option<isize>,
+    minimized: bool,
+}
+
+/// The cards: "Весь экран" first, each monitor when there are several, then the windows.
+fn build_picks(monitors: &[String], rects: &[(i32, i32, u32, u32)], primary: usize, windows: &[WinEntry]) -> Vec<Pick> {
+    let size = |i: usize| rects.get(i).map(|r| format!("{}×{}", r.2, r.3)).unwrap_or_default();
+    let mut v = vec![Pick {
+        choice: Choice::Screen,
+        key: Key::Monitor(primary),
+        title: "Весь экран".into(),
+        sub: size(primary),
+        hwnd: None,
+        minimized: false,
+    }];
+    if monitors.len() > 1 {
+        for i in 0..monitors.len() {
+            v.push(Pick { choice: Choice::Monitor(i), key: Key::Monitor(i), title: format!("Монитор {}", i + 1), sub: size(i), hwnd: None, minimized: false });
+        }
+    }
+    for w in windows {
+        v.push(Pick {
+            choice: Choice::Window(w.hwnd),
+            key: Key::Window(w.hwnd),
+            title: w.title.clone(),
+            sub: String::new(),
+            hwnd: Some(w.hwnd),
+            minimized: w.minimized,
+        });
+    }
+    v
+}
+
 struct GuiApp {
     page: Page,
     monitors: Vec<String>,
+    /// Position and size of every monitor on the desktop (for the picker's pictures).
+    rects: Vec<(i32, i32, u32, u32)>,
     /// Index of the primary monitor ("Весь экран"; also the canvas size when one window is shown).
     primary: usize,
     /// "Что показывать": the choice, its text (kept in case the window vanished from the list) and the windows.
     choice: Choice,
     choice_label: String,
     windows: Vec<WinEntry>,
+    thumbs: ThumbStore,
     /// Mbit/s ceiling of the chosen preset; 0 = Авто (the default).
     bitrate: u32,
     audio: bool,
@@ -394,10 +490,12 @@ impl GuiApp {
         GuiApp {
             page: Page::Home,
             monitors,
+            rects: mons.iter().map(|m| (m.left, m.top, m.width, m.height)).collect(),
             primary: monitor,
             choice: Choice::Screen,
             choice_label: "Весь экран".into(),
             windows: wincap::list_windows(),
+            thumbs: ThumbStore::new(),
             bitrate: 0,
             audio: true,
             audio_prefs: audiosel::AudioPrefs::default(),
@@ -441,6 +539,52 @@ impl GuiApp {
         }
         a
     }
+
+    /// "Начать показ" (also "Повторить" after a failure: a short code is made anew, the old one is spent).
+    fn start_host(&mut self, ctx: &egui::Context) {
+        let mut args = self.host_args("host");
+        let room = self.easy.then(easy::new_room_code);
+        if let Some(r) = &room {
+            args.extend(["--room".to_string(), r.clone()]);
+        }
+        self.host = None;
+        match Session::start(ctx, args) {
+            Ok(mut s) => {
+                s.room = room;
+                self.host = Some(s);
+                self.start_error = None;
+            }
+            Err(e) => self.start_error = Some(e),
+        }
+    }
+
+    /// "Подключиться" with the code in the input (also "Повторить").
+    fn start_join(&mut self, ctx: &egui::Context) {
+        let code = self.input.trim().to_string();
+        let mut args = vec!["client".to_string()];
+        if !self.fullscreen {
+            args.push("--windowed".into());
+        }
+        // A short room code needs no pasting at all: the client fetches the offer itself.
+        let room = easy::normalize(&code);
+        if let Some(r) = &room {
+            args.extend(["--room".to_string(), r.clone()]);
+        }
+        self.join = None;
+        match Session::start(ctx, args) {
+            Ok(mut s) => {
+                if room.is_some() {
+                    s.room = room;
+                    s.status = "Ищу друга по короткому коду...".into();
+                } else {
+                    s.proc.send(&code);
+                }
+                self.join = Some(s);
+                self.start_error = None;
+            }
+            Err(e) => self.start_error = Some(e),
+        }
+    }
 }
 
 impl eframe::App for GuiApp {
@@ -481,22 +625,124 @@ impl eframe::App for GuiApp {
     }
 }
 
+// ---------------------------------------------------------------- icons (drawn, so no font is needed)
+
+#[derive(Clone, Copy, PartialEq)]
+enum Ico {
+    Monitor,
+    Eye,
+    Play,
+    Stop,
+    Check,
+    Cross,
+    Warn,
+    Window,
+    Retry,
+    Home,
+    Wifi,
+}
+
+fn draw_ico(p: &egui::Painter, ico: Ico, c: egui::Pos2, size: f32, col: Color32) {
+    use egui::{pos2, Rect, Shape};
+    let s = size / 2.0;
+    let st = Stroke::new((size / 11.0).max(1.6), col);
+    let pt = |x: f32, y: f32| pos2(c.x + x * s, c.y + y * s);
+    let line = |pts: Vec<egui::Pos2>| Shape::line(pts, st);
+    match ico {
+        Ico::Monitor => {
+            p.rect_stroke(Rect::from_min_max(pt(-1.0, -0.8), pt(1.0, 0.45)), 3.0, st, egui::StrokeKind::Inside);
+            p.add(line(vec![pt(0.0, 0.45), pt(0.0, 0.85)]));
+            p.add(line(vec![pt(-0.5, 0.88), pt(0.5, 0.88)]));
+        }
+        Ico::Window => {
+            p.rect_stroke(Rect::from_min_max(pt(-1.0, -0.8), pt(1.0, 0.8)), 3.0, st, egui::StrokeKind::Inside);
+            p.add(line(vec![pt(-1.0, -0.35), pt(1.0, -0.35)]));
+        }
+        Ico::Eye => {
+            let n = 14;
+            let up: Vec<_> = (0..=n).map(|i| { let x = -1.0 + 2.0 * i as f32 / n as f32; pt(x, -0.62 * (1.0 - x * x)) }).collect();
+            let dn: Vec<_> = (0..=n).map(|i| { let x = -1.0 + 2.0 * i as f32 / n as f32; pt(x, 0.62 * (1.0 - x * x)) }).collect();
+            p.add(line(up));
+            p.add(line(dn));
+            p.circle_filled(c, s * 0.3, col);
+        }
+        Ico::Play => {
+            p.add(Shape::convex_polygon(vec![pt(-0.55, -0.8), pt(0.85, 0.0), pt(-0.55, 0.8)], col, Stroke::NONE));
+        }
+        Ico::Stop => {
+            p.rect_filled(Rect::from_min_max(pt(-0.7, -0.7), pt(0.7, 0.7)), 2.5, col);
+        }
+        Ico::Check => {
+            p.add(line(vec![pt(-0.7, 0.05), pt(-0.2, 0.55), pt(0.75, -0.5)]));
+        }
+        Ico::Cross => {
+            p.add(line(vec![pt(-0.6, -0.6), pt(0.6, 0.6)]));
+            p.add(line(vec![pt(-0.6, 0.6), pt(0.6, -0.6)]));
+        }
+        Ico::Warn => {
+            p.add(Shape::closed_line(vec![pt(0.0, -0.9), pt(0.95, 0.75), pt(-0.95, 0.75)], st));
+            p.add(line(vec![pt(0.0, -0.3), pt(0.0, 0.25)]));
+            p.circle_filled(pt(0.0, 0.5), s * 0.09 + 0.6, col);
+        }
+        Ico::Retry => {
+            let pts: Vec<_> = (0..=18)
+                .map(|i| {
+                    let a = (-30.0 + 280.0 * i as f32 / 18.0).to_radians();
+                    pt(0.8 * a.cos(), 0.8 * a.sin())
+                })
+                .collect();
+            let end = *pts.last().unwrap();
+            p.add(line(pts));
+            p.add(Shape::convex_polygon(vec![pt(0.8 * (250f32).to_radians().cos() - 0.05, 0.8 * (250f32).to_radians().sin() - 0.55), pt(0.8 * (250f32).to_radians().cos() + 0.5, 0.8 * (250f32).to_radians().sin() + 0.1), end + egui::vec2(-0.1 * s, 0.0)], col, Stroke::NONE));
+        }
+        Ico::Home => {
+            p.add(Shape::closed_line(vec![pt(-0.85, 0.0), pt(0.0, -0.8), pt(0.85, 0.0), pt(0.85, 0.8), pt(-0.85, 0.8)], st));
+        }
+        Ico::Wifi => {
+            for (i, r) in [0.35f32, 0.7, 1.05].into_iter().enumerate() {
+                let pts: Vec<_> = (0..=10)
+                    .map(|k| {
+                        let a = (-135.0 + 90.0 * k as f32 / 10.0).to_radians();
+                        pt(r * a.cos(), 0.7 + r * a.sin())
+                    })
+                    .collect();
+                let _ = i;
+                p.add(line(pts));
+            }
+            p.circle_filled(pt(0.0, 0.7), s * 0.12 + 0.5, col);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- widgets
 
-fn card_button(ui: &mut egui::Ui, title: &str, subtitle: &str) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 82.0), Sense::click());
+/// The two big buttons of the first screen.
+fn tile_button(ui: &mut egui::Ui, ico: Ico, title: &str, subtitle: &str, fill: Color32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 112.0), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mut color = fill;
+    if resp.is_pointer_button_down_on() {
+        color = fill.gamma_multiply(0.82);
+    } else if resp.hovered() {
+        color = fill.lerp_to_gamma(Color32::WHITE, 0.10);
+    }
     let p = ui.painter();
-    p.rect_filled(rect, 14.0, if resp.hovered() { CARD_HOVER } else { CARD });
-    p.text(rect.left_top() + Vec2::new(22.0, 18.0), Align2::LEFT_TOP, title, bold(19.0), TEXT);
-    p.text(rect.left_top() + Vec2::new(22.0, 48.0), Align2::LEFT_TOP, subtitle, FontId::proportional(14.0), MUTED);
-    p.text(rect.right_center() - Vec2::new(22.0, 2.0), Align2::RIGHT_CENTER, "›", FontId::proportional(30.0), MUTED);
+    p.rect_filled(rect, 18.0, color);
+    let c = rect.left_center() + Vec2::new(52.0, 0.0);
+    p.circle_filled(c, 32.0, Color32::from_white_alpha(34));
+    draw_ico(p, ico, c, 34.0, Color32::WHITE);
+    p.text(rect.left_center() + Vec2::new(104.0, -15.0), Align2::LEFT_CENTER, title, bold(24.0), Color32::WHITE);
+    p.text(rect.left_center() + Vec2::new(104.0, 17.0), Align2::LEFT_CENTER, subtitle, FontId::proportional(14.0), Color32::from_white_alpha(205));
     resp.clicked()
 }
 
 fn big_button(ui: &mut egui::Ui, text: &str, fill: Color32, enabled: bool) -> bool {
+    big_button_i(ui, None, text, fill, enabled)
+}
+
+fn big_button_i(ui: &mut egui::Ui, ico: Option<Ico>, text: &str, fill: Color32, enabled: bool) -> bool {
     let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), sense);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 52.0), sense);
     let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
     let mut color = fill;
     if !enabled {
@@ -507,21 +753,28 @@ fn big_button(ui: &mut egui::Ui, text: &str, fill: Color32, enabled: bool) -> bo
         color = fill.lerp_to_gamma(Color32::WHITE, 0.12);
     }
     let p = ui.painter();
-    p.rect_filled(rect, 10.0, color);
+    p.rect_filled(rect, 14.0, color);
     let text_color = if enabled { Color32::WHITE } else { Color32::from_white_alpha(110) };
-    p.text(rect.center(), Align2::CENTER_CENTER, text, bold(16.0), text_color);
+    let galley = p.layout_no_wrap(text.to_string(), bold(17.0), text_color);
+    let icon_w = if ico.is_some() { 26.0 } else { 0.0 };
+    let total = galley.size().x + icon_w;
+    let x0 = rect.center().x - total / 2.0;
+    if let Some(i) = ico {
+        draw_ico(p, i, egui::pos2(x0 + 9.0, rect.center().y), 18.0, text_color);
+    }
+    p.galley(egui::pos2(x0 + icon_w, rect.center().y - galley.size().y / 2.0), galley, text_color);
     enabled && resp.clicked()
 }
 
 fn back_link(ui: &mut egui::Ui) -> bool {
-    ui.add(egui::Label::new(RichText::new("‹  Назад").color(MUTED).size(15.0)).sense(Sense::click()))
+    ui.add(egui::Label::new(RichText::new("‹  Назад").color(MUTED).size(16.0)).sense(Sense::click()))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
 }
 
 fn title(ui: &mut egui::Ui, t: &str, sub: &str) {
     ui.add_space(6.0);
-    ui.label(RichText::new(t).font(bold(26.0)));
+    ui.label(RichText::new(t).font(bold(28.0)));
     ui.label(RichText::new(sub).color(MUTED));
     ui.add_space(12.0);
 }
@@ -529,13 +782,20 @@ fn title(ui: &mut egui::Ui, t: &str, sub: &str) {
 fn section(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(CARD)
-        .corner_radius(14)
+        .corner_radius(16)
         .inner_margin(Margin::same(18))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
         });
     ui.add_space(4.0);
+}
+
+/// A collapsible block ("Дополнительно", "Подробности"): closed by default.
+fn fold<R>(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui) -> R) {
+    egui::CollapsingHeader::new(RichText::new(name).font(bold(15.0)).color(MUTED)).default_open(false).show(ui, |ui| {
+        add(ui);
+    });
 }
 
 fn step(ui: &mut egui::Ui, n: u32, text: &str) {
@@ -547,29 +807,47 @@ fn step(ui: &mut egui::Ui, n: u32, text: &str) {
     });
 }
 
-fn status_dot(ui: &mut egui::Ui, color: Color32, text: &str) {
-    ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-        ui.painter().circle_filled(r.center(), 6.0, color);
-        ui.label(RichText::new(text).font(bold(17.0)));
-    });
-}
-
-/// Network lamp: a coloured dot and a short text; the numbers behind it are in the tooltip.
-fn net_lamp(ui: &mut egui::Ui, s: &Session) {
-    let Some((level, text, details)) = &s.net else { return };
-    let color = match level {
+fn level_color(level: netq::Level) -> Color32 {
+    match level {
         netq::Level::Good => GREEN,
         netq::Level::Weak => YELLOW,
         netq::Level::Bad => RED,
+    }
+}
+
+/// The one-glance status: a coloured round icon (the network lamp of 0.7.7), a headline and a short text.
+/// The numbers behind it are in the tooltip; the whole long line lives in "Подробности".
+fn status_head(ui: &mut egui::Ui, s: &Session, headline: &str) {
+    let (color, short, tip, ico) = match &s.net {
+        Some((level, text, details)) => {
+            let ico = match level {
+                netq::Level::Good => Ico::Check,
+                netq::Level::Weak => Ico::Warn,
+                netq::Level::Bad => Ico::Cross,
+            };
+            (level_color(*level), text.clone(), if details.is_empty() { "Пока нет данных".to_string() } else { details.clone() }, ico)
+        }
+        None => (MUTED, "Проверяю сеть…".to_string(), "Пока нет данных".to_string(), Ico::Wifi),
     };
-    ui.horizontal(|ui| {
-        let (r, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-        ui.painter().circle_filled(r.center(), 6.0, color);
-        let t = ui.label(RichText::new(text).color(color).size(15.0));
-        let tip = if details.is_empty() { "Пока нет данных".to_string() } else { details.clone() };
-        resp.on_hover_text(tip.clone());
-        t.on_hover_text(tip);
+    let r = ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(46.0), Sense::hover());
+        ui.painter().circle_filled(r.center(), 23.0, color.gamma_multiply(0.28));
+        ui.painter().circle_stroke(r.center(), 23.0, Stroke::new(2.0, color));
+        draw_ico(ui.painter(), ico, r.center(), 22.0, color);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(RichText::new(headline).font(bold(20.0)));
+            ui.label(RichText::new(short).color(color).size(15.0));
+        });
+    });
+    r.response.on_hover_text(tip);
+}
+
+fn warn_line(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal_top(|ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+        draw_ico(ui.painter(), Ico::Warn, r.center() + Vec2::new(0.0, 3.0), 15.0, RED);
+        ui.add(egui::Label::new(RichText::new(text).color(RED)).wrap());
     });
 }
 
@@ -585,13 +863,13 @@ fn rate_line(ui: &mut egui::Ui, s: &Session) {
 }
 
 fn code_box(ui: &mut egui::Ui, code: &str, copied_at: &mut Option<Instant>) {
-    egui::Frame::new().fill(FIELD).corner_radius(10).inner_margin(Margin::same(14)).show(ui, |ui| {
+    egui::Frame::new().fill(FIELD).corner_radius(12).inner_margin(Margin::same(14)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.add(egui::Label::new(RichText::new(code).monospace().size(16.0).color(TEXT)).wrap());
     });
     let copied = copied_at.is_some_and(|t| t.elapsed() < Duration::from_secs(2));
-    let label = if copied { "Скопировано ✓" } else { "Скопировать код" };
-    if big_button(ui, label, if copied { GREEN } else { ACCENT }, true) {
+    let label = if copied { "Скопировано" } else { "Скопировать код" };
+    if big_button_i(ui, copied.then_some(Ico::Check), label, if copied { GREEN } else { ACCENT }, true) {
         ui.ctx().copy_text(code.to_string());
         *copied_at = Some(Instant::now());
     }
@@ -629,14 +907,14 @@ fn classic_host_codes(ui: &mut egui::Ui, s: &mut Session, input: &mut String, co
 
 /// The short room code, large, with a copy button.
 fn code_box_big(ui: &mut egui::Ui, code: &str, copied_at: &mut Option<Instant>) {
-    egui::Frame::new().fill(FIELD).corner_radius(10).inner_margin(Margin::same(14)).show(ui, |ui| {
+    egui::Frame::new().fill(FIELD).corner_radius(12).inner_margin(Margin::same(14)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.vertical_centered(|ui| {
             ui.label(RichText::new(code).monospace().size(34.0).color(TEXT));
         });
     });
     let copied = copied_at.is_some_and(|t| t.elapsed() < Duration::from_secs(2));
-    if big_button(ui, if copied { "Скопировано ✓" } else { "Скопировать код" }, if copied { GREEN } else { ACCENT }, true) {
+    if big_button_i(ui, copied.then_some(Ico::Check), if copied { "Скопировано" } else { "Скопировать код" }, if copied { GREEN } else { ACCENT }, true) {
         ui.ctx().copy_text(code.to_string());
         *copied_at = Some(Instant::now());
     }
@@ -653,50 +931,6 @@ fn code_input(ui: &mut egui::Ui, input: &mut String, hint: &str) {
             .margin(Margin::symmetric(12, 10))
             .desired_width(f32::INFINITY),
     );
-}
-
-/// "Что показывать" while streaming: picking another entry sends `SOURCE ...` to the host, which switches
-/// without stopping (the preview and the friend's picture follow).
-fn live_source_picker(
-    ui: &mut egui::Ui,
-    s: &mut Session,
-    choice: &mut Choice,
-    choice_label: &mut String,
-    windows: &mut Vec<WinEntry>,
-    monitors: &[String],
-    primary: usize,
-) {
-    if monitors.is_empty() {
-        return;
-    }
-    section(ui, |ui| {
-        ui.label(RichText::new("Что показывать сейчас").font(bold(15.0)));
-        let items = source::build_menu(monitors, windows);
-        // What the host really shows (it may have fallen back to the screen) beats what was clicked last.
-        let sel = if s.preview_label.is_empty() { choice_label.clone() } else { s.preview_label.clone() };
-        let mut picked = None;
-        let r = egui::ComboBox::from_id_salt("live_source").width(ui.available_width()).selected_text(sel).show_ui(ui, |ui| {
-            for it in &items {
-                if ui.selectable_label(*choice == it.choice, &it.label).clicked() {
-                    picked = Some(it.clone());
-                }
-            }
-        });
-        if r.response.clicked() {
-            *windows = wincap::list_windows(); // fresh list every time the dropdown is opened
-            ui.ctx().request_repaint();
-        }
-        if let Some(it) = picked {
-            *choice = it.choice;
-            *choice_label = it.label.clone();
-            s.proc.send(&source::SourceReq::from_choice(it.choice, primary).to_line());
-        }
-        ui.label(
-            RichText::new("Можно менять, не останавливая показ: другое окно, монитор или весь экран.")
-                .color(MUTED)
-                .size(12.5),
-        );
-    });
 }
 
 fn fps_hint(ui: &mut egui::Ui) {
@@ -718,102 +952,266 @@ fn spinner_line(ui: &mut egui::Ui, text: &str) {
     });
 }
 
-impl GuiApp {
-    fn settings(&mut self, ui: &mut egui::Ui, with_audio: bool) {
-        section(ui, |ui| {
-            ui.label(RichText::new("Что показывать").font(bold(15.0)));
-            if self.monitors.is_empty() {
-                error_text(ui, "Мониторы не найдены");
-            } else {
-                let items = source::build_menu(&self.monitors, &self.windows);
-                let sel = items.iter().find(|i| i.choice == self.choice).map_or_else(|| self.choice_label.clone(), |i| i.label.clone());
-                let r = egui::ComboBox::from_id_salt("source").width(ui.available_width()).selected_text(sel).show_ui(ui, |ui| {
-                    for it in &items {
-                        if ui.selectable_label(self.choice == it.choice, &it.label).clicked() {
-                            self.choice = it.choice;
-                            self.choice_label = it.label.clone();
-                        }
-                    }
-                });
-                if r.response.clicked() {
-                    // The list of windows is refreshed every time the dropdown is opened.
-                    self.windows = wincap::list_windows();
-                    ui.ctx().request_repaint();
+/// The animated connection screen: a spinner, the current step in words and the whole path as a list.
+fn connect_card(ui: &mut egui::Ui, s: &Session) {
+    let cur = lg::conn_step(s.is_host, &s.status, s.code.is_some(), s.connected, !s.stats.is_empty());
+    section(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(44.0).color(ACCENT));
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new(cur.label()).font(bold(22.0)));
+                ui.label(RichText::new(cur.hint(s.is_host, s.room.is_some())).color(MUTED));
+            });
+        });
+        ui.add_space(6.0);
+        for st in STEPS {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+                let p = ui.painter();
+                if st < cur || (st == cur && st == Step::Picture) {
+                    p.circle_filled(r.center(), 10.0, GREEN);
+                    draw_ico(p, Ico::Check, r.center(), 12.0, BG);
+                } else if st == cur {
+                    p.circle_filled(r.center(), 10.0, ACCENT.gamma_multiply(0.35));
+                    let t = ui.input(|i| i.time) as f32;
+                    let pulse = 0.5 + 0.5 * (t * 4.0).sin();
+                    p.circle_filled(r.center(), 4.0 + 2.5 * pulse, ACCENT);
+                } else {
+                    p.circle_stroke(r.center(), 9.5, Stroke::new(1.5, MUTED.gamma_multiply(0.7)));
                 }
-                if matches!(self.choice, Choice::Window(_)) {
-                    ui.label(
-                        RichText::new(
-                            "Друг увидит только это окно (картинка вписывается в кадр с чёрными полосами). \
-                             Если окно закроется — покажу весь экран.",
-                        )
-                        .color(MUTED)
-                        .size(13.0),
-                    );
-                }
-            }
-            ui.add_space(8.0);
-            ui.label(RichText::new("Качество").font(bold(15.0)));
-            ui.horizontal_wrapped(|ui| {
-                for (name, v) in [("Авто", 0), ("Стандарт · 30 Мбит/с", 30), ("Высокое качество · 60 Мбит/с", 60)] {
-                    if ui.selectable_label(self.bitrate == v, name).clicked() {
-                        self.bitrate = v;
+                let color = if st <= cur { TEXT } else { MUTED };
+                let font = if st == cur { bold(15.0) } else { FontId::proportional(15.0) };
+                ui.label(RichText::new(st.label()).font(font).color(color));
+            });
+        }
+        if !s.status.is_empty() && !s.connected {
+            ui.add_space(2.0);
+            ui.label(RichText::new(&s.status).color(MUTED).size(12.5));
+        }
+        if !s.connected && s.started.elapsed() > Duration::from_secs(45) {
+            ui.label(
+                RichText::new("Идёт долго. Друг должен держать свою программу открытой; файрвол может мешать.")
+                    .color(YELLOW)
+                    .size(13.0),
+            );
+        }
+    });
+    ui.ctx().request_repaint_after(Duration::from_millis(50));
+}
+
+enum ErrAction {
+    Retry,
+    Home,
+}
+
+/// A failure in plain words with "Повторить"; the raw text is under "Подробности".
+fn error_card(ui: &mut egui::Ui, raw: Option<&str>, retry_label: &str) -> Option<ErrAction> {
+    let (title, hint) = lg::friendly_error(raw.unwrap_or("остановлено"));
+    section(ui, |ui| {
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(46.0), Sense::hover());
+            ui.painter().circle_filled(r.center(), 23.0, RED.gamma_multiply(0.28));
+            ui.painter().circle_stroke(r.center(), 23.0, Stroke::new(2.0, RED));
+            draw_ico(ui.painter(), Ico::Cross, r.center(), 22.0, RED);
+            ui.add(egui::Label::new(RichText::new(title).font(bold(20.0))).wrap());
+        });
+        ui.label(RichText::new(hint).color(TEXT));
+        if let Some(raw) = raw {
+            fold(ui, "Подробности", |ui| {
+                ui.add(egui::Label::new(RichText::new(raw).color(MUTED).size(12.5)).wrap());
+            });
+        }
+    });
+    let mut act = None;
+    if big_button_i(ui, Some(Ico::Retry), retry_label, ACCENT, true) {
+        act = Some(ErrAction::Retry);
+    }
+    if big_button_i(ui, Some(Ico::Home), "На главную", CARD_HOVER, true) {
+        act = Some(ErrAction::Home);
+    }
+    act
+}
+
+/// The picker: a grid of cards, each with a small picture of the window / monitor, its app icon and title.
+/// Returns what was clicked. Used before the start and, with the same cards, to switch while streaming.
+fn source_picker(
+    ui: &mut egui::Ui,
+    ts: &mut ThumbStore,
+    windows: &mut Vec<WinEntry>,
+    monitors: &[String],
+    rects: &[(i32, i32, u32, u32)],
+    primary: usize,
+    selected: Choice,
+    max_height: f32,
+) -> Option<Choice> {
+    if ts.last_list.elapsed() > Duration::from_secs(3) {
+        *windows = wincap::list_windows(); // new windows appear, closed ones go
+        ts.last_list = Instant::now();
+    }
+    let picks = build_picks(monitors, rects, primary, windows);
+    let targets: Vec<Target> = picks
+        .iter()
+        .filter_map(|p| match (p.key, p.hwnd) {
+            (Key::Monitor(i), _) => rects.get(i).map(|r| Target::Monitor { index: i, left: r.0, top: r.1, w: r.2, h: r.3 }),
+            (Key::Window(h), _) => Some(Target::Window { hwnd: h, minimized: p.minimized }),
+        })
+        .collect();
+    let keys: Vec<Key> = picks.iter().map(|p| p.key).collect();
+    ts.sync(ui.ctx(), targets, &keys);
+
+    let gap = ui.spacing().item_spacing.x;
+    let mut clicked = None;
+    egui::ScrollArea::vertical().max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
+        let card_w = ((ui.available_width() - gap - 8.0) / 2.0).floor();
+        for row in picks.chunks(2) {
+            ui.horizontal(|ui| {
+                for p in row {
+                    if pick_card(ui, ts, p, card_w, p.choice == selected) {
+                        clicked = Some(p.choice);
                     }
                 }
             });
+        }
+    });
+    clicked
+}
+
+fn pick_card(ui: &mut egui::Ui, ts: &ThumbStore, p: &Pick, w: f32, selected: bool) -> bool {
+    let pad = 8.0;
+    let th_h = ((w - 2.0 * pad) * 9.0 / 16.0).round();
+    let h = th_h + pad * 2.0 + 28.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&p.title);
+    let paint = ui.painter();
+    let fill = if selected {
+        Color32::from_rgb(0x1f, 0x2c, 0x55)
+    } else if resp.hovered() {
+        CARD_HOVER
+    } else {
+        CARD
+    };
+    paint.rect_filled(rect, 14.0, fill);
+    if selected {
+        paint.rect_stroke(rect, 14.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+    }
+    let th = egui::Rect::from_min_size(rect.min + Vec2::splat(pad), Vec2::new(w - 2.0 * pad, th_h));
+    paint.rect_filled(th, 8.0, FIELD);
+    let icon_tex = p.hwnd.and_then(|h| ts.icons.get(&h)).and_then(|t| t.as_ref());
+    match ts.tex.get(&p.key) {
+        Some((t, _)) => {
+            // Letterbox inside the 16:9 area, keeping the window's own aspect.
+            let tv = t.size_vec2();
+            let k = (th.width() / tv.x).min(th.height() / tv.y);
+            let r = egui::Rect::from_center_size(th.center(), tv * k);
+            paint.image(t.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        None => match (icon_tex, p.hwnd) {
+            (Some(t), _) => {
+                let r = egui::Rect::from_center_size(th.center(), Vec2::splat(40.0));
+                paint.image(t.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            (None, Some(_)) => draw_ico(paint, Ico::Window, th.center(), 34.0, MUTED),
+            (None, None) => draw_ico(paint, Ico::Monitor, th.center(), 38.0, MUTED),
+        },
+    }
+    if p.minimized {
+        paint.text(th.center_bottom() - Vec2::new(0.0, 6.0), Align2::CENTER_BOTTOM, "свёрнуто", FontId::proportional(12.0), MUTED);
+    }
+    if selected {
+        let c = th.right_top() + Vec2::new(-15.0, 15.0);
+        paint.circle_filled(c, 11.0, ACCENT);
+        draw_ico(paint, Ico::Check, c, 13.0, Color32::WHITE);
+    }
+    // Line under the picture: the program's icon (or a drawn one) and the title.
+    let y = th.bottom() + 6.0 + 11.0;
+    let mut x = rect.left() + pad;
+    let small = Vec2::splat(18.0);
+    match (icon_tex, p.hwnd) {
+        (Some(t), _) => {
+            let r = egui::Rect::from_center_size(egui::pos2(x + 9.0, y), small);
+            paint.image(t.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        (None, Some(_)) => draw_ico(paint, Ico::Window, egui::pos2(x + 9.0, y), 15.0, MUTED),
+        (None, None) => draw_ico(paint, Ico::Monitor, egui::pos2(x + 9.0, y), 16.0, MUTED),
+    }
+    x += 26.0;
+    let title = if p.sub.is_empty() { p.title.clone() } else { format!("{} · {}", p.title, p.sub) };
+    let mut job = egui::text::LayoutJob::simple_singleline(title, FontId::proportional(14.0), if selected { Color32::WHITE } else { TEXT });
+    job.wrap = egui::text::TextWrapping::truncate_at_width((rect.right() - pad - x).max(10.0));
+    let galley = ui.painter().layout_job(job);
+    let gh = galley.size().y;
+    ui.painter().galley(egui::pos2(x, y - gh / 2.0), galley, TEXT);
+    resp.clicked()
+}
+
+impl GuiApp {
+    /// A click on a card: remembers the choice and its label (same wording as the old menu).
+    fn choose(&mut self, c: Choice) {
+        self.choice = c;
+        let items = source::build_menu(&self.monitors, &self.windows);
+        if let Some(it) = items.iter().find(|i| i.choice == c) {
+            self.choice_label = it.label.clone();
+        }
+    }
+
+    /// "Что показывать" before the start.
+    fn pick_source(&mut self, ui: &mut egui::Ui) {
+        if self.monitors.is_empty() {
+            error_text(ui, "Мониторы не найдены");
+            return;
+        }
+        let sel = self.choice;
+        let (mut windows, monitors, rects, primary) = (std::mem::take(&mut self.windows), self.monitors.clone(), self.rects.clone(), self.primary);
+        let picked = source_picker(ui, &mut self.thumbs, &mut windows, &monitors, &rects, primary, sel, 300.0);
+        self.windows = windows;
+        if let Some(c) = picked {
+            self.choose(c);
+        }
+        if matches!(self.choice, Choice::Window(_)) {
             ui.label(
-                RichText::new(
-                    "«Авто» в начале сама подбирает скорость: стартует с 20 Мбит/с и поднимает до 60, пока нет потерь. \
-                     «Стандарт» и «Высокое» — потолок: если интернет не успевает, программа сама снижает качество, а потом возвращает.",
-                )
-                .color(MUTED)
-                .size(13.0),
+                RichText::new("Друг увидит только это окно. Если окно закроется — покажу весь экран.").color(MUTED).size(13.0),
             );
-            if with_audio {
-                ui.add_space(8.0);
-                ui.checkbox(&mut self.audio, "Передавать звук компьютера");
-                if self.audio {
-                    if matches!(self.choice, Choice::Window(_)) {
-                        ui.checkbox(&mut self.audio_prefs.window_only, "Звук только из этого окна");
-                    }
-                    ui.checkbox(&mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе друг услышит сам себя эхом");
+        }
+    }
+
+    /// "Дополнительно": quality, audio, the short-code option. Defaults need no touching.
+    fn advanced(&mut self, ui: &mut egui::Ui, with_audio: bool, with_easy: bool) {
+        ui.label(RichText::new("Качество").font(bold(15.0)));
+        ui.horizontal_wrapped(|ui| {
+            for (name, v) in [("Авто", 0), ("Стандарт · 30 Мбит/с", 30), ("Высокое качество · 60 Мбит/с", 60)] {
+                let on = self.bitrate == v;
+                let b = egui::Button::new(RichText::new(name).color(if on { Color32::WHITE } else { TEXT }))
+                    .fill(if on { ACCENT } else { FIELD })
+                    .corner_radius(10.0)
+                    .min_size(egui::vec2(0.0, 30.0));
+                if ui.add(b).clicked() {
+                    self.bitrate = v;
                 }
             }
         });
-    }
-
-    fn home(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(10.0);
-        ui.label(RichText::new("screenshare").font(bold(34.0)));
-        ui.label(RichText::new("Экран другу — напрямую, без серверов и регистрации").color(MUTED).size(15.0));
-        ui.add_space(26.0);
-        if card_button(ui, "Показать мой экран", "Весь экран или одно окно — и звук компьютера") {
-            self.windows = wincap::list_windows();
-            self.page = Page::Host;
-        }
-        if card_button(ui, "Смотреть экран друга", "Понадобится код, который пришлёт друг") {
-            self.page = Page::Join;
-        }
-        if card_button(ui, "Проверить на этом ПК", "Увидишь то же самое, что увидит друг") {
-            self.windows = wincap::list_windows();
-            self.page = Page::Test;
-        }
-        ui.add_space(18.0);
-        ui.label(RichText::new(format!("версия {}", env!("CARGO_PKG_VERSION"))).color(MUTED).size(12.0));
-    }
-
-    fn host_page(&mut self, ui: &mut egui::Ui) {
-        let running = self.host.as_ref().is_some_and(|s| s.active());
-        if !running && back_link(ui) {
-            self.go_home();
-            return;
-        }
-        title(ui, "Показать мой экран", "Друг подключится по коду — без настроек роутера");
-
-        let Some(s) = &mut self.host else {
-            self.settings(ui, true);
-            if let Some(e) = &self.start_error {
-                error_text(ui, e);
+        ui.label(
+            RichText::new(
+                "«Авто» в начале сама подбирает скорость: стартует с 20 Мбит/с и поднимает до 60, пока нет потерь. \
+                 «Стандарт» и «Высокое» — потолок: если интернет не успевает, программа сама снижает качество, а потом возвращает.",
+            )
+            .color(MUTED)
+            .size(13.0),
+        );
+        if with_audio {
+            ui.add_space(6.0);
+            ui.label(RichText::new("Звук").font(bold(15.0)));
+            ui.checkbox(&mut self.audio, "Передавать звук компьютера");
+            if self.audio {
+                if matches!(self.choice, Choice::Window(_)) {
+                    ui.checkbox(&mut self.audio_prefs.window_only, "Звук только из этого окна");
+                }
+                ui.checkbox(&mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе друг услышит сам себя эхом");
             }
+        }
+        if with_easy {
+            ui.add_space(6.0);
+            ui.label(RichText::new("Подключение").font(bold(15.0)));
             ui.checkbox(&mut self.easy, "Простое подключение (beta): один короткий код вместо двух длинных");
             if self.easy {
                 ui.label(
@@ -822,30 +1220,132 @@ impl GuiApp {
                         .size(12.5),
                 );
             }
-            if big_button(ui, "Начать", ACCENT, !self.monitors.is_empty()) {
-                let mut args = self.host_args("host");
-                let room = self.easy.then(easy::new_room_code);
-                if let Some(r) = &room {
-                    args.extend(["--room".to_string(), r.clone()]);
-                }
-                match Session::start(ui.ctx(), args) {
-                    Ok(mut s) => {
-                        s.room = room;
-                        self.host = Some(s);
-                    }
-                    Err(e) => self.start_error = Some(e),
-                }
+        }
+    }
+
+    fn home(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
+            ui.painter().rect_filled(r, 15.0, ACCENT);
+            draw_ico(ui.painter(), Ico::Monitor, r.center(), 28.0, Color32::WHITE);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(RichText::new("screenshare").font(bold(32.0)));
+                ui.label(RichText::new("Экран другу — напрямую, без серверов").color(MUTED).size(15.0));
+            });
+        });
+        ui.add_space(26.0);
+        if tile_button(ui, Ico::Monitor, "Показать экран", "Друг увидит экран и услышит звук", ACCENT) {
+            self.windows = wincap::list_windows();
+            self.thumbs.last_list = Instant::now();
+            self.page = Page::Host;
+        }
+        ui.add_space(4.0);
+        if tile_button(ui, Ico::Eye, "Смотреть", "Понадобится код друга", Color32::from_rgb(0x2b, 0x2f, 0x3f)) {
+            self.page = Page::Join;
+        }
+        ui.add_space(18.0);
+        fold(ui, "Дополнительно", |ui| {
+            if big_button_i(ui, Some(Ico::Play), "Проверить на этом ПК", CARD_HOVER, true) {
+                self.windows = wincap::list_windows();
+                self.thumbs.last_list = Instant::now();
+                self.page = Page::Test;
             }
+            ui.label(RichText::new("Увидишь то же самое, что увидит друг. Качество, звук и порт настраиваются на странице показа.").color(MUTED).size(13.0));
+            ui.label(RichText::new(format!("версия {}", env!("CARGO_PKG_VERSION"))).color(MUTED).size(12.0));
+        });
+    }
+
+    fn host_page(&mut self, ui: &mut egui::Ui) {
+        let running = self.host.as_ref().is_some_and(|s| s.active());
+        if !running && back_link(ui) {
+            self.go_home();
+            return;
+        }
+        let live = self.host.as_ref().is_some_and(|s| s.connected && s.active());
+        title(
+            ui,
+            "Показать экран",
+            if live { "Друг видит твой экран" } else { "Выбери, что показать другу, и нажми «Начать»" },
+        );
+
+        let Some(s) = &mut self.host else {
+            section(ui, |ui| {
+                ui.label(RichText::new("Что показывать").font(bold(15.0)));
+                self.pick_source(ui);
+            });
+            if let Some(e) = &self.start_error {
+                error_text(ui, e);
+            }
+            if big_button_i(ui, Some(Ico::Play), "Начать показ", ACCENT, !self.monitors.is_empty()) {
+                let ctx = ui.ctx().clone();
+                self.start_host(&ctx);
+            }
+            ui.add_space(6.0);
+            fold(ui, "Дополнительно", |ui| self.advanced(ui, true, true));
             return;
         };
 
         if s.connected && !s.ended {
+            // The picture/numbers of the first second are not in yet: still the connection screen.
+            if s.stats.is_empty() && s.connected_at.is_some_and(|t| t.elapsed() < Duration::from_secs(6)) {
+                connect_card(ui, s);
+                return;
+            }
             // The preview is made only while this window is visible and the switch is on.
             drive_preview(ui.ctx(), self.show_preview, s);
-            live_source_picker(ui, s, &mut self.choice, &mut self.choice_label, &mut self.windows, &self.monitors, self.primary);
+            let s = &mut *s;
+            section(ui, |ui| {
+                status_head(ui, s, "Идёт трансляция");
+                if !s.source.is_empty() && s.source_warn {
+                    warn_line(ui, &s.source);
+                }
+                if !s.enc_warn.is_empty() {
+                    warn_line(ui, &format!("Видеокарта не используется: {}", s.enc_warn));
+                }
+                if s.audio.starts_with("Звук выключен") || s.audio.starts_with("Звук не") {
+                    warn_line(ui, &s.audio);
+                }
+                fold(ui, "Подробности", |ui| {
+                    rate_line(ui, s);
+                    ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
+                    if !s.encoder.is_empty() {
+                        ui.label(RichText::new(&s.encoder).color(TEXT));
+                    }
+                    if !s.audio.is_empty() {
+                        ui.label(RichText::new(&s.audio).color(TEXT));
+                    }
+                    if !s.source.is_empty() && !s.source_warn {
+                        ui.label(RichText::new(&s.source).color(TEXT));
+                    }
+                    fps_hint(ui);
+                });
+            });
+            // Switching without stopping: the same cards as at the start.
+            let mut picked = None;
+            if !self.monitors.is_empty() {
+                section(ui, |ui| {
+                    let shown = if s.preview_label.is_empty() { self.choice_label.clone() } else { s.preview_label.clone() };
+                    egui::CollapsingHeader::new(RichText::new("Сменить окно или экран").font(bold(16.0))).default_open(false).show(ui, |ui| {
+                        let mut windows = std::mem::take(&mut self.windows);
+                        picked = source_picker(ui, &mut self.thumbs, &mut windows, &self.monitors, &self.rects, self.primary, self.choice, 280.0);
+                        self.windows = windows;
+                        ui.label(RichText::new("Можно менять, не останавливая показ.").color(MUTED).size(12.5));
+                    });
+                    ui.label(RichText::new(format!("Сейчас: {shown}")).color(MUTED).size(13.0));
+                });
+            }
+            if let Some(c) = picked {
+                self.choice = c;
+                if let Some(it) = source::build_menu(&self.monitors, &self.windows).iter().find(|i| i.choice == c) {
+                    self.choice_label = it.label.clone();
+                }
+                s.proc.send(&source::SourceReq::from_choice(c, self.primary).to_line());
+            }
             if self.audio {
                 let before = self.audio_prefs;
-                section(ui, |ui| {
+                fold(ui, "Дополнительно", |ui| {
                     ui.label(RichText::new("Звук").font(bold(15.0)));
                     if matches!(self.choice, Choice::Window(_)) {
                         ui.checkbox(&mut self.audio_prefs.window_only, "Звук только из этого окна");
@@ -856,29 +1356,7 @@ impl GuiApp {
                     s.proc.send(&self.audio_prefs.line());
                 }
             }
-            let s = &*s;
-            section(ui, |ui| {
-                status_dot(ui, GREEN, "Идёт трансляция");
-                net_lamp(ui, s);
-                rate_line(ui, s);
-                ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
-                if !s.encoder.is_empty() {
-                    ui.label(RichText::new(&s.encoder).color(TEXT));
-                }
-                if !s.enc_warn.is_empty() {
-                    ui.label(RichText::new(format!("Видеокарта не используется: {}", s.enc_warn)).color(RED));
-                }
-                ui.add_space(6.0);
-                if !s.source.is_empty() && s.source_warn {
-                    ui.label(RichText::new(&s.source).color(if s.source_warn { RED } else { TEXT }));
-                }
-                if !s.audio.is_empty() {
-                    let warn = s.audio.starts_with("Звук выключен") || s.audio.starts_with("Звук не");
-                    ui.label(RichText::new(&s.audio).color(if warn { RED } else { TEXT }));
-                }
-                fps_hint(ui);
-            });
-            if big_button(ui, "Остановить", RED, true) {
+            if big_button_i(ui, Some(Ico::Stop), "Остановить", RED, true) {
                 self.go_home();
                 return;
             }
@@ -888,16 +1366,28 @@ impl GuiApp {
             return;
         }
         if s.ended {
-            section(ui, |ui| {
-                status_dot(ui, if s.error.is_some() { RED } else { MUTED }, "Трансляция завершена");
-                if let Some(e) = &s.error {
-                    error_text(ui, e);
-                } else {
+            let (was, raw) = (s.connected, s.error.clone());
+            if was && raw.is_none() {
+                section(ui, |ui| {
+                    ui.label(RichText::new("Трансляция завершена").font(bold(20.0)));
                     ui.label(RichText::new(&s.status).color(MUTED));
+                });
+                if big_button_i(ui, Some(Ico::Retry), "Показать снова", ACCENT, true) {
+                    let ctx = ui.ctx().clone();
+                    self.start_host(&ctx);
+                } else if big_button_i(ui, Some(Ico::Home), "На главную", CARD_HOVER, true) {
+                    self.go_home();
                 }
-            });
-            if big_button(ui, "На главную", CARD_HOVER, true) {
-                self.go_home();
+                return;
+            }
+            let raw = raw.or_else(|| Some(s.status.clone()).filter(|t| !t.is_empty()));
+            match error_card(ui, raw.as_deref(), "Повторить") {
+                Some(ErrAction::Retry) => {
+                    let ctx = ui.ctx().clone();
+                    self.start_host(&ctx);
+                }
+                Some(ErrAction::Home) => self.go_home(),
+                None => {}
             }
             return;
         }
@@ -907,21 +1397,22 @@ impl GuiApp {
                 step(ui, 1, "Назови другу этот код");
                 code_box_big(ui, &room, &mut self.copied_at);
                 ui.label(
-                    RichText::new("Друг вводит его в «Смотреть экран друга» — больше ничего пересылать не нужно. Код живёт 15 минут.")
+                    RichText::new("Друг вводит его в «Смотреть» — больше ничего пересылать не нужно. Код живёт 15 минут.")
                         .color(MUTED)
                         .size(13.0),
                 );
-                spinner_line(ui, &s.status);
             });
+            connect_card(ui, s);
             if s.code.is_some() {
-                egui::CollapsingHeader::new("Не подключается? Обычный способ с длинными кодами").show(ui, |ui| {
+                egui::CollapsingHeader::new(RichText::new("Не подключается? Обычный способ с длинными кодами").color(MUTED)).show(ui, |ui| {
                     classic_host_codes(ui, s, &mut self.input, &mut self.copied_at);
                 });
             }
         } else {
             classic_host_codes(ui, s, &mut self.input, &mut self.copied_at);
+            connect_card(ui, s);
         }
-        if big_button(ui, "Отмена", CARD_HOVER, true) {
+        if big_button_i(ui, Some(Ico::Cross), "Отмена", CARD_HOVER, true) {
             self.go_home();
         }
     }
@@ -932,38 +1423,54 @@ impl GuiApp {
             self.go_home();
             return;
         }
-        title(ui, "Смотреть экран друга", "Попроси друга нажать «Показать мой экран» и прислать код");
+        let live = self.join.as_ref().is_some_and(|s| s.connected && s.active());
+        title(ui, "Смотреть", if live { "Ты смотришь экран друга" } else { "Попроси друга нажать «Показать экран» и прислать код" });
 
         if let Some(s) = &mut self.join {
             if s.connected && !s.ended {
+                if s.stats.is_empty() && s.connected_at.is_some_and(|t| t.elapsed() < Duration::from_secs(6)) {
+                    connect_card(ui, s);
+                    return;
+                }
                 section(ui, |ui| {
-                    status_dot(ui, GREEN, "Подключено");
-                    net_lamp(ui, s);
-                    ui.label("Окно просмотра открыто. F11 или двойной клик — переключить полный экран.");
-                    ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
-                    if !s.diag.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(&s.diag).color(MUTED).size(12.0));
+                    status_head(ui, s, "Идёт просмотр");
+                    ui.label(RichText::new("Окно просмотра открыто. F11 или двойной клик — полный экран.").color(MUTED).size(14.0));
+                    fold(ui, "Подробности", |ui| {
+                        ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
+                        if !s.diag.is_empty() {
+                            ui.label(RichText::new(&s.diag).color(MUTED).size(12.0));
+                        }
                         ui.label(RichText::new("Журнал: %LOCALAPPDATA%\\screenshare\\viewer.log").color(MUTED).size(12.0));
-                    }
+                    });
                 });
-                if big_button(ui, "Отключиться", RED, true) {
+                if big_button_i(ui, Some(Ico::Stop), "Отключиться", RED, true) {
                     self.go_home();
                 }
                 return;
             }
             if s.ended {
-                section(ui, |ui| {
-                    status_dot(ui, if s.error.is_some() { RED } else { MUTED }, "Отключено");
-                    match &s.error {
-                        Some(e) => error_text(ui, e),
-                        None => {
-                            ui.label(RichText::new(&s.status).color(MUTED));
-                        }
+                let (was, raw) = (s.connected, s.error.clone());
+                if was && raw.is_none() {
+                    section(ui, |ui| {
+                        ui.label(RichText::new("Просмотр завершён").font(bold(20.0)));
+                        ui.label(RichText::new(&s.status).color(MUTED));
+                    });
+                    if big_button_i(ui, Some(Ico::Retry), "Подключиться снова", ACCENT, true) {
+                        let ctx = ui.ctx().clone();
+                        self.start_join(&ctx);
+                    } else if big_button_i(ui, Some(Ico::Home), "На главную", CARD_HOVER, true) {
+                        self.go_home();
                     }
-                });
-                if big_button(ui, "На главную", CARD_HOVER, true) {
-                    self.go_home();
+                    return;
+                }
+                let raw = raw.or_else(|| Some(s.status.clone()).filter(|t| !t.is_empty()));
+                match error_card(ui, raw.as_deref(), "Повторить") {
+                    Some(ErrAction::Retry) => {
+                        let ctx = ui.ctx().clone();
+                        self.start_join(&ctx);
+                    }
+                    Some(ErrAction::Home) => self.go_home(),
+                    None => {}
                 }
                 return;
             }
@@ -971,15 +1478,15 @@ impl GuiApp {
 
         if let Some(s) = self.join.as_ref().filter(|s| s.room.is_some()) {
             section(ui, |ui| {
-                step(ui, 1, &format!("Код {} — подключаюсь к другу", s.room.as_deref().unwrap_or("")));
-                spinner_line(ui, if s.code.is_some() { "Нашёл друга, соединяюсь..." } else { &s.status });
+                step(ui, 1, &format!("Код {}", s.room.as_deref().unwrap_or("")));
                 ui.label(
-                    RichText::new("Друг должен держать окно «Показать мой экран» открытым. Если не выходит дольше минуты — отмени и используй обычный длинный код.")
+                    RichText::new("Друг должен держать окно «Показать экран» открытым. Если не выходит дольше минуты — отмени и используй обычный длинный код.")
                         .color(MUTED)
                         .size(13.0),
                 );
             });
-            if big_button(ui, "Отмена", CARD_HOVER, true) {
+            connect_card(ui, s);
+            if big_button_i(ui, Some(Ico::Cross), "Отмена", CARD_HOVER, true) {
                 self.go_home();
             }
             return;
@@ -995,49 +1502,39 @@ impl GuiApp {
                 if let Some(e) = &self.start_error {
                     error_text(ui, e);
                 }
-                ui.checkbox(&mut self.fullscreen, "Открыть на весь экран");
                 if self.join.as_ref().is_some_and(|s| s.bad_code.is_none()) {
                     spinner_line(ui, "Проверяю код...");
-                } else if big_button(ui, "Подключиться", ACCENT, !self.input.trim().is_empty()) {
-                    let code = self.input.trim().to_string();
+                } else if big_button_i(ui, Some(Ico::Eye), "Смотреть", ACCENT, !self.input.trim().is_empty()) {
                     if let Some(s) = &mut self.join {
+                        let code = self.input.trim().to_string();
                         s.bad_code = None;
                         s.proc.send(&code);
                     } else {
-                        let mut args = vec!["client".to_string()];
-                        if !self.fullscreen {
-                            args.push("--windowed".into());
-                        }
-                        // A short room code needs no pasting at all: the client fetches the offer itself.
-                        let room = easy::normalize(&code);
-                        if let Some(r) = &room {
-                            args.extend(["--room".to_string(), r.clone()]);
-                        }
-                        match Session::start(ui.ctx(), args) {
-                            Ok(mut s) => {
-                                if room.is_some() {
-                                    s.room = room;
-                                    s.status = "Ищу друга по короткому коду...".into();
-                                } else {
-                                    s.proc.send(&code);
-                                }
-                                self.join = Some(s);
-                            }
-                            Err(e) => self.start_error = Some(e),
-                        }
+                        let ctx = ui.ctx().clone();
+                        self.start_join(&ctx);
                     }
                 }
             });
+            if self.join.is_none() {
+                fold(ui, "Дополнительно", |ui| {
+                    ui.checkbox(&mut self.fullscreen, "Открыть на весь экран");
+                });
+            }
         } else {
             let s = self.join.as_mut().unwrap();
             section(ui, |ui| {
                 step(ui, 2, "Отправь другу код ответа");
                 code_box(ui, s.code.as_ref().unwrap(), &mut self.copied_at);
-                spinner_line(ui, "Жду, пока друг вставит этот код...");
             });
         }
-        if self.join.is_some() && big_button(ui, "Отмена", CARD_HOVER, true) {
-            self.go_home();
+        if let Some(s) = &self.join {
+            // A bad code is just a typo: stay on the input, no connection card for it.
+            if have_reply || s.bad_code.is_none() {
+                connect_card(ui, s);
+            }
+            if big_button_i(ui, Some(Ico::Cross), "Отмена", CARD_HOVER, true) {
+                self.go_home();
+            }
         }
     }
 
@@ -1052,7 +1549,10 @@ impl GuiApp {
             drive_preview(ui.ctx(), self.show_preview, h); // the streaming side makes the pictures
         }
         let Some((h, c, _, _)) = &self.test else {
-            self.settings(ui, false);
+            section(ui, |ui| {
+                ui.label(RichText::new("Что показывать").font(bold(15.0)));
+                self.pick_source(ui);
+            });
             section(ui, |ui| {
                 ui.label(RichText::new("Совет").font(bold(15.0)));
                 ui.label(
@@ -1068,7 +1568,7 @@ impl GuiApp {
             if let Some(e) = &self.start_error {
                 error_text(ui, e);
             }
-            if big_button(ui, "Запустить проверку", ACCENT, !self.monitors.is_empty()) {
+            if big_button_i(ui, Some(Ico::Play), "Запустить проверку", ACCENT, !self.monitors.is_empty()) {
                 let mut host_args = self.host_args("host");
                 host_args.push("--no-audio".into());
                 let started = Session::start(ui.ctx(), host_args).and_then(|h| {
@@ -1079,39 +1579,56 @@ impl GuiApp {
                     Err(e) => self.start_error = Some(e),
                 }
             }
+            ui.add_space(6.0);
+            fold(ui, "Дополнительно", |ui| self.advanced(ui, false, false));
             return;
         };
 
+        // One short line per side; the numbers are in "Подробности".
         let line = |ui: &mut egui::Ui, name: &str, s: &Session| {
             let (color, text) = if let Some(e) = &s.error {
-                (RED, e.clone())
+                (RED, lg::friendly_error(e).0.to_string())
             } else if s.ended {
                 (MUTED, "остановлено".to_string())
-            } else if s.connected {
-                (GREEN, if s.stats.is_empty() { "работает".to_string() } else { s.stats.clone() })
+            } else if s.connected && !s.stats.is_empty() {
+                match &s.net {
+                    Some((l, t, _)) => (level_color(*l), t.clone()),
+                    None => (GREEN, "работает".to_string()),
+                }
             } else {
-                (ACCENT, s.status.clone())
+                (ACCENT, lg::conn_step(s.is_host, &s.status, s.code.is_some(), s.connected, !s.stats.is_empty()).label().to_string())
             };
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
                 ui.painter().circle_filled(r.center(), 6.0, color);
-                ui.label(RichText::new(name).font(bold(15.0)));
+                ui.label(RichText::new(name).font(bold(16.0)));
+                ui.label(RichText::new(text).color(color));
             });
-            ui.label(RichText::new(text).color(MUTED));
         };
         section(ui, |ui| {
             line(ui, "Трансляция", h);
-            ui.add_space(6.0);
             line(ui, "Просмотр", c);
-            if !c.diag.is_empty() {
-                ui.label(RichText::new(&c.diag).color(MUTED).size(12.0));
+            if !(h.ended || c.ended) && !(h.connected && c.connected && !h.stats.is_empty()) {
+                spinner_line(ui, "Соединяю две половины на этом компьютере…");
             }
-            fps_hint(ui);
+            fold(ui, "Подробности", |ui| {
+                for (name, s) in [("Трансляция", h), ("Просмотр", c)] {
+                    ui.label(RichText::new(name).font(bold(14.0)));
+                    if let Some(e) = &s.error {
+                        error_text(ui, e);
+                    }
+                    ui.label(RichText::new(if s.stats.is_empty() { &s.status } else { &s.stats }).color(MUTED));
+                }
+                if !c.diag.is_empty() {
+                    ui.label(RichText::new(&c.diag).color(MUTED).size(12.0));
+                }
+                fps_hint(ui);
+            });
         });
         if h.connected && c.connected {
             ui.label(RichText::new("Окно просмотра открыто отдельно. F11 или двойной клик — полный экран.").color(MUTED));
         }
-        if big_button(ui, "Остановить", RED, true) {
+        if big_button_i(ui, Some(Ico::Stop), "Остановить", RED, true) {
             self.go_home();
             return;
         }

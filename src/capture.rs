@@ -14,6 +14,9 @@ pub struct MonitorInfo {
     pub width: u32,
     pub height: u32,
     pub primary: bool,
+    /// Top-left corner on the virtual desktop (for the picker's thumbnails).
+    pub left: i32,
+    pub top: i32,
     adapter_idx: u32,
     output_idx: u32,
 }
@@ -48,6 +51,8 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>> {
                         width: (r.right - r.left) as u32,
                         height: (r.bottom - r.top) as u32,
                         primary: r.left == 0 && r.top == 0,
+                        left: r.left,
+                        top: r.top,
                         adapter_idx: ai,
                         output_idx: oi,
                     });

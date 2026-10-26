@@ -48,6 +48,9 @@ mod reassembly;
 #[path = "../../../src/retx.rs"]
 mod retx;
 mod sim;
+#[path = "../../../src/guilogic.rs"]
+#[allow(dead_code)]
+mod guilogic;
 #[path = "../../../src/source.rs"]
 #[allow(dead_code)]
 mod source;
