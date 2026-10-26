@@ -57,12 +57,16 @@ screenshare — показ экрана напрямую, без серверо�
 Без параметров — окно программы. Параметры (для продвинутых):
   screenshare host   [--monitor N] [--window HWND] [--bitrate МБИТ] [--fps N] [--preset p1..p7]
                      [--max-send МБИТ] [--no-audio] [--audio-all] [--keep-voice] [--auto-bitrate] [--exchange-dir ПАПКА]
+                     [--control] [--no-control-pad] [--no-control-kbm]
                      --bitrate по умолчанию 30 (окно программы даёт «Авто», 30 «Стандарт» и 60 «Высокое качество»), --max-send 100.
                      --auto-bitrate — «Авто»: старт с 20 Мбит/с и подъём до --bitrate (по умолчанию 60), пока нет потерь.
                      Звук окна: при показе окна берётся звук только его процесса; --audio-all — всегда весь звук,
                      --keep-voice — не вырезать Discord. В stdin во время показа: «AUDIO window=0|1 voice=0|1».
+                     Удалённое управление: --control разрешает зрителю геймпад и мышь с клавиатурой (по умолчанию выключено),
+                     --no-control-pad / --no-control-kbm исключают одно из двух; строка «CONTROL on=0|1 pad=0|1 kbm=0|1» в stdin меняет
+                     разрешения на лету. Аварийное отключение — Ctrl+Alt+Shift+F12 на компьютере показывающего.
                      Во время показа окно программы может сменить источник: строка «SOURCE monitor N» / «SOURCE window HWND» в stdin.
-  screenshare client [--no-audio] [--cpu-decode] [--cpu-convert] [--windowed] [--exchange-dir ПАПКА]
+  screenshare client [--no-audio] [--no-control] [--cpu-decode] [--cpu-convert] [--windowed] [--exchange-dir ПАПКА]
                      [--frames N --screenshot ФАЙЛ.bmp]
                      --cpu-convert (или переменная SS_CPU_CONVERT=1) — цвет и масштаб на процессоре, не на видеокарте
   screenshare gputest        проверка видеокарты для цвета и масштаба у зрителя (без сети)
@@ -221,6 +225,12 @@ fn run(mut a: Args) -> Result<()> {
             let dh = a.num::<u32>("--window-h", 900)?;
             a.finish()?;
             gpuconv::selftest(w, h, dw, dh)?;
+        }
+        "overlaytest" => {
+            let out = PathBuf::from(a.value("--out")?.unwrap_or_else(|| "overlay.bmp".into()));
+            let (panel, on) = (a.flag("--panel"), a.flag("--on"));
+            a.finish()?;
+            client::overlay_preview(&out, panel, on)?;
         }
         "opustest" => {
             a.finish()?;

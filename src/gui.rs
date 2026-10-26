@@ -501,6 +501,9 @@ struct Session {
     /// Sound cues already played for this session.
     cue_conn: bool,
     cue_end: bool,
+    /// Host: what the control thread reports (`@CTRL`), and a one-shot flag that the owner just revoked control.
+    ctrl: Option<lg::CtrlStatus>,
+    revoke_event: bool,
 }
 
 impl Session {
@@ -534,6 +537,8 @@ impl Session {
             graph: lg::Graph::default(),
             cue_conn: false,
             cue_end: false,
+            ctrl: None,
+            revoke_event: false,
         })
     }
 
@@ -565,6 +570,13 @@ impl Session {
             } else if let Some(g) = l.strip_prefix("@GRAPH ") {
                 if let Some(p) = lg::parse_graph(g) {
                     self.graph.push(p);
+                }
+            } else if let Some(c) = l.strip_prefix("@CTRL ") {
+                if let Some(c) = lg::parse_ctrl(c) {
+                    if c.revoked && !self.ctrl.is_some_and(|o| o.revoked) {
+                        self.revoke_event = true;
+                    }
+                    self.ctrl = Some(c);
                 }
             } else if let Some(p) = l.strip_prefix("@PREVIEW ") {
                 self.preview_raw = Some(p.to_string()); // only the newest picture matters
@@ -775,6 +787,8 @@ enum Page {
     About,
     /// Self-test (reached from the settings).
     Test,
+    /// Gamepad test (reached from the settings).
+    Pads,
 }
 
 /// How long a new picture takes to replace the old one on a card.
@@ -925,6 +939,32 @@ struct GuiApp {
     input: String,
     copied_at: Option<Instant>,
     start_error: Option<String>,
+    /// Remote control switches of the host page. Consent is per session: off at every new start.
+    ctl: CtlUi,
+    /// Is the ViGEmBus driver installed (checked every few seconds on the host page).
+    vigem: (bool, Instant),
+    /// XInput for the gamepad test page (loaded on the first visit; None inside = no XInput on this PC).
+    xi: Option<Option<crate::xinput::XInput>>,
+    /// Which pad is vibrating for the test button, and until when.
+    rumble: Option<(usize, Instant)>,
+}
+
+/// The owner's remote-control switches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CtlUi {
+    allow: bool,
+    pad: bool,
+    kbm: bool,
+}
+
+fn vigem_now() -> bool {
+    // SS_FAKE_PAD=1 is the screenshot/demo switch (see xinput.rs): it also pretends the driver is there.
+    crate::inputhost::vigem_installed() || std::env::var("SS_FAKE_PAD").is_ok_and(|v| v == "1")
+}
+
+/// Opens a web page in the default browser (no console window).
+fn open_link(url: &str) {
+    let _ = Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).creation_flags(0x0800_0000).spawn();
 }
 
 impl GuiApp {
@@ -974,13 +1014,20 @@ impl GuiApp {
             input: String::new(),
             copied_at: None,
             start_error: None,
+            ctl: CtlUi { allow: false, pad: true, kbm: true },
+            vigem: (vigem_now(), Instant::now()),
+            xi: None,
+            rumble: None,
         }
     }
 
     /// Ends the session of the page that is open (and clears the typed code); the page itself stays.
     fn go_home(&mut self) {
         match self.page {
-            Page::Host => self.host = None,
+            Page::Host => {
+                self.host = None;
+                self.ctl.allow = false; // consent ends with the session
+            }
             Page::Join => self.join = None,
             Page::Test => self.test = None,
             _ => {}
@@ -1012,6 +1059,15 @@ impl GuiApp {
     /// "Начать показ" (also "Повторить" after a failure: a short code is made anew, the old one is spent).
     fn start_host(&mut self, ctx: &egui::Context) {
         let mut args = self.host_args("host");
+        if self.ctl.allow {
+            args.push("--control".into());
+        }
+        if !self.ctl.pad {
+            args.push("--no-control-pad".into());
+        }
+        if !self.ctl.kbm {
+            args.push("--no-control-kbm".into());
+        }
         let room = self.easy.then(easy::new_room_code);
         if let Some(r) = &room {
             args.extend(["--room".to_string(), r.clone()]);
@@ -1121,6 +1177,7 @@ impl GuiApp {
             Page::Host => 10 + sub(&self.host),
             Page::Join => 20 + sub(&self.join),
             Page::Test => 30 + self.test.is_some() as u32,
+            Page::Pads => 40,
         }
     }
 }
@@ -1152,6 +1209,20 @@ impl eframe::App for GuiApp {
             }
         }
         self.play_cues();
+        if self.host.as_ref().is_some_and(|s| s.ended) {
+            self.ctl.allow = false;
+        }
+        if self.page == Page::Host && self.vigem.1.elapsed() > Duration::from_secs(3) {
+            self.vigem = (vigem_now(), Instant::now());
+        }
+        if let Some((slot, t)) = self.rumble {
+            if t.elapsed() > Duration::from_millis(450) || self.page != Page::Pads {
+                if let Some(Some(x)) = &self.xi {
+                    x.vibrate(slot, 0, 0);
+                }
+                self.rumble = None;
+            }
+        }
         let busy = self.host.as_ref().is_some_and(|s| s.active())
             || self.join.as_ref().is_some_and(|s| s.active())
             || self.test.is_some();
@@ -1216,6 +1287,7 @@ impl eframe::App for GuiApp {
                             Page::Settings => self.settings_page(ui),
                             Page::About => self.about_page(ui),
                             Page::Test => self.test_page(ui),
+                            Page::Pads => self.pads_page(ui),
                         }
                         ui.add_space(24.0);
                     });
@@ -1296,7 +1368,7 @@ impl GuiApp {
             if nav_item(ui, Ico::Info, "О программе", self.page == Page::About, true, None) {
                 self.page = Page::About;
             }
-            if nav_item(ui, Ico::Gear, "Настройки", matches!(self.page, Page::Settings | Page::Test), true, None) {
+            if nav_item(ui, Ico::Gear, "Настройки", matches!(self.page, Page::Settings | Page::Test | Page::Pads), true, None) {
                 self.page = Page::Settings;
             }
         });
@@ -1432,6 +1504,7 @@ enum Ico {
     Wifi,
     Gear,
     Info,
+    Pad,
 }
 
 fn draw_ico(p: &egui::Painter, ico: Ico, c: egui::Pos2, size: f32, col: Color32) {
@@ -1445,6 +1518,15 @@ fn draw_ico(p: &egui::Painter, ico: Ico, c: egui::Pos2, size: f32, col: Color32)
             p.rect_stroke(Rect::from_min_max(pt(-1.0, -0.8), pt(1.0, 0.45)), 3.0, st, egui::StrokeKind::Inside);
             p.add(line(vec![pt(0.0, 0.45), pt(0.0, 0.85)]));
             p.add(line(vec![pt(-0.5, 0.88), pt(0.5, 0.88)]));
+        }
+        Ico::Pad => {
+            // a gamepad: a rounded body with a cross on the left and two buttons on the right
+            let body = vec![pt(-0.55, -0.55), pt(0.55, -0.55), pt(1.0, -0.2), pt(1.1, 0.5), pt(0.8, 0.75), pt(0.45, 0.45), pt(-0.45, 0.45), pt(-0.8, 0.75), pt(-1.1, 0.5), pt(-1.0, -0.2), pt(-0.55, -0.55)];
+            p.add(line(body));
+            p.add(line(vec![pt(-0.6, -0.1), pt(-0.2, -0.1)]));
+            p.add(line(vec![pt(-0.4, -0.3), pt(-0.4, 0.1)]));
+            p.circle_filled(pt(0.35, -0.1), s * 0.13, col);
+            p.circle_filled(pt(0.65, 0.1), s * 0.13, col);
         }
         Ico::Window => {
             p.rect_stroke(Rect::from_min_max(pt(-1.0, -0.8), pt(1.0, 0.8)), 3.0, st, egui::StrokeKind::Inside);
@@ -1639,6 +1721,137 @@ fn step(ui: &mut egui::Ui, n: u32, text: &str) {
         ui.painter().text(r.center(), Align2::CENTER_CENTER, n.to_string(), bold(13.0), on_fill(a));
         ui.label(RichText::new(text).font(bold(15.5)));
     });
+}
+
+/// The host's "Удалённое управление" card: consent switches, driver status, who is controlling.
+fn control_card(ui: &mut egui::Ui, ctl: &mut CtlUi, vigem: bool, live: Option<&mut Session>) {
+    use crate::inputhost::{DRIVER_URL, HOTKEY_TEXT};
+    let before = *ctl;
+    let mut st = None;
+    let mut revoked_now = false;
+    if let Some(s) = &live {
+        st = s.ctrl;
+        revoked_now = s.revoke_event;
+    }
+    if revoked_now {
+        ctl.allow = false;
+    }
+    let mut install = false;
+    section(ui, |ui| {
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+            draw_ico(ui.painter(), Ico::Pad, r.center(), 22.0, c_text());
+            ui.label(RichText::new("Удалённое управление").font(bold(16.0)));
+            if st.is_some_and(|c| c.active) && ctl.allow {
+                ui.add_space(6.0);
+                let (r, _) = ui.allocate_exact_size(Vec2::new(150.0, 22.0), Sense::hover());
+                ui.painter().rect_filled(r, 11.0, c_red().gamma_multiply(0.22));
+                ui.painter().circle_filled(r.left_center() + Vec2::new(12.0, 0.0), 4.5, c_red());
+                ui.painter().text(r.left_center() + Vec2::new(24.0, 0.0), egui::Align2::LEFT_CENTER, "Зритель управляет", egui::FontId::proportional(13.0), c_red());
+            }
+        });
+        ui.label(
+            RichText::new("Как в Steam Remote Play: зритель играет на вашем компьютере своим геймпадом, мышью и клавиатурой.")
+                .color(c_muted())
+                .size(13.0),
+        );
+        ui.add_space(4.0);
+        ui.checkbox(&mut ctl.allow, "Разрешить управление зрителю");
+        if ctl.allow {
+            ui.indent("ctl_dev", |ui| {
+                ui.checkbox(&mut ctl.pad, "Геймпад");
+                ui.checkbox(&mut ctl.kbm, "Мышь и клавиатура");
+            });
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(format!(
+                    "Зритель сможет двигать мышь и нажимать клавиши на всём компьютере, а не только в игре. Разрешайте только тем, кому доверяете. \
+                     Аварийно отключить управление: {HOTKEY_TEXT}."
+                ))
+                .color(c_muted())
+                .size(12.5),
+            );
+        }
+        if st.is_some_and(|c| c.revoked) && !ctl.allow {
+            warn_line(ui, &format!("Управление отключено сочетанием {HOTKEY_TEXT}. Включите снова, когда будете готовы."));
+        }
+        if ctl.pad {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                if vigem {
+                    draw_ico(ui.painter(), Ico::Check, r.center(), 14.0, c_green());
+                    ui.label(RichText::new("Драйвер геймпада установлен").color(c_green()));
+                    if let Some(c) = st.filter(|c| c.pads > 0) {
+                        ui.label(RichText::new(format!("· виртуальных геймпадов: {}", c.pads)).color(c_muted()));
+                    }
+                } else {
+                    draw_ico(ui.painter(), Ico::Warn, r.center(), 14.0, c_yellow());
+                    ui.label(RichText::new("Драйвер геймпада не найден").color(c_yellow()));
+                }
+            });
+            if !vigem {
+                ui.label(
+                    RichText::new("Без драйвера ViGEmBus геймпад зрителя в игру не попадёт — мышь и клавиатура работают. После установки, если попросит установщик, перезагрузите компьютер.")
+                        .color(c_muted())
+                        .size(12.5),
+                );
+                if ui.button("Установить драйвер").on_hover_text(DRIVER_URL).clicked() {
+                    install = true;
+                }
+            }
+        }
+    });
+    if install {
+        open_link(DRIVER_URL);
+    }
+    if *ctl != before || revoked_now {
+        if let Some(s) = live {
+            s.revoke_event = false;
+            s.proc.send(&lg::control_line(ctl.allow, ctl.pad, ctl.kbm));
+        }
+    }
+}
+
+/// One controller drawn live: sticks, triggers, buttons.
+fn pad_view(ui: &mut egui::Ui, st: &crate::inputproto::PadState) {
+    use crate::inputproto::btn;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 96.0), Sense::hover());
+    let p = ui.painter_at(rect);
+    let o = rect.min;
+    let acc = c_accent();
+    let off = c_text().gamma_multiply(0.12);
+    let stick = |cx: f32, sx: i16, sy: i16, down: bool| {
+        let c = o + Vec2::new(cx, 48.0);
+        p.circle_filled(c, 34.0, off);
+        p.circle_stroke(c, 34.0, Stroke::new(1.0, c_border()));
+        let d = Vec2::new(sx as f32 / 32768.0, -(sy as f32) / 32768.0) * 27.0;
+        p.circle_filled(c + d, 9.0, if down { c_green() } else { acc });
+    };
+    stick(40.0, st.lx, st.ly, st.buttons & btn::LTHUMB != 0);
+    stick(124.0, st.rx, st.ry, st.buttons & btn::RTHUMB != 0);
+    for (k, (v, name)) in [(st.lt, "LT"), (st.rt, "RT")].into_iter().enumerate() {
+        let x = 190.0 + k as f32 * 30.0;
+        let r = egui::Rect::from_min_size(o + Vec2::new(x, 8.0), Vec2::new(20.0, 70.0));
+        p.rect_filled(r, 5.0, off);
+        let fh = 70.0 * v as f32 / 255.0;
+        p.rect_filled(egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - fh), r.max), 5.0, acc);
+        p.text(egui::pos2(r.center().x, r.bottom() + 9.0), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(11.0), c_muted());
+    }
+    let names: [(u16, &str); 14] = [
+        (btn::A, "A"), (btn::B, "B"), (btn::X, "X"), (btn::Y, "Y"), (btn::LB, "LB"), (btn::RB, "RB"), (btn::BACK, "Back"),
+        (btn::START, "Start"), (btn::UP, "↑"), (btn::DOWN, "↓"), (btn::LEFT, "←"), (btn::RIGHT, "→"), (btn::LTHUMB, "LS"), (btn::RTHUMB, "RS"),
+    ];
+    // The button grid shrinks to the card width instead of running out of it.
+    let cw = ((rect.width() - 262.0) / 7.0).clamp(40.0, 54.0);
+    let fs = if cw < 50.0 { 12.0 } else { 13.0 };
+    for (k, (mask, name)) in names.iter().enumerate() {
+        let (col, row) = ((k % 7) as f32, (k / 7) as f32);
+        let r = egui::Rect::from_min_size(o + Vec2::new(262.0 + col * cw, 8.0 + row * 38.0), Vec2::new(cw - 6.0, 30.0));
+        let on = st.buttons & mask != 0;
+        p.rect_filled(r, 8.0, if on { acc } else { off });
+        p.text(r.center(), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(fs), if on { on_fill(acc) } else { c_muted() });
+    }
 }
 
 fn level_color(level: netq::Level) -> Color32 {
@@ -2140,6 +2353,77 @@ impl GuiApp {
                 self.page = Page::Test;
             }
         });
+        section(ui, |ui| {
+            ui.label(RichText::new("Геймпад").font(bold(16.0)));
+            ui.label(
+                RichText::new("Покажет, как компьютер видит ваш геймпад: кнопки, стики, курки и вибрацию. Пригодится перед удалённой игрой.")
+                    .color(c_muted())
+                    .size(13.0),
+            );
+            if big_button_i(ui, Some(Ico::Pad), "Тест геймпада", c_card_hover(), true) {
+                self.page = Page::Pads;
+            }
+        });
+    }
+
+    /// "Тест геймпада": what XInput sees on this PC, which controller becomes which virtual pad, a vibration check.
+    fn pads_page(&mut self, ui: &mut egui::Ui) {
+        if crumb(ui, "Настройки") {
+            self.page = Page::Settings;
+            return;
+        }
+        page_head(ui, Ico::Pad, "Тест геймпада", "Нажмите кнопки и подвигайте стики: так увидит показывающий");
+        let xi = self.xi.get_or_insert_with(crate::xinput::XInput::load);
+        let Some(xi) = xi.as_ref() else {
+            section(ui, |ui| {
+                warn_line(ui, "Не удалось загрузить XInput — в этой системе геймпады Xbox недоступны.");
+            });
+            return;
+        };
+        let states: Vec<Option<crate::inputproto::PadState>> = (0..4).map(|i| xi.state(i)).collect();
+        let slots = crate::inputlogic::assign_slots([states[0].is_some(), states[1].is_some(), states[2].is_some(), states[3].is_some()]);
+        let mut rumble = None;
+        if states.iter().all(|s| s.is_none()) {
+            section(ui, |ui| {
+                ui.label(RichText::new("Геймпад не найден").font(bold(16.0)));
+                ui.label(
+                    RichText::new("Подключите геймпад (Xbox или любой с поддержкой XInput) и нажмите на нём любую кнопку. Эта страница обновляется сама.")
+                        .color(c_muted())
+                        .size(13.0),
+                );
+            });
+        }
+        for (slot, st) in states.iter().enumerate() {
+            let Some(st) = st else { continue };
+            let virt = slots.iter().position(|x| *x == Some(slot)).map(|v| v + 1);
+            section(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Геймпад {}", slot + 1)).font(bold(16.0)));
+                    if let Some(v) = virt {
+                        ui.label(RichText::new(format!("→ виртуальный геймпад {v} у показывающего")).color(c_muted()));
+                    }
+                });
+                pad_view(ui, st);
+                if ui.button("Проверить вибрацию").clicked() {
+                    rumble = Some(slot);
+                }
+            });
+        }
+        if let Some(slot) = rumble {
+            xi.vibrate(slot, 255, 255);
+            self.rumble = Some((slot, Instant::now()));
+        }
+        section(ui, |ui| {
+            ui.label(
+                RichText::new(
+                    "Геймпады передаются по порядку: первый подключённый становится геймпадом 1 у показывающего, второй — геймпадом 2 и так до четырёх. \
+                     Во время просмотра эту же проверку можно открыть клавишей F2.",
+                )
+                .color(c_muted())
+                .size(13.0),
+            );
+        });
+        ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
 
     fn about_page(&mut self, ui: &mut egui::Ui) {
@@ -2287,7 +2571,9 @@ impl GuiApp {
             ui,
             Ico::Monitor,
             "Показать экран",
-            if live {
+            if self.host.as_ref().is_some_and(|s| s.ctrl.is_some_and(|c| c.active)) {
+                "Зритель управляет вашим компьютером"
+            } else if live {
                 "Ваш экран транслируется"
             } else if self.host.as_ref().is_some_and(|s| s.active()) {
                 "Идёт подключение"
@@ -2301,6 +2587,7 @@ impl GuiApp {
                 ui.label(RichText::new("Что показывать").font(bold(15.0)));
                 self.pick_source(ui);
             });
+            control_card(ui, &mut self.ctl, self.vigem.0, None);
             if let Some(e) = &self.start_error {
                 error_text(ui, e);
             }
@@ -2349,6 +2636,7 @@ impl GuiApp {
                     graph_panel(ui, &s.graph, true);
                 });
             });
+            control_card(ui, &mut self.ctl, self.vigem.0, Some(&mut *s));
             // Switching without stopping: the same cards as at the start.
             let mut picked = None;
             if !self.monitors.is_empty() {

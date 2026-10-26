@@ -1523,6 +1523,48 @@ impl App {
     }
 }
 
+/// Hidden `overlaytest`: draws the bar, the hint line and the F2 panel over a fake frame into a BMP (for screenshots without a connection).
+pub fn overlay_preview(out: &std::path::Path, panel: bool, on: bool) -> std::io::Result<()> {
+    let (ww, wh) = (1280usize, 720usize);
+    let mut buf = vec![0u32; ww * wh];
+    for y in 0..wh {
+        for x in 0..ww {
+            let (r, g, b) = (40 + x * 60 / ww, 60 + y * 80 / wh, 90 + (x + y) * 50 / (ww + wh));
+            buf[y * ww + x] = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+        }
+    }
+    let st = bar::State {
+        level: 0.7,
+        muted: false,
+        has_audio: true,
+        net: Some(0),
+        fullscreen: false,
+        hover: Hit::Outside,
+        opacity: 1.0,
+        time: 1.0,
+        ctl: Some(bar::Ctl { on, allowed: true, pads: 2, captured: on }),
+    };
+    let geom = Bar::with_control(ww as i32, wh as i32, 1, true);
+    bar::draw(&mut buf, ww as i32, wh as i32, &geom, &st);
+    let mut ob = crate::overlay::Buf { px: &mut buf, w: ww as i32, h: wh as i32 };
+    crate::overlay::bar_label(&mut ob, geom.ctl_rect(), 1, "Управление", if on { 0x00_FF_FF_FF } else { 0x00_E8_EA_EE });
+    if on {
+        crate::overlay::hint(&mut ob, ww as i32 / 2, 20, 1, "Управление: мышь захвачена. Выйти — Ctrl+Alt+Shift или удерживайте Esc", Some(0x00_3C_D2_78), 1.0);
+    }
+    if panel {
+        let mut rows = Vec::new();
+        if let Some(p) = crate::xinput::XInput::load() {
+            for slot in 0..4 {
+                if let Some(st) = p.state(slot) {
+                    rows.push(crate::overlay::PadRow { virt: Some(rows.len() + 1), slot, st });
+                }
+            }
+        }
+        crate::overlay::pad_panel(&mut ob, 1, &rows, "Управление включено: геймпад передаётся показывающему.", 1.0);
+    }
+    write_bmp(out, ww as u32, wh as u32, &buf)
+}
+
 /// 32-bit top-down BMP from 0x00RRGGBB pixels.
 pub fn write_bmp(path: &std::path::Path, w: u32, h: u32, px: &[u32]) -> std::io::Result<()> {
     let data_len = w * h * 4;

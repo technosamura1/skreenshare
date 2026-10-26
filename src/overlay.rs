@@ -29,6 +29,7 @@ impl Buf<'_> {
         *p = mix(16) | mix(8) | mix(0);
     }
 
+    #[allow(dead_code)]
     pub fn rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, a: f32) {
         for yy in y.max(0)..(y + h).min(self.h) {
             for xx in x.max(0)..(x + w).min(self.w) {

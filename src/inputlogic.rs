@@ -120,6 +120,7 @@ impl Sender {
         }
     }
 
+    #[allow(dead_code)]
     pub fn pad_count(&self) -> usize {
         self.pads.iter().flatten().count()
     }
@@ -153,6 +154,7 @@ impl Sender {
         }
     }
 
+    #[allow(dead_code)]
     pub fn holds_anything(&self) -> bool {
         !self.keys.is_empty() || self.buttons != 0 || self.pads.iter().flatten().any(|p| *p != PadState::default())
     }
@@ -719,7 +721,7 @@ mod tests {
             let mut r = Receiver::new(ALL);
             let mut log = Log::default();
             let mut now = t;
-            let mut deliver = |s: &mut Sender, now: Instant, r: &mut Receiver, log: &mut Log, i: u32, lossy: bool| {
+            let deliver = |s: &mut Sender, now: Instant, r: &mut Receiver, log: &mut Log, i: u32, lossy: bool| {
                 if let Some(f) = s.poll(now) {
                     if !(lossy && loss & (1 << (i % 6)) != 0) {
                         r.on_frame(now, &wire(&f), log);

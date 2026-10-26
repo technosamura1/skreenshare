@@ -292,6 +292,46 @@ pub fn bar_opacity(idle_ms: u128) -> f32 {
     }
 }
 
+/// What the host's control thread reports (`@CTRL on=1 pad=1 kbm=1 vigem=1 pads=2 active=0 revoked=0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct CtrlStatus {
+    pub on: bool,
+    pub pad: bool,
+    pub kbm: bool,
+    pub vigem: bool,
+    pub pads: u8,
+    /// The viewer is controlling right now (input arrived within the last moments).
+    pub active: bool,
+    /// The owner took control away with the emergency hotkey.
+    pub revoked: bool,
+}
+
+pub fn parse_ctrl(text: &str) -> Option<CtrlStatus> {
+    let mut c = CtrlStatus::default();
+    let mut seen = 0;
+    for w in text.split_whitespace() {
+        let Some((k, v)) = w.split_once('=') else { continue };
+        let b = v == "1";
+        match k {
+            "on" => c.on = b,
+            "pad" => c.pad = b,
+            "kbm" => c.kbm = b,
+            "vigem" => c.vigem = b,
+            "pads" => c.pads = v.parse().ok()?,
+            "active" => c.active = b,
+            "revoked" => c.revoked = b,
+            _ => continue,
+        }
+        seen += 1;
+    }
+    (seen >= 5).then_some(c)
+}
+
+/// The line the GUI sends to the host process when the owner changes the switches.
+pub fn control_line(on: bool, pad: bool, kbm: bool) -> String {
+    format!("CONTROL on={} pad={} kbm={}", on as u8, pad as u8, kbm as u8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +465,22 @@ mod tests {
         assert!((mid - 0.5).abs() < 0.01);
         assert_eq!(bar_opacity(BAR_SHOW_MS + BAR_FADE_MS), 0.0);
         assert_eq!(bar_opacity(60_000), 0.0);
+    }
+
+    #[test]
+    fn ctrl_status_parses_and_rejects_junk() {
+        let c = parse_ctrl("on=1 pad=1 kbm=0 vigem=1 pads=2 active=1 revoked=0").unwrap();
+        assert!(c.on && c.pad && !c.kbm && c.vigem && c.active && !c.revoked);
+        assert_eq!(c.pads, 2);
+        assert!(parse_ctrl("hello").is_none());
+        assert!(parse_ctrl("on=1 pad=1").is_none());
+        assert!(parse_ctrl("on=1 pad=1 kbm=1 vigem=0 pads=x").is_none());
+        assert!(parse_ctrl("on=0 pad=1 kbm=1 vigem=0 pads=0 active=0 revoked=1 future=7").unwrap().revoked);
+    }
+
+    #[test]
+    fn control_line_matches_what_the_host_reads() {
+        assert_eq!(control_line(true, true, false), "CONTROL on=1 pad=1 kbm=0");
+        assert_eq!(control_line(false, false, false), "CONTROL on=0 pad=0 kbm=0");
     }
 }

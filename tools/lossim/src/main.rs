@@ -173,6 +173,9 @@ fn avg(v: &[Out]) -> Out {
 }
 
 #[cfg(test)]
+mod inputloop;
+
+#[cfg(test)]
 mod simtests {
     use super::*;
     #[test]

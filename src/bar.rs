@@ -393,6 +393,9 @@ pub fn draw(buf: &mut [u32], w: i32, h: i32, b: &Bar, st: &State) {
         gamepad_icon(&mut c, r.0 + 10 * s, r.1 + (r.3 - 16 * s) / 2, s, col);
         let count = format!("{}", ct.pads.min(9));
         c.digits(r.0 + 10 * s + 30 * s, r.1 + (r.3 - 10 * s) / 2, 2 * s, &count, col, 1.0);
+        if ct.captured {
+            c.disc(r.0 + r.2 - 10 * s, r.1 + r.3 - 10 * s, 4.0 * s as f32, GREEN, 1.0); // the mouse is captured
+        }
         if waiting {
             let q = 5.0 * s as f32;
             c.disc(r.0 + r.2 - 10 * s, r.1 + 10 * s, q, YELLOW, 0.5 + 0.5 * (st.time * 4.0).sin().abs());
