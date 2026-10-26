@@ -1139,6 +1139,8 @@ impl App {
         if info.kbm {
             let t = if info.pad && self.input.pad_count() > 0 {
                 "Геймпад уже передаётся. Нажмите на картинку, чтобы управлять мышью и клавиатурой"
+            } else if !info.pad && self.input.pad_count() > 0 {
+                "Нажмите на картинку, чтобы управлять мышью и клавиатурой (геймпад не разрешён)"
             } else {
                 "Нажмите на картинку, чтобы управлять мышью и клавиатурой"
             };
@@ -1414,14 +1416,9 @@ impl ApplicationHandler<UserEv> for App {
         if self.captured && self.esc_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(1)) {
             self.set_capture(false);
         }
-        if self.overlay_active() {
-            el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + BAR_TICK));
-            self.redraw();
-            return;
-        }
-        // A still picture sends no frames, so the bar needs its own clock. While it is on screen (or has to be
-        // wiped once more after fading out) tick at ~30 fps; otherwise sleep until something happens.
-        if self.bar_opacity() > 0.0 || self.bar_drawn {
+        // The overlay (hint, F2 panel, captured mouse) and the bar animate on the clock only: ResumeTimeReached in
+        // `new_events` redraws, so this must not ask for a redraw itself (that made a loop that never slept).
+        if crate::guilogic::viewer_ticks(self.overlay_active(), self.bar_opacity() > 0.0, self.bar_drawn) {
             el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + BAR_TICK));
         } else {
             el.set_control_flow(ControlFlow::Wait);
@@ -1433,7 +1430,14 @@ impl App {
     fn draw(&mut self) {
         let t0 = Instant::now();
         let ctl = if self.ctl_available() {
-            Some((self.input.want.load(Ordering::Relaxed), self.input.host_info().is_some_and(|i| i.allowed), self.input.pad_count()))
+            let hi = self.input.host_info();
+            Some((
+                self.input.want.load(Ordering::Relaxed),
+                hi.is_some_and(|i| i.allowed),
+                self.input.pad_count(),
+                hi.is_some_and(|i| i.pad),
+                hi.is_some_and(|i| i.kbm),
+            ))
         } else {
             None
         };
@@ -1483,17 +1487,18 @@ impl App {
                 hover: self.hover,
                 opacity,
                 time: self.started.elapsed().as_secs_f32(),
-                ctl: ctl.map(|(on, allowed, pads)| bar::Ctl { on, allowed, pads: pads as u8, captured: self.captured }),
+                ctl: ctl.map(|(on, allowed, pads, pad_ok, kbm_ok)| bar::Ctl { on, allowed, pads: pads as u8, captured: self.captured, pad_ok, kbm_ok }),
             };
             let geom = Bar::with_control(ww as i32, wh as i32, sc, ctl.is_some());
             bar::draw(&mut buf, ww as i32, wh as i32, &geom, &st);
             if geom.ctl_w > 90 * sc {
-                if let Some((on, allowed, _)) = ctl {
+                if let Some((on, allowed, _, pad_ok, kbm_ok)) = ctl {
                     let mut ob = crate::overlay::Buf { px: &mut buf, w: ww as i32, h: wh as i32 };
                     let col = if on && allowed { 0x00_FF_FF_FF } else if on { 0x00_F0_B4_3C } else { 0x00_E8_EA_EE };
                     // faded with the bar through the label's colour: simple, the label is small
                     if opacity > 0.5 {
-                        crate::overlay::bar_label(&mut ob, geom.ctl_rect(), sc, "Управление", col);
+                        let label = bar::Ctl { on, allowed, pads: 0, captured: false, pad_ok, kbm_ok }.label();
+                        crate::overlay::bar_label(&mut ob, geom.ctl_rect(), sc, label, col);
                     }
                 }
             }
@@ -1541,7 +1546,11 @@ impl App {
 
 /// Hidden `overlaytest`: draws the bar, the hint line and the F2 panel over a fake frame into a BMP (for screenshots without a connection).
 pub fn overlay_preview(out: &std::path::Path, panel: bool, on: bool) -> std::io::Result<()> {
-    let (ww, wh) = (1280usize, 720usize);
+    let ww = std::env::var("OVERLAY_W").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1280).clamp(320, 3840);
+    let wh = 720usize;
+    // OVERLAY_DEV=pad|kbm|none: what the host allows (default both).
+    let dev = std::env::var("OVERLAY_DEV").unwrap_or_default();
+    let (pad_ok, kbm_ok) = (dev != "kbm" && dev != "none", dev != "pad" && dev != "none");
     let mut buf = vec![0u32; ww * wh];
     for y in 0..wh {
         for x in 0..ww {
@@ -1558,12 +1567,18 @@ pub fn overlay_preview(out: &std::path::Path, panel: bool, on: bool) -> std::io:
         hover: Hit::Outside,
         opacity: 1.0,
         time: 1.0,
-        ctl: Some(bar::Ctl { on, allowed: true, pads: 2, captured: on }),
+        ctl: Some(bar::Ctl { on, allowed: true, pads: 2, captured: on && kbm_ok, pad_ok, kbm_ok }),
     };
     let geom = Bar::with_control(ww as i32, wh as i32, 1, true);
     bar::draw(&mut buf, ww as i32, wh as i32, &geom, &st);
     let mut ob = crate::overlay::Buf { px: &mut buf, w: ww as i32, h: wh as i32 };
-    crate::overlay::bar_label(&mut ob, geom.ctl_rect(), 1, "Управление", if on { 0x00_FF_FF_FF } else { 0x00_E8_EA_EE });
+    let label = match st.ctl {
+        Some(c) => c.label(),
+        None => "Управление",
+    };
+    if geom.ctl_w > 90 {
+        crate::overlay::bar_label(&mut ob, geom.ctl_rect(), 1, label, if on { 0x00_FF_FF_FF } else { 0x00_E8_EA_EE });
+    }
     if on {
         crate::overlay::hint(&mut ob, ww as i32 / 2, 20, 1, "Управление: мышь захвачена. Выйти — Ctrl+Alt+Shift или удерживайте Esc", Some(0x00_3C_D2_78), 1.0);
     }

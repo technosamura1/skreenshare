@@ -487,6 +487,22 @@ pub struct RumbleTx {
     last: [Option<Instant>; MAX_PADS],
 }
 
+/// How often the viewer's input thread looks around: every millisecond only while it sends something (or says
+/// goodbye); otherwise 10 ms, because nothing can be pressed and the gamepad list is only for the bar.
+pub fn view_pause(sending: bool) -> Duration {
+    if sending { Duration::from_millis(1) } else { Duration::from_millis(10) }
+}
+
+/// The gamepads are read every 4 ms while they go to the host (250 Hz), every 50 ms otherwise.
+pub fn pad_poll_gap(sending: bool) -> Duration {
+    if sending { Duration::from_millis(4) } else { Duration::from_millis(50) }
+}
+
+/// The host's input thread: 8 ms while control is allowed or something is still held, 25 ms when it is off.
+pub fn host_pause(allowed: bool, holds: bool) -> Duration {
+    if allowed || holds { Duration::from_millis(8) } else { Duration::from_millis(25) }
+}
+
 pub const RUMBLE_REFRESH: Duration = Duration::from_millis(200);
 pub const RUMBLE_REPEAT_GAP: Duration = Duration::from_millis(15);
 
@@ -1015,6 +1031,82 @@ mod tests {
         r.set_perms(Perms { allowed: true, pad: false, kbm: true }, &mut log);
         assert_eq!(log.keys, vec![0x11]);
         assert!(!log.plugged[0]);
+    }
+
+    #[test]
+    fn revoking_only_mouse_and_keyboard_keeps_the_pad_and_ignores_their_packets() {
+        let t = t0();
+        let mut s = Sender::new(0);
+        let mut r = Receiver::new(ALL);
+        let mut log = Log::default();
+        s.poll(t);
+        s.key(0x11, true, false);
+        s.mouse_button(1, true);
+        s.set_pad(0, Some(PadState { buttons: btn::A, ..Default::default() }));
+        let f = s.poll(t + ms(5)).unwrap();
+        r.on_frame(t + ms(5), &wire(&f), &mut log);
+        assert_eq!(log.keys, vec![0x11]);
+        assert!(log.plugged[0] && log.buttons == 2);
+        // The owner unticks "Мышь и клавиатура": held keys and buttons are let go on the spot, the pad stays.
+        r.set_perms(Perms { allowed: true, pad: true, kbm: false }, &mut log);
+        assert!(log.keys.is_empty());
+        assert_eq!(log.buttons, 0);
+        assert!(log.plugged[0], "the pad is not touched");
+        assert_eq!(log.pad[0].buttons, btn::A);
+        // The viewer keeps typing and moving: nothing is injected, the pad still follows.
+        s.key(0x12, true, false);
+        s.mouse_move(40, 40);
+        s.set_pad(0, Some(PadState { buttons: btn::B, ..Default::default() }));
+        let f = s.poll(t + ms(120)).unwrap();
+        r.on_frame(t + ms(120), &wire(&f), &mut log);
+        assert!(log.keys.is_empty());
+        assert_eq!(log.mouse, (0, 0));
+        assert_eq!(log.pad[0].buttons, btn::B);
+        // Ticked again: what is held applies from the next snapshot, and no jump of the mouse.
+        r.set_perms(ALL, &mut log);
+        let f = s.poll(t + ms(230)).unwrap();
+        r.on_frame(t + ms(230), &wire(&f), &mut log);
+        assert_eq!(log.keys, vec![0x11, 0x12]);
+        assert_eq!(log.mouse, (0, 0));
+    }
+
+    #[test]
+    fn pad_packets_are_ignored_while_the_pad_is_off_and_keys_still_work() {
+        let t = t0();
+        let mut s = Sender::new(0);
+        let mut r = Receiver::new(Perms { allowed: true, pad: false, kbm: true });
+        let mut log = Log::default();
+        s.poll(t);
+        s.set_pad(0, Some(PadState { buttons: btn::A, ..Default::default() }));
+        s.set_pad(1, Some(PadState::default()));
+        s.key(0x1E, true, false);
+        let f = s.poll(t + ms(5)).unwrap();
+        r.on_frame(t + ms(5), &wire(&f), &mut log);
+        assert!(!log.plugged[0] && !log.plugged[1], "no virtual pad appears");
+        assert!(!log.ev.iter().any(|e| e.starts_with("plug")));
+        assert_eq!(log.keys, vec![0x1E]);
+        // Switched on later: the pad appears from the next packet; switched off again: unplugged at once.
+        r.set_perms(ALL, &mut log);
+        let f = s.poll(t + ms(120)).unwrap();
+        r.on_frame(t + ms(120), &wire(&f), &mut log);
+        assert!(log.plugged[0] && log.plugged[1]);
+        r.set_perms(Perms { allowed: true, pad: false, kbm: true }, &mut log);
+        assert!(!log.plugged[0] && !log.plugged[1]);
+        assert_eq!(log.keys, vec![0x1E], "the keyboard is untouched");
+        assert_eq!(r.plugged_count(), 0);
+    }
+
+    #[test]
+    fn idle_threads_sleep_longer_and_busy_ones_keep_their_pace() {
+        assert_eq!(view_pause(true), Duration::from_millis(1));
+        assert_eq!(pad_poll_gap(true), Duration::from_millis(4));
+        assert!(view_pause(false) >= Duration::from_millis(10));
+        assert!(pad_poll_gap(false) >= Duration::from_millis(50));
+        assert_eq!(host_pause(true, false), Duration::from_millis(8));
+        assert_eq!(host_pause(false, true), Duration::from_millis(8), "a held key is let go promptly");
+        assert!(host_pause(false, false) > Duration::from_millis(8));
+        // the idle pace still lets the host see a peer's first packet within a few frames
+        assert!(host_pause(false, false) < Duration::from_millis(50));
     }
 
     #[test]

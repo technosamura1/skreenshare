@@ -171,6 +171,28 @@ pub struct Ctl {
     pub pads: u8,
     /// The mouse is captured.
     pub captured: bool,
+    /// What the host's owner allows (only meaningful while `allowed`): the gamepad, the mouse with the keyboard.
+    pub pad_ok: bool,
+    pub kbm_ok: bool,
+}
+
+impl Ctl {
+    /// Text on the wide button: says which devices go to the host when only one (or none) is allowed.
+    pub fn label(&self) -> &'static str {
+        match (self.allowed, self.pad_ok, self.kbm_ok) {
+            (true, true, false) => "Геймпад",
+            (true, false, true) => "Мышь+клав.",
+            (true, false, false) => "Нет доступа",
+            _ => "Управление",
+        }
+    }
+    /// A device the host switched off (shown struck through).
+    fn pad_off(&self) -> bool {
+        self.allowed && !self.pad_ok
+    }
+    fn kbm_off(&self) -> bool {
+        self.allowed && !self.kbm_ok
+    }
 }
 
 const BG: u32 = 0x00_0D_11_18;
@@ -303,6 +325,14 @@ impl Cv<'_> {
 }
 
 /// A small gamepad: body, d-pad, four buttons. `x`,`y`: top-left of a 26x16 (unit `s`) box.
+/// A thin diagonal bar from the bottom-left to the top-right of the box: "this one is off".
+fn strike(c: &mut Cv, x: i32, y: i32, w: i32, h: i32, s: i32, col: u32) {
+    let n = (w.max(h) / s.max(1)).max(2);
+    for i in 0..n {
+        c.rect(x + i * w / n, y + h - (i + 1) * h / n, (2 * s).max(2), (2 * s).max(2), col, 0.95);
+    }
+}
+
 fn gamepad_icon(c: &mut Cv, x: i32, y: i32, s: i32, col: u32) {
     c.round(x, y + 2 * s, 26 * s, 12 * s, 6 * s, col, 1.0);
     // grips
@@ -400,10 +430,25 @@ pub fn draw(buf: &mut [u32], w: i32, h: i32, b: &Bar, st: &State) {
             c.outline(r.0, r.1, r.2, r.3, 12 * s, s.max(1), FG, 0.20);
         }
         let col = if ct.on { 0x00_FF_FF_FF } else if ct.pads > 0 { FG } else { DIM };
-        gamepad_icon(&mut c, r.0 + 10 * s, r.1 + (r.3 - 16 * s) / 2, s, col);
+        let pcol = if ct.pad_off() { DIM } else { col };
+        let (px, py) = (r.0 + 10 * s, r.1 + (r.3 - 16 * s) / 2);
+        gamepad_icon(&mut c, px, py, s, pcol);
         let count = format!("{}", ct.pads.min(9));
-        c.digits(r.0 + 10 * s + 30 * s, r.1 + (r.3 - 10 * s) / 2, 2 * s, &count, col, 1.0);
-        if ct.captured {
+        c.digits(px + 30 * s, r.1 + (r.3 - 10 * s) / 2, 2 * s, &count, pcol, 1.0);
+        if ct.pad_off() {
+            strike(&mut c, px - 2 * s, py, 28 * s, 16 * s, s, RED);
+        }
+        let compact = b.ctl_w <= CTL_W_COMPACT;
+        if compact {
+            // No room for the label: a small mouse says whether mouse and keyboard are allowed (green = captured).
+            let (mx, my) = (r.0 + r.2 - 22 * s, r.1 + (r.3 - 16 * s) / 2);
+            let mcol = if ct.kbm_off() { DIM } else if ct.captured { GREEN } else { col };
+            c.outline(mx, my, 10 * s, 16 * s, 5 * s, s.max(1), mcol, 1.0);
+            c.rect(mx + 5 * s - s / 2, my + s, s.max(1), 6 * s, mcol, 1.0);
+            if ct.kbm_off() {
+                strike(&mut c, mx - 2 * s, my, 14 * s, 16 * s, s, RED);
+            }
+        } else if ct.captured {
             c.disc(r.0 + r.2 - 10 * s, r.1 + r.3 - 10 * s, 4.0 * s as f32, GREEN, 1.0); // the mouse is captured
         }
         if waiting {
@@ -515,13 +560,47 @@ mod tests {
     }
 
     #[test]
+    fn control_button_says_which_devices_are_allowed() {
+        let c = |allowed, pad_ok, kbm_ok| Ctl { on: true, allowed, pads: 1, captured: false, pad_ok, kbm_ok };
+        assert_eq!(c(true, true, true).label(), "Управление");
+        assert_eq!(c(true, true, false).label(), "Геймпад");
+        assert_eq!(c(true, false, true).label(), "Мышь+клав.");
+        assert_eq!(c(true, false, false).label(), "Нет доступа");
+        // not allowed at all (the host says nothing about devices yet): the plain label
+        assert_eq!(c(false, false, false).label(), "Управление");
+    }
+
+    #[test]
+    fn a_device_the_host_switched_off_is_drawn_differently() {
+        for ww in [900, 640] {
+            let (w, h) = (ww, 300);
+            let b = Bar::with_control(w, h, 1, true);
+            let base = vec![0x00_20_20_20u32; (w * h) as usize];
+            let render = |pad_ok, kbm_ok| {
+                let mut buf = base.clone();
+                let ctl = Ctl { on: true, allowed: true, pads: 1, captured: false, pad_ok, kbm_ok };
+                draw(&mut buf, w, h, &b, &State { ctl: Some(ctl), ..st() });
+                buf
+            };
+            let both = render(true, true);
+            let no_pad = render(false, true);
+            let no_kbm = render(true, false);
+            assert_ne!(both, no_pad, "pad off shows (width {ww})");
+            if b.ctl_w <= CTL_W_COMPACT {
+                assert_ne!(both, no_kbm, "the compact bar has a mouse glyph that changes");
+            }
+            assert_ne!(no_pad, no_kbm);
+        }
+    }
+
+    #[test]
     fn control_button_draws_in_every_state() {
         let (w, h) = (900, 300);
         let b = Bar::with_control(w, h, 1, true);
         let base = vec![0x00_20_20_20u32; (w * h) as usize];
         for (on, allowed, pads, captured) in [(false, false, 0, false), (false, true, 2, false), (true, false, 1, false), (true, true, 3, true)] {
             let mut buf = base.clone();
-            draw(&mut buf, w, h, &b, &State { ctl: Some(Ctl { on, allowed, pads, captured }), ..st() });
+            draw(&mut buf, w, h, &b, &State { ctl: Some(Ctl { on, allowed, pads, captured, pad_ok: true, kbm_ok: true }), ..st() });
             let r = b.ctl_rect();
             let mut changed = false;
             for y in r.1..r.1 + r.3 {

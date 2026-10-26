@@ -3,7 +3,7 @@
 // go of everything) are in inputlogic.rs; this file is the Windows glue. NOT tested on real Windows by the author.
 //
 // Input is injected globally (like Parsec does), not into one window: whatever has focus on the host gets it.
-use crate::inputlogic::{Perms, Receiver, RumbleTx, Sink};
+use crate::inputlogic::{self, Perms, Receiver, RumbleTx, Sink};
 use crate::inputproto::{self, CtrlInfo, PadState, MAX_PADS};
 use crate::net;
 use std::net::{SocketAddr, UdpSocket};
@@ -285,12 +285,13 @@ impl InputHost {
                         }
                     }
                     // Status for the GUI: on change, and once a second so a late reader catches up.
-                    let (info, active) = {
+                    let (info, active, holds) = {
                         let g = me.inner.lock().unwrap();
                         let p = g.rx.perms();
                         (
                             CtrlInfo { allowed: p.allowed, pad: p.pad, kbm: p.kbm, vigem: me.vigem.load(Ordering::Relaxed), pads: g.rx.plugged_count() as u8 },
                             g.rx.controlling(now),
+                            g.rx.holds_anything(),
                         )
                     };
                     let line = format!(
@@ -308,7 +309,7 @@ impl InputHost {
                         last_ui = line;
                         last_ui_t = Instant::now();
                     }
-                    std::thread::sleep(Duration::from_millis(8));
+                    std::thread::sleep(inputlogic::host_pause(info.allowed, holds));
                 }
                 me.release_all();
             })

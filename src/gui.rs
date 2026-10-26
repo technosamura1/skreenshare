@@ -1235,6 +1235,16 @@ impl eframe::App for GuiApp {
                 *sent_c = true;
             }
         }
+        let test_over = self.test.as_ref().is_some_and(|(h, c, _, _)| {
+            let half = |s: &Session| lg::TestHalf { ended: s.ended, connected: s.connected, error: s.error.is_some() };
+            lg::test_finished(half(h), half(c))
+        });
+        if test_over {
+            // Stopped from the viewer's bar, by closing its window or from our own button: one click, everything
+            // back to the start (button, preview and the two status lines go with the sessions).
+            self.test = None;
+            ui.ctx().request_repaint();
+        }
         self.play_cues();
         if self.host.as_ref().is_some_and(|s| s.ended) {
             self.ctl.allow = false;
@@ -1339,15 +1349,16 @@ impl eframe::App for GuiApp {
 // ---------------------------------------------------------------- sidebar and status bar
 
 /// One row of the sidebar: icon, label, a soft accent plate and a bar on the left when selected.
-fn nav_item(ui: &mut egui::Ui, ico: Ico, label: &str, selected: bool, enabled: bool, live: Option<Color32>) -> bool {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+/// A sidebar item. Always clickable: what is running keeps running while another tab is open.
+fn nav_item(ui: &mut egui::Ui, ico: Ico, label: &str, selected: bool, live: Option<Color32>) -> bool {
+    let sense = Sense::click();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), sense);
-    let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
-    let t = if enabled { hover_t(ui.ctx(), &resp) } else { 0.0 };
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let t = hover_t(ui.ctx(), &resp);
     let st = ui.ctx().animate_bool_with_time(resp.id.with("nav"), selected, anim_secs(0.18));
     let a = c_accent();
     let p = ui.painter();
-    let dim = if enabled { 1.0 } else { 0.45 };
+    let dim = 1.0;
     if t > 0.0 && st < 1.0 {
         let h = if pal().light { Color32::from_black_alpha(16) } else { Color32::from_white_alpha(13) };
         p.rect_filled(rect, 10.0, h.gamma_multiply(t * (1.0 - st)));
@@ -1388,18 +1399,24 @@ impl GuiApp {
             });
         });
         ui.add_space(24.0);
-        let host_on = self.host.as_ref().is_some_and(|s| s.active());
-        let join_on = self.join.as_ref().is_some_and(|s| s.active());
-        let test_on = self.test.is_some();
+        let test_live = self.test.as_ref().map(|(h, c, _, _)| {
+            if h.error.is_some() || c.error.is_some() {
+                c_red()
+            } else if h.connected && c.connected {
+                c_green()
+            } else {
+                c_accent()
+            }
+        });
         let dot = |s: &Option<Session>| s.as_ref().filter(|s| s.active()).map(|s| if s.connected { c_green() } else { c_accent() });
         let host_live = dot(&self.host);
         let join_live = dot(&self.join);
-        if nav_item(ui, Ico::Monitor, "Показать", self.page == Page::Host, !(join_on || test_on), host_live) && self.page != Page::Host {
+        if nav_item(ui, Ico::Monitor, "Показать", self.page == Page::Host, host_live) && self.page != Page::Host {
             self.windows = wincap::list_windows();
             self.thumbs.last_list = Instant::now();
             self.page = Page::Host;
         }
-        if nav_item(ui, Ico::Eye, "Смотреть", self.page == Page::Join, !(host_on || test_on), join_live) {
+        if nav_item(ui, Ico::Eye, "Смотреть", self.page == Page::Join, join_live) {
             self.page = Page::Join;
         }
         // Remote control lives here, under the two main items: the switch and a status line, the rest on its own page.
@@ -1413,10 +1430,10 @@ impl GuiApp {
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
-            if nav_item(ui, Ico::Info, "О программе", self.page == Page::About, true, None) {
+            if nav_item(ui, Ico::Info, "О программе", self.page == Page::About, None) {
                 self.page = Page::About;
             }
-            if nav_item(ui, Ico::Gear, "Настройки", matches!(self.page, Page::Settings | Page::Test | Page::Pads), true, None) {
+            if nav_item(ui, Ico::Gear, "Настройки", matches!(self.page, Page::Settings | Page::Test | Page::Pads), test_live) {
                 self.page = Page::Settings;
             }
         });
@@ -1452,14 +1469,23 @@ impl GuiApp {
                     ui.label(RichText::new("Управление").font(bold(14.5)));
                 });
                 ui.checkbox(&mut ctl.allow, "Разрешить зрителю");
-                let what = match (ctl.allow, ctl.pad, ctl.kbm) {
-                    (false, _, _) => "Сейчас выключено",
-                    (true, true, true) => "Геймпад, мышь и клавиатура",
-                    (true, true, false) => "Только геймпад",
-                    (true, false, true) => "Только мышь и клавиатура",
-                    (true, false, false) => "Ничего не выбрано",
-                };
-                ui.label(RichText::new(what).color(c_muted()).size(12.5));
+                // The two devices can be allowed one by one; both are greyed out while the main switch is off.
+                ui.add_enabled_ui(ctl.allow, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.checkbox(&mut ctl.pad, "Геймпад");
+                            ui.checkbox(&mut ctl.kbm, "Мышь и клавиатура");
+                        });
+                    });
+                });
+                if !ctl.allow {
+                    ui.label(RichText::new("Сейчас выключено").color(c_muted()).size(12.5));
+                } else if !ctl.pad && !ctl.kbm {
+                    ui.label(RichText::new("Ничего не выбрано").color(c_yellow()).size(12.5));
+                }
                 if st.is_some_and(|c| c.active) && ctl.allow {
                     let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(150.0), 22.0), Sense::hover());
                     ui.painter().rect_filled(r, 11.0, c_red().gamma_multiply(0.22));
@@ -2805,7 +2831,76 @@ impl GuiApp {
         }
     }
 
+    /// A tab that cannot start its own session right now: says what is running (its state) and offers to open it
+    /// or stop it. Nothing is stopped by merely looking at the tab.
+    fn busy_notice(&mut self, ui: &mut egui::Ui, what: lg::Occupied) {
+        let state = |s: &Session| -> (Color32, String) {
+            if let Some(e) = &s.error {
+                (c_red(), lg::friendly_error(e).0.to_string())
+            } else if s.connected && !s.stats.is_empty() {
+                match &s.net {
+                    Some((l, t, _)) => (level_color(*l), t.clone()),
+                    None => (c_green(), "работает".to_string()),
+                }
+            } else {
+                (c_accent(), lg::conn_step(s.is_host, &s.status, s.code.is_some(), s.connected, !s.stats.is_empty()).label().to_string())
+            }
+        };
+        let (color, text) = match what {
+            lg::Occupied::Host => self.host.as_ref().map(state),
+            lg::Occupied::Join => self.join.as_ref().map(state),
+            lg::Occupied::Test => self.test.as_ref().map(|(h, _, _, _)| state(h)),
+        }
+        .unwrap_or((c_muted(), String::new()));
+        section(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                ui.painter().circle_filled(r.center(), 6.0, color);
+                ui.label(RichText::new(what.title()).font(bold(17.0)));
+            });
+            if !text.is_empty() {
+                ui.label(RichText::new(text).color(color));
+            }
+            ui.label(RichText::new("Он продолжает работать в фоне. Чтобы начать другое, сначала остановите его.").color(c_muted()).size(13.0));
+        });
+        if big_button_i(ui, Some(Ico::Play), what.open_text(), c_accent(), true) {
+            self.page = match what {
+                lg::Occupied::Host => Page::Host,
+                lg::Occupied::Join => Page::Join,
+                lg::Occupied::Test => Page::Test,
+            };
+        }
+        if big_button_i(ui, Some(Ico::Stop), what.stop_text(), c_red(), true) {
+            match what {
+                lg::Occupied::Host => {
+                    self.host = None;
+                    self.ctl.allow = false;
+                }
+                lg::Occupied::Join => self.join = None,
+                lg::Occupied::Test => self.test = None,
+            }
+        }
+    }
+
+    fn tab_busy(&self, tab: lg::Tab) -> Option<lg::Occupied> {
+        let (h, j) = (self.host.as_ref().is_some_and(|s| s.active()), self.join.as_ref().is_some_and(|s| s.active()));
+        let own = match tab {
+            lg::Tab::Host => h,
+            lg::Tab::Join => j,
+        };
+        if own {
+            None
+        } else {
+            lg::tab_busy(tab, h, j, self.test.is_some())
+        }
+    }
+
     fn host_page(&mut self, ui: &mut egui::Ui) {
+        if let Some(b) = self.tab_busy(lg::Tab::Host) {
+            page_head(ui, Ico::Monitor, "Показать экран", "Сейчас занято другим");
+            self.busy_notice(ui, b);
+            return;
+        }
         let live = self.host.as_ref().is_some_and(|s| s.connected && s.active());
         page_head(
             ui,
@@ -2994,6 +3089,11 @@ impl GuiApp {
     }
 
     fn join_page(&mut self, ui: &mut egui::Ui) {
+        if let Some(b) = self.tab_busy(lg::Tab::Join) {
+            page_head(ui, Ico::Eye, "Смотреть", "Сейчас занято другим");
+            self.busy_notice(ui, b);
+            return;
+        }
         let live = self.join.as_ref().is_some_and(|s| s.connected && s.active());
         page_head(ui, Ico::Eye, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Нужен код от показывающего: он нажимает «Показать экран» и присылает код" });
 

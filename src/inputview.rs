@@ -2,7 +2,7 @@
 // them to the host in small, numbered packets (inputlogic::Sender); applies the host's force feedback to the
 // viewer's pad. Runs its own high-priority thread; the window thread only hands over events.
 // NOT tested with real hardware by the author.
-use crate::inputlogic::{assign_slots, RumbleRx, Sender};
+use crate::inputlogic::{self, assign_slots, RumbleRx, Sender};
 use crate::inputproto::{self, CtrlInfo, PadState, MAX_PADS};
 use crate::net;
 use crate::xinput::XInput;
@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 
 /// How long the host's PT_CTRL stays valid (it sends one every second).
 const CTRL_TTL: Duration = Duration::from_secs(4);
-/// Gamepads are read this often (4 ms = 250 Hz); packets go out only on change plus the 100 ms refresh.
-const PAD_POLL: Duration = Duration::from_millis(4);
+/// A pad plugged in later is found within RESCAN. (Reading pace: inputlogic::pad_poll_gap.) Packets go out only on change plus the 100 ms refresh.
 /// A pad plugged in later is found within this time (asking for missing pads is slow in XInput).
 const RESCAN: Duration = Duration::from_millis(1000);
 
@@ -144,7 +143,8 @@ impl ViewInput {
                     let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
                 }
                 let mut out = Vec::with_capacity(512);
-                let mut last_poll = Instant::now() - PAD_POLL;
+                let mut last_poll = Instant::now() - Duration::from_secs(1);
+                let mut busy = false; // sending, or saying goodbye
                 let mut last_scan = Instant::now() - RESCAN;
                 let mut known = [false; MAX_PADS];
                 let mut was_active = false;
@@ -153,7 +153,7 @@ impl ViewInput {
                     let now = Instant::now();
                     // 1. gamepads
                     if let Some(xi) = &me.xi {
-                        if now.duration_since(last_poll) >= PAD_POLL {
+                        if now.duration_since(last_poll) >= inputlogic::pad_poll_gap(busy) {
                             last_poll = now;
                             let scan = now.duration_since(last_scan) >= RESCAN;
                             if scan {
@@ -189,6 +189,7 @@ impl ViewInput {
                     was_active = active;
                     // 3. send
                     let sending = active || linger_until.is_some_and(|t| now < t);
+                    busy = sending;
                     if sending {
                         let f = me.sender.lock().unwrap().poll(now);
                         if let Some(f) = f {
@@ -201,7 +202,7 @@ impl ViewInput {
                     for i in me.rumble.lock().unwrap().tick(now) {
                         me.vibrate_virtual(i, 0, 0);
                     }
-                    std::thread::sleep(Duration::from_millis(1));
+                    std::thread::sleep(inputlogic::view_pause(busy));
                 }
                 me.sender.lock().unwrap().release_all(true);
                 for i in me.rumble.lock().unwrap().stop_all() {

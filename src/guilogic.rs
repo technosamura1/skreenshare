@@ -381,6 +381,85 @@ pub fn control_line(on: bool, pad: bool, kbm: bool) -> String {
     format!("CONTROL on={} pad={} kbm={}", on as u8, pad as u8, kbm as u8)
 }
 
+/// The viewer window wakes itself on a ~30 fps clock only while something on it animates: an overlay line or
+/// panel, the bar fading, or the bar still to be wiped once more. Otherwise it sleeps until an event.
+pub fn viewer_ticks(overlay: bool, bar_visible: bool, bar_to_wipe: bool) -> bool {
+    overlay || bar_visible || bar_to_wipe
+}
+
+/// The two tabs that start a session of their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Host,
+    Join,
+}
+
+/// What is running that stands in the way of starting something on a tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Occupied {
+    Host,
+    Join,
+    Test,
+}
+
+impl Occupied {
+    pub fn title(self) -> &'static str {
+        match self {
+            Occupied::Host => "Сейчас идёт показ вашего экрана",
+            Occupied::Join => "Сейчас идёт просмотр",
+            Occupied::Test => "Сейчас идёт проверка на этом ПК",
+        }
+    }
+    /// "перейти к ..." / "остановить ..." button texts.
+    pub fn open_text(self) -> &'static str {
+        match self {
+            Occupied::Host => "Перейти к показу",
+            Occupied::Join => "Перейти к просмотру",
+            Occupied::Test => "Перейти к проверке",
+        }
+    }
+    pub fn stop_text(self) -> &'static str {
+        match self {
+            Occupied::Host => "Остановить показ",
+            Occupied::Join => "Остановить просмотр",
+            Occupied::Test => "Остановить проверку",
+        }
+    }
+}
+
+/// The sidebar items are always clickable and every session keeps running in the background. A tab whose action
+/// cannot start right now (one session at a time: showing, watching or the self-test) still opens, and says what
+/// is running instead of its form. None: the tab shows its own page.
+pub fn tab_busy(tab: Tab, host_on: bool, join_on: bool, test_on: bool) -> Option<Occupied> {
+    if test_on {
+        return Some(Occupied::Test);
+    }
+    match tab {
+        Tab::Host if join_on => Some(Occupied::Join),
+        Tab::Join if host_on => Some(Occupied::Host),
+        _ => None,
+    }
+}
+
+/// One half of the self-test as the window sees it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TestHalf {
+    pub ended: bool,
+    pub connected: bool,
+    pub error: bool,
+}
+
+/// The self-test is over for good and the page goes back to "Запустить проверку" by itself: one half was stopped
+/// (the red button on the viewer's bar, its window closed, the sharing side ended) after the two had been
+/// connected, and neither half reports an error (an error stays on screen to be read). Without this the main
+/// button kept saying "Остановить" over two dead sessions and needed a second click.
+pub fn test_finished(host: TestHalf, client: TestHalf) -> bool {
+    if host.error || client.error {
+        return false;
+    }
+    (host.ended && host.connected) || (client.ended && client.connected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +635,72 @@ mod tests {
         }
         assert!(driver_end_text(DriverEnd::NeedReboot).contains("перезагруз"));
         assert!(!driver_end_text(DriverEnd::Failed(5)).contains("друг"));
+    }
+
+    #[test]
+    fn self_test_resets_by_itself_when_either_half_is_stopped() {
+        let up = TestHalf { ended: false, connected: true, error: false };
+        let gone = TestHalf { ended: true, connected: true, error: false };
+        // running: stays
+        assert!(!test_finished(up, up));
+        // the viewer's stop button / closed window, or the sharing side ending: back to the start at once
+        assert!(test_finished(up, gone));
+        assert!(test_finished(gone, up));
+        assert!(test_finished(gone, gone));
+        // still connecting: nothing to reset
+        let start = TestHalf::default();
+        assert!(!test_finished(start, start));
+        // a failure stays on screen so it can be read
+        let bad = TestHalf { ended: true, connected: true, error: true };
+        assert!(!test_finished(up, bad));
+        assert!(!test_finished(bad, gone));
+        // never connected and ended without a word: left visible (not silently swallowed)
+        let dead = TestHalf { ended: true, connected: false, error: false };
+        assert!(!test_finished(dead, start));
+    }
+
+    #[test]
+    fn viewer_sleeps_when_nothing_animates() {
+        assert!(!viewer_ticks(false, false, false));
+        assert!(viewer_ticks(true, false, false));
+        assert!(viewer_ticks(false, true, false));
+        assert!(viewer_ticks(false, false, true));
+    }
+
+    #[test]
+    fn every_tab_opens_in_every_state_and_says_what_is_running() {
+        for bits in 0..8u8 {
+            let (h, j, t) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            for tab in [Tab::Host, Tab::Join] {
+                let b = tab_busy(tab, h, j, t);
+                // A tab never reports its own session as the obstacle.
+                match (tab, b) {
+                    (Tab::Host, Some(Occupied::Host)) | (Tab::Join, Some(Occupied::Join)) => panic!("{tab:?} {h} {j} {t}"),
+                    _ => {}
+                }
+                // Nothing running: the plain page.
+                if !(h || j || t) {
+                    assert_eq!(b, None);
+                }
+                // Whatever is named is really running.
+                match b {
+                    Some(Occupied::Host) => assert!(h),
+                    Some(Occupied::Join) => assert!(j),
+                    Some(Occupied::Test) => assert!(t),
+                    None => {}
+                }
+            }
+        }
+        // One's own session shows its own page, the other tab explains.
+        assert_eq!(tab_busy(Tab::Host, true, false, false), None);
+        assert_eq!(tab_busy(Tab::Join, true, false, false), Some(Occupied::Host));
+        assert_eq!(tab_busy(Tab::Host, false, true, false), Some(Occupied::Join));
+        assert_eq!(tab_busy(Tab::Join, false, true, false), None);
+        assert_eq!(tab_busy(Tab::Host, false, false, true), Some(Occupied::Test));
+        assert_eq!(tab_busy(Tab::Join, false, false, true), Some(Occupied::Test));
+        for o in [Occupied::Host, Occupied::Join, Occupied::Test] {
+            assert!(!o.title().is_empty() && !o.open_text().is_empty() && !o.stop_text().is_empty());
+            assert!(!o.title().contains("друг"));
+        }
     }
 }
