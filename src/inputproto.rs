@@ -96,7 +96,14 @@ pub struct Kbm {
     pub wheel_h: i32,
     pub keys: Vec<u16>,
     pub events: Vec<Ev>,
+    /// Where the viewer's pointer is on the picture, 0..=65535 both ways (since 0.11.7). With it the host puts
+    /// its cursor on exactly that spot (the arrows match whatever the scaling); `dx`/`dy` are for games that
+    /// hide the cursor and turn the camera with raw motion.
+    pub abs: Option<(u16, u16)>,
 }
+
+/// Tag of the optional pointer-position tail after the kbm block (older hosts stop reading before it).
+const ABS_TAG: u8 = 0xA1;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
@@ -146,6 +153,11 @@ pub fn encode(f: &Frame, out: &mut Vec<u8>) {
             out.extend_from_slice(&e.seq.to_le_bytes());
             out.push(e.kind.code());
             out.extend_from_slice(&e.code.to_le_bytes());
+        }
+        if let Some((x, y)) = k.abs {
+            out.push(ABS_TAG);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
         }
     }
 }
@@ -220,7 +232,11 @@ pub fn decode(body: &[u8]) -> Option<Frame> {
             let kind = EvKind::from_code(r.u8()?)?;
             events.push(Ev { seq, kind, code: r.u16()? });
         }
-        f.kbm = Some(Kbm { buttons, dx, dy, wheel_v, wheel_h, keys, events });
+        let abs = match r.u8() {
+            Some(ABS_TAG) => Some((r.u16()?, r.u16()?)),
+            _ => None,
+        };
+        f.kbm = Some(Kbm { buttons, dx, dy, wheel_v, wheel_h, keys, events, abs });
     }
     Some(f)
 }
@@ -236,11 +252,14 @@ pub struct CtrlInfo {
     pub vigem: bool,
     /// Virtual pads currently plugged in on the host.
     pub pads: u8,
+    /// The host's cursor is hidden (a game took the mouse): the viewer's own pointer should hide too, and only raw
+    /// motion counts. Otherwise the host follows the pointer's position on the picture (since 0.11.7).
+    pub relative: bool,
 }
 
 pub fn encode_ctrl(c: &CtrlInfo, out: &mut Vec<u8>) {
     out.push(VERSION);
-    out.push(c.allowed as u8 | (c.pad as u8) << 1 | (c.kbm as u8) << 2 | (c.vigem as u8) << 3);
+    out.push(c.allowed as u8 | (c.pad as u8) << 1 | (c.kbm as u8) << 2 | (c.vigem as u8) << 3 | (c.relative as u8) << 4);
     out.push(c.pads);
 }
 
@@ -249,7 +268,7 @@ pub fn decode_ctrl(body: &[u8]) -> Option<CtrlInfo> {
         return None;
     }
     let f = body[1];
-    Some(CtrlInfo { allowed: f & 1 != 0, pad: f & 2 != 0, kbm: f & 4 != 0, vigem: f & 8 != 0, pads: body[2] })
+    Some(CtrlInfo { allowed: f & 1 != 0, pad: f & 2 != 0, kbm: f & 4 != 0, vigem: f & 8 != 0, pads: body[2], relative: f & 16 != 0 })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -295,6 +314,7 @@ mod tests {
                 wheel_h: 120,
                 keys: vec![0x1E, 0xE04B],
                 events: vec![Ev { seq: 9, kind: EvKind::KeyDown, code: 0x1E }, Ev { seq: 10, kind: EvKind::MouseUp, code: 4 }],
+                abs: Some((0, 65535)),
             }),
         };
         let mut b = Vec::new();
@@ -359,6 +379,23 @@ mod tests {
     }
 
     #[test]
+    fn pointer_position_rides_along_and_old_packets_still_work() {
+        let k = Kbm { buttons: 1, dx: 5, abs: Some((12345, 65535)), ..Default::default() };
+        let f = Frame { seq: 9, kbm: Some(k), ..Default::default() };
+        let mut b = Vec::new();
+        encode(&f, &mut b);
+        assert_eq!(decode(&b), Some(f.clone()));
+        // A 0.11.6 host reads up to the events and stops: it sees the same packet minus the position.
+        let mut old = f.clone();
+        old.kbm.as_mut().unwrap().abs = None;
+        let mut ob = Vec::new();
+        encode(&old, &mut ob);
+        assert_eq!(&b[..ob.len()], &ob[..], "the position is only a tail");
+        // A 0.11.6 viewer's packet (no tail) decodes with no position.
+        assert_eq!(decode(&ob), Some(old));
+    }
+
+    #[test]
     fn sequence_compare_wraps() {
         assert!(newer(1, 0));
         assert!(newer(0, 65535));
@@ -369,7 +406,7 @@ mod tests {
 
     #[test]
     fn ctrl_and_rumble_round_trip() {
-        let c = CtrlInfo { allowed: true, pad: false, kbm: true, vigem: true, pads: 2 };
+        let c = CtrlInfo { allowed: true, pad: false, kbm: true, vigem: true, pads: 2, relative: true };
         let mut b = Vec::new();
         encode_ctrl(&c, &mut b);
         assert_eq!(decode_ctrl(&b), Some(c));

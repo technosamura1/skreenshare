@@ -54,11 +54,83 @@ struct Pad {
     target: vigem_client::XTarget,
 }
 
+/// What the stream shows, so a spot on the viewer's picture can be turned into a spot on this screen.
+#[derive(Clone, Copy, Debug)]
+pub enum Region {
+    /// A monitor fills the picture: its rectangle on the desktop (left, top, width, height).
+    Screen { canvas: (u32, u32), rect: (i32, i32, i32, i32) },
+    /// One window letterboxed into a monitor-sized picture; the window's place is read when needed (it moves).
+    Window { canvas: (u32, u32), content: (u32, u32), hwnd: isize },
+}
+
+/// The host's cursor is hidden: a game took the mouse, so only raw motion makes sense.
+pub fn cursor_hidden() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
+    let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+    unsafe { GetCursorInfo(&mut ci).is_ok() && ci.flags.0 & CURSOR_SHOWING.0 == 0 }
+}
+
+/// A window's visible rectangle on the desktop (without the invisible resize borders), in physical pixels.
+fn window_rect(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let h = HWND(hwnd as *mut core::ffi::c_void);
+    let mut r = RECT::default();
+    unsafe {
+        let ok = DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &mut r as *mut RECT as *mut core::ffi::c_void, std::mem::size_of::<RECT>() as u32)
+            .is_ok()
+            || GetWindowRect(h, &mut r).is_ok();
+        (ok && r.right > r.left && r.bottom > r.top).then_some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+    }
+}
+
+/// Puts the cursor on spot (x, y) of the picture (0..=65535 both ways) of `region`; returns the screen point.
+pub fn place_cursor(region: Region, x: u16, y: u16) -> Option<(i32, i32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
+    let (canvas, content, target) = match region {
+        Region::Screen { canvas, rect } => (canvas, None, rect),
+        Region::Window { canvas, content, hwnd } => (canvas, Some(content), window_rect(hwnd)?),
+    };
+    let (px, py) = crate::source::picture_to_screen((x, y), canvas, content, target);
+    // Absolute SendInput speaks 0..65535 over the whole virtual desktop (all monitors, physical pixels).
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
+        )
+    };
+    let nx = ((px - vx) as f64 * 65535.0 / (vw - 1) as f64).round() as i32;
+    let ny = ((py - vy) as f64 * 65535.0 / (vh - 1) as f64).round() as i32;
+    send(&[mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0)]);
+    Some((px, py))
+}
+
+/// `abstest`: puts the cursor on the corners and the centre of `region` and reports where it really landed.
+pub fn place_cursor_selftest(region: Region) -> Vec<((u16, u16), (i32, i32), (i32, i32))> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut out = Vec::new();
+    for spot in [(0, 0), (65535, 0), (32768, 32768), (0, 65535), (65535, 65535)] {
+        let Some(want) = place_cursor(region, spot.0, spot.1) else { continue };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let mut p = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut p);
+        }
+        out.push((spot, want, (p.x, p.y)));
+    }
+    out
+}
+
 /// The real thing the receiver drives: SendInput and virtual pads.
 struct HostSink {
     client: Option<vigem_client::Client>,
     pads: [Option<Pad>; MAX_PADS],
     rumble: Arc<Mutex<RumbleTx>>,
+    region: Arc<Mutex<Option<Region>>>,
 }
 
 impl HostSink {
@@ -94,6 +166,14 @@ impl Sink for HostSink {
 
     fn mouse_move(&mut self, dx: i32, dy: i32) {
         send(&[mouse(MOUSEEVENTF_MOVE, dx, dy, 0)]);
+    }
+
+    fn mouse_abs(&mut self, x: u16, y: u16) -> bool {
+        if cursor_hidden() {
+            return false;
+        }
+        let Some(region) = *self.region.lock().unwrap() else { return false };
+        place_cursor(region, x, y).is_some()
     }
 
     fn wheel(&mut self, v: i32, h: i32) {
@@ -163,21 +243,29 @@ pub struct InputHost {
     /// The emergency hotkey took control away since the owner last switched it on.
     revoked: AtomicBool,
     vigem: AtomicBool,
+    region: Arc<Mutex<Option<Region>>>,
 }
 
 impl InputHost {
     pub fn new(perms: Perms) -> Arc<InputHost> {
         let rumble = Arc::new(Mutex::new(RumbleTx::new()));
+        let region = Arc::new(Mutex::new(None));
         Arc::new(InputHost {
             inner: Mutex::new(Inner {
                 rx: Receiver::new(perms),
-                sink: HostSink { client: None, pads: Default::default(), rumble: rumble.clone() },
+                sink: HostSink { client: None, pads: Default::default(), rumble: rumble.clone(), region: region.clone() },
             }),
+            region,
             rumble,
             peer_input: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
             vigem: AtomicBool::new(vigem_installed()),
         })
+    }
+
+    /// What the stream shows right now (called for every frame: the window may have been resized or switched).
+    pub fn set_region(&self, r: Region) {
+        *self.region.lock().unwrap() = Some(r);
     }
 
     pub fn set_peer_caps(&self, flags: u8) {
@@ -207,7 +295,7 @@ impl InputHost {
     fn ctrl_info(&self) -> CtrlInfo {
         let g = self.inner.lock().unwrap();
         let p = g.rx.perms();
-        CtrlInfo { allowed: p.allowed, pad: p.pad, kbm: p.kbm, vigem: self.vigem.load(Ordering::Relaxed), pads: g.rx.plugged_count() as u8 }
+        CtrlInfo { allowed: p.allowed, pad: p.pad, kbm: p.kbm, vigem: self.vigem.load(Ordering::Relaxed), pads: g.rx.plugged_count() as u8, relative: cursor_hidden() }
     }
 
     /// `CONTROL on=1 pad=1 kbm=1`
@@ -289,7 +377,7 @@ impl InputHost {
                         let g = me.inner.lock().unwrap();
                         let p = g.rx.perms();
                         (
-                            CtrlInfo { allowed: p.allowed, pad: p.pad, kbm: p.kbm, vigem: me.vigem.load(Ordering::Relaxed), pads: g.rx.plugged_count() as u8 },
+                            CtrlInfo { allowed: p.allowed, pad: p.pad, kbm: p.kbm, vigem: me.vigem.load(Ordering::Relaxed), pads: g.rx.plugged_count() as u8, relative: cursor_hidden() },
                             g.rx.controlling(now),
                             g.rx.holds_anything(),
                         )

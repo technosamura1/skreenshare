@@ -846,9 +846,14 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         let t0 = Instant::now();
         let (buf, stride) = e.input()?;
         match &mut cap {
-            Cap::Screen(c) => c.compose(buf, stride),
+            Cap::Screen(c) => {
+                c.compose(buf, stride);
+                let size = (c.width, c.height);
+                input.set_region(crate::inputhost::Region::Screen { canvas: size, rect: (monitor.left, monitor.top, size.0 as i32, size.1 as i32) });
+            }
             Cap::Window(w) => {
                 let (src, size) = (w.pixels(), (w.width, w.height));
+                input.set_region(crate::inputhost::Region::Window { canvas, content: size, hwnd: w.hwnd() });
                 crate::source::draw_letterboxed(src, size, buf, stride, canvas, &mut scratch, |s, sw, sh, d, dw, dh| {
                     scaler.scale(s, sw, sh, sw as usize * 4, d, dw, dh, dw as usize * 4).map_err(|e| format!("{e:#}"))
                 })

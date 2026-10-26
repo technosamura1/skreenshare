@@ -983,6 +983,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         bar_drawn: true,
         cursor_shown: true,
         shown_seq: 0,
+        relative_mode: false,
         started: Instant::now(),
         control,
         input: input.clone(),
@@ -1029,6 +1030,8 @@ struct App {
     cursor_shown: bool,
     /// `Picture::seq` last put on screen (tells a new frame from a redraw of the bar).
     shown_seq: u64,
+    /// Controlling with raw motion (the host's cursor is hidden) rather than by the pointer's position.
+    relative_mode: bool,
     started: Instant,
     /// Remote control is enabled (no `--no-control`).
     control: bool,
@@ -1105,13 +1108,9 @@ impl App {
         self.mouse_frac = (0.0, 0.0);
         if let Some(w) = &self.window {
             if on {
-                use winit::window::CursorGrabMode;
-                if w.set_cursor_grab(CursorGrabMode::Confined).is_err() {
-                    let _ = w.set_cursor_grab(CursorGrabMode::Locked);
-                }
-                w.set_cursor_visible(false);
-                self.cursor_shown = false;
                 self.capture_t = Some(Instant::now());
+                self.relative_mode = !self.input.host_relative(); // force apply_pointer_mode to set things up
+                self.apply_pointer_mode();
             } else {
                 let _ = w.set_cursor_grab(winit::window::CursorGrabMode::None);
                 w.set_cursor_visible(true);
@@ -1124,6 +1123,55 @@ impl App {
             self.input.release_kbm();
         }
         self.redraw();
+    }
+
+    /// While controlling: if the host shows its cursor (desktop, browser, most windows) our pointer stays visible
+    /// and the host puts its cursor exactly where ours is on the picture; if the host hid its cursor (a game took
+    /// the mouse), ours hides too and raw motion turns the camera. Follows the host when that changes.
+    fn apply_pointer_mode(&mut self) {
+        if !self.captured {
+            return;
+        }
+        let relative = self.input.host_relative();
+        if relative == self.relative_mode {
+            return;
+        }
+        self.relative_mode = relative;
+        let Some(w) = &self.window else { return };
+        use winit::window::CursorGrabMode;
+        if relative {
+            self.input.mouse_abs(None);
+            if w.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+                let _ = w.set_cursor_grab(CursorGrabMode::Confined);
+            }
+        } else {
+            let _ = w.set_cursor_grab(CursorGrabMode::None);
+            if w.set_cursor_grab(CursorGrabMode::Confined).is_err() {
+                let _ = w.set_cursor_grab(CursorGrabMode::Locked);
+            }
+        }
+        w.set_cursor_visible(!relative);
+        self.cursor_shown = !relative;
+    }
+
+    /// Where `pos` (window pixels) is on the picture, 0..=65535 both ways (clamped to its edges).
+    fn picture_spot(&self, pos: winit::dpi::PhysicalPosition<f64>) -> Option<(u16, u16)> {
+        let w = self.window.as_ref()?;
+        let size = w.inner_size();
+        let (pw, ph) = {
+            let p = self.sh.picture.lock().unwrap();
+            (p.w as f64, p.h as f64)
+        };
+        if pw < 1.0 || ph < 1.0 || size.width == 0 || size.height == 0 {
+            return None;
+        }
+        // The picture is drawn fitted and centred (black bars where the aspect differs).
+        let s = (size.width as f64 / pw).min(size.height as f64 / ph);
+        let (dw, dh) = (pw * s, ph * s);
+        let (ox, oy) = ((size.width as f64 - dw) / 2.0, (size.height as f64 - dh) / 2.0);
+        let fx = ((pos.x - ox) / dw).clamp(0.0, 1.0);
+        let fy = ((pos.y - oy) / dh).clamp(0.0, 1.0);
+        Some(((fx * 65535.0).round() as u16, (fy * 65535.0).round() as u16))
     }
 
     fn toggle_control(&mut self) {
@@ -1301,7 +1349,12 @@ impl ApplicationHandler<UserEv> for App {
                 };
                 self.input.wheel(y.round() as i32, x.round() as i32);
             }
-            WindowEvent::CursorMoved { .. } if self.captured => {}
+            WindowEvent::CursorMoved { position, .. } if self.captured => {
+                if !self.relative_mode {
+                    let spot = self.picture_spot(position);
+                    self.input.mouse_abs(spot);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat && matches!(event.logical_key, Key::Named(NamedKey::F2)) =>
             {
@@ -1461,6 +1514,7 @@ impl ApplicationHandler<UserEv> for App {
         if self.captured && self.esc_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(1)) {
             self.set_capture(false);
         }
+        self.apply_pointer_mode();
         // The overlay (hint, F2 panel, captured mouse) and the bar animate on the clock only: ResumeTimeReached in
         // `new_events` redraws, so this must not ask for a redraw itself (that made a loop that never slept).
         if crate::guilogic::viewer_ticks(self.overlay_active(), self.bar_opacity() > 0.0, self.bar_drawn) {
@@ -1578,7 +1632,8 @@ impl App {
         }
         // The mouse cursor goes away with the bar in full screen (the stream already shows the host's).
         let hide = opacity <= 0.0 && w.fullscreen().is_some();
-        let want_cursor = !hide;
+        // While controlling, the pointer mode decides (it used to come back here and drift away from the host's).
+        let want_cursor = if self.captured { !self.relative_mode } else { !hide };
         let _ = buf.present();
         if new_picture {
             self.sh.diag.lock().unwrap().shown.feed(self.sh.start.elapsed().as_micros() as u64);

@@ -255,6 +255,29 @@ fn run(mut a: Args) -> Result<()> {
             a.finish()?;
             avsync::run_beacon(secs)?;
         }
+        "abstest" => {
+            // Remote control by position: does the cursor land exactly where computed? (moves the cursor)
+            let window = a.value("--window")?.map(|v| v.parse::<isize>()).transpose().context("--window")?;
+            let mon = a.num::<usize>("--monitor", 0)?;
+            a.finish()?;
+            let m = host::pick_monitor(Some(mon), false)?;
+            let canvas = (m.width, m.height);
+            let mut regions = vec![("монитор", inputhost::Region::Screen { canvas, rect: (m.left, m.top, m.width as i32, m.height as i32) })];
+            if let Some(h) = window {
+                let w = wincap::WindowCapturer::new(h)?;
+                regions.push(("окно", inputhost::Region::Window { canvas, content: (w.width, w.height), hwnd: h }));
+            }
+            let mut worst = 0;
+            for (name, r) in regions {
+                println!("{name}: {r:?}");
+                for (spot, want, got) in inputhost::place_cursor_selftest(r) {
+                    let err = (want.0 - got.0).abs().max((want.1 - got.1).abs());
+                    worst = worst.max(err);
+                    println!("  точка {spot:?}: ждали {want:?}, курсор {got:?}, ошибка {err} пикс.");
+                }
+            }
+            println!("{}", if worst <= 1 { "OK: курсор встаёт точно" } else { "ОШИБКА: курсор встаёт не туда" });
+        }
         "audiolab" => {
             // Test tooling: tone / record --pid / analyze FILE.wav (see audiolab.rs).
             let mode = if a.0.is_empty() { String::new() } else { a.0.remove(0) };

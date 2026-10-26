@@ -144,6 +144,25 @@ pub fn letterbox_rect(sw: u32, sh: u32, ow: u32, oh: u32) -> (u32, u32, u32, u32
     (x, y, fw, fh)
 }
 
+/// Where a spot of the streamed picture lands on the host's screen (remote control by position).
+/// `pos`: 0..=65535 both ways over the whole picture (the canvas). `content`: the window's own size when a window
+/// is letterboxed into the canvas (None: a monitor fills it). `target`: that content's rectangle on the host's
+/// screen (left, top, width, height). A spot on the black bars goes to the nearest edge of the window.
+pub fn picture_to_screen(pos: (u16, u16), canvas: (u32, u32), content: Option<(u32, u32)>, target: (i32, i32, i32, i32)) -> (i32, i32) {
+    let (cw, ch) = (canvas.0.max(1) as f64, canvas.1.max(1) as f64);
+    let (u, v) = (pos.0 as f64 / 65535.0 * cw, pos.1 as f64 / 65535.0 * ch);
+    let (fx, fy) = match content {
+        None => (u / cw, v / ch),
+        Some((sw, sh)) => {
+            let (x, y, fw, fh) = letterbox_rect(sw, sh, canvas.0, canvas.1);
+            ((u - x as f64) / fw.max(1) as f64, (v - y as f64) / fh.max(1) as f64)
+        }
+    };
+    let (fx, fy) = (fx.clamp(0.0, 1.0), fy.clamp(0.0, 1.0));
+    let (l, t, w, h) = target;
+    (l + (fx * (w - 1).max(0) as f64).round() as i32, t + (fy * (h - 1).max(0) as f64).round() as i32)
+}
+
 /// Draws `src` (`sw`x`sh` BGRA, tight rows) into the `ow`x`oh` canvas `dst` (rows of `stride` bytes): scaled to
 /// fit and centred, bars black. `scale(src, sw, sh, out, fw, fh)` resizes into a tight `fw`x`fh` buffer
 /// (only called when the size really differs). A window picture of any size (the user drags its edge) lands in
@@ -192,6 +211,22 @@ pub fn draw_letterboxed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picture_spots_map_to_the_host_screen() {
+        // Whole monitor 2560x1440 at (0,0): the centre of the picture is the centre of the screen.
+        assert_eq!(picture_to_screen((32768, 32768), (2560, 1440), None, (0, 0, 2560, 1440)), (1280, 720));
+        assert_eq!(picture_to_screen((0, 0), (2560, 1440), None, (-1080, 100, 1080, 1920)), (-1080, 100));
+        assert_eq!(picture_to_screen((65535, 65535), (2560, 1440), None, (0, 0, 2560, 1440)), (2559, 1439));
+        // A 1000x1000 window at (300, 200) letterboxed into a 2560x1440 canvas: it fills 1440x1440 in the middle
+        // (x 560..2000). The canvas centre is the window centre; its left bar edge is the window's left edge.
+        let w = Some((1000, 1000));
+        assert_eq!(picture_to_screen((32768, 32768), (2560, 1440), w, (300, 200, 1000, 1000)), (800, 700));
+        let left_edge = (560.0 / 2560.0 * 65535.0) as u16;
+        assert_eq!(picture_to_screen((left_edge, 0), (2560, 1440), w, (300, 200, 1000, 1000)).0, 300);
+        // A click on the black bar goes to the nearest window edge, not somewhere else on the screen.
+        assert_eq!(picture_to_screen((100, 32768), (2560, 1440), w, (300, 200, 1000, 1000)), (300, 700));
+    }
 
     #[test]
     fn source_request_round_trips() {

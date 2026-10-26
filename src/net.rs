@@ -140,6 +140,7 @@ fn bind_socket_on(nic: Option<&Nic>) -> Result<UdpSocket> {
     let _ = s.set_send_buffer_size(8 << 20);
     let ip = nic.map_or(Ipv4Addr::UNSPECIFIED, |n| n.ip);
     s.bind(&SocketAddr::from((ip, 0)).into())?;
+    #[cfg(not(lossim))]
     if let Some(n) = nic {
         // Bound to the adapter's address *and* told to send through it: a VPN's catch-all route can't take it.
         use std::os::windows::io::AsRawSocket;
@@ -157,8 +158,15 @@ pub struct Nic {
     pub name: String,
 }
 
+/// The loss simulator (tools/lossim, any OS) has no Windows API: no adapter choice there.
+#[cfg(lossim)]
+pub fn physical_nic() -> Option<Nic> {
+    None
+}
+
 /// The adapter our traffic would use without a VPN. VPN tunnels (Happ/sing-box, WireGuard, OpenVPN TAP,
 /// Wintun...) are not Ethernet/Wi-Fi typed or are named as such, so they are skipped. Lowest metric wins.
+#[cfg(not(lossim))]
 pub fn physical_nic() -> Option<Nic> {
     use windows::Win32::NetworkManagement::IpHelper::*;
     use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;

@@ -2,6 +2,9 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Shared sources skip their Windows-only parts under this flag (src/net.rs: adapter choice).
+    println!("cargo::rustc-check-cfg=cfg(lossim)");
+    println!("cargo:rustc-cfg=lossim");
     let root = PathBuf::from("../../vendor/opus");
     let mut b = cc::Build::new();
     for dir in ["celt", "silk", "silk/float", "src"] {

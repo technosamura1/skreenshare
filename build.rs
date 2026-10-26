@@ -44,6 +44,8 @@ fn check_vigem() {
 }
 
 fn main() {
+    // tools/lossim builds some of these sources with cfg(lossim); declare it so this build doesn't warn.
+    println!("cargo::rustc-check-cfg=cfg(lossim)");
     check_vigem();
     build_opus();
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");

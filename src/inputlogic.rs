@@ -29,6 +29,8 @@ pub struct Sender {
     dy: i32,
     wv: i32,
     wh: i32,
+    /// The pointer's spot on the picture (see `Kbm::abs`).
+    abs: Option<(u16, u16)>,
     pads: [Option<PadState>; MAX_PADS],
     /// (event, sends left, last sent)
     events: Vec<(Ev, u8, Option<Instant>)>,
@@ -47,6 +49,7 @@ impl Sender {
             dy: 0,
             wv: 0,
             wh: 0,
+            abs: None,
             pads: [None; MAX_PADS],
             events: Vec::new(),
             dirty: true,
@@ -99,6 +102,14 @@ impl Sender {
         if dx != 0 || dy != 0 {
             self.dx = self.dx.wrapping_add(dx);
             self.dy = self.dy.wrapping_add(dy);
+            self.dirty = true;
+        }
+    }
+
+    /// The pointer moved to this spot of the picture (0..=65535 both ways); None when it is off the picture.
+    pub fn mouse_abs(&mut self, pos: Option<(u16, u16)>) {
+        if self.abs != pos {
+            self.abs = pos;
             self.dirty = true;
         }
     }
@@ -197,7 +208,16 @@ impl Sender {
             seq: self.seq,
             pad_mask: mask,
             pads,
-            kbm: Some(Kbm { buttons: self.buttons, dx: self.dx, dy: self.dy, wheel_v: self.wv, wheel_h: self.wh, keys: self.keys.clone(), events: evs }),
+            kbm: Some(Kbm {
+                buttons: self.buttons,
+                dx: self.dx,
+                dy: self.dy,
+                wheel_v: self.wv,
+                wheel_h: self.wh,
+                keys: self.keys.clone(),
+                events: evs,
+                abs: self.abs,
+            }),
         })
     }
 }
@@ -208,6 +228,11 @@ pub trait Sink {
     fn key(&mut self, code: u16, down: bool);
     fn mouse_button(&mut self, b: u8, down: bool);
     fn mouse_move(&mut self, dx: i32, dy: i32);
+    /// Put the cursor on this spot of the streamed picture. Returns false when the host wants raw motion instead
+    /// (its cursor is hidden: a game took the mouse) or doesn't know where the picture is.
+    fn mouse_abs(&mut self, _x: u16, _y: u16) -> bool {
+        false
+    }
     fn wheel(&mut self, v: i32, h: i32);
     /// Plug virtual pad `idx` in; false = it could not be (no driver).
     fn pad_plug(&mut self, idx: usize) -> bool;
@@ -237,6 +262,9 @@ pub struct Receiver {
     last_seq: Option<u16>,
     last_ev: Option<u16>,
     base: Option<(i32, i32, i32, i32)>,
+    /// The pointer position last applied, and whether the sink took it (false: it wants raw motion).
+    last_abs: Option<(u16, u16)>,
+    abs_ok: bool,
     held_keys: Vec<u16>,
     held_buttons: u8,
     plugged: [bool; MAX_PADS],
@@ -254,6 +282,8 @@ impl Receiver {
             last_seq: None,
             last_ev: None,
             base: None,
+            last_abs: None,
+            abs_ok: false,
             held_keys: Vec::new(),
             held_buttons: 0,
             plugged: [false; MAX_PADS],
@@ -401,6 +431,17 @@ impl Receiver {
     }
 
     fn apply_kbm(&mut self, k: &Kbm, sink: &mut dyn Sink) {
+        // The pointer's position before any button of this packet: a click must land where the viewer clicked.
+        let by_position = match k.abs {
+            None => false,
+            Some(p) => {
+                if self.last_abs != Some(p) {
+                    self.abs_ok = sink.mouse_abs(p.0, p.1);
+                    self.last_abs = Some(p);
+                }
+                self.abs_ok
+            }
+        };
         // Numbered events first, oldest first, each only once.
         let mut evs: Vec<&Ev> = k.events.iter().filter(|e| self.last_ev.is_none_or(|l| newer(e.seq, l))).collect();
         evs.sort_by(|a, b| if a.seq == b.seq { std::cmp::Ordering::Equal } else if newer(a.seq, b.seq) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less });
@@ -467,7 +508,8 @@ impl Receiver {
         if let Some(b) = self.base {
             let (dx, dy) = (now.0.wrapping_sub(b.0), now.1.wrapping_sub(b.1));
             let (wv, wh) = (now.2.wrapping_sub(b.2), now.3.wrapping_sub(b.3));
-            if dx != 0 || dy != 0 {
+            // Following the pointer's position: raw motion would move the cursor a second time.
+            if (dx != 0 || dy != 0) && !by_position {
                 sink.mouse_move(dx, dy);
             }
             if wv != 0 || wh != 0 {
@@ -638,6 +680,8 @@ mod tests {
         mouse: (i32, i32),
         wheel: (i32, i32),
         no_driver: bool,
+        /// The host follows the pointer's position (its cursor is visible).
+        by_position: bool,
     }
 
     impl Sink for Log {
@@ -662,6 +706,12 @@ mod tests {
         fn mouse_move(&mut self, dx: i32, dy: i32) {
             self.mouse.0 += dx;
             self.mouse.1 += dy;
+        }
+        fn mouse_abs(&mut self, x: u16, y: u16) -> bool {
+            if self.by_position {
+                self.ev.push(format!("at {x} {y}"));
+            }
+            self.by_position
         }
         fn wheel(&mut self, v: i32, h: i32) {
             self.wheel.0 += v;
@@ -711,6 +761,40 @@ mod tests {
         s.mouse_move(1, 0);
         assert!(s.poll(t + ms(101)).is_none(), "min gap");
         assert!(s.poll(t + ms(103)).is_some());
+    }
+
+    #[test]
+    fn click_lands_where_the_pointer_is_and_motion_does_not_move_twice() {
+        let t = t0();
+        let mut s = Sender::new(0);
+        let mut r = Receiver::new(ALL);
+        let mut log = Log { by_position: true, ..Default::default() };
+        s.poll(t);
+        // In one packet: the pointer moved (raw motion too) and the button went down.
+        s.mouse_move(40, -7);
+        s.mouse_abs(Some((30000, 20000)));
+        s.mouse_button(0, true);
+        let f = s.poll(t + ms(10)).unwrap();
+        r.on_frame(t + ms(10), &wire(&f), &mut log);
+        assert_eq!(log.ev, vec!["at 30000 20000", "btn 0 true"], "position first, then the click");
+        assert_eq!(log.mouse, (0, 0), "raw motion ignored while following the position");
+        // The same spot again (a refresh) is not re-sent to the screen.
+        let f = s.poll(t + ms(200)).unwrap();
+        r.on_frame(t + ms(200), &wire(&f), &mut log);
+        assert_eq!(log.ev.len(), 2);
+
+        // A game hides the host's cursor: the sink refuses positions, raw motion moves the camera.
+        let mut log = Log::default();
+        let mut r = Receiver::new(ALL);
+        let mut s = Sender::new(0);
+        s.poll(t);
+        s.mouse_abs(Some((100, 100)));
+        let f = s.poll(t + ms(10)).unwrap();
+        r.on_frame(t + ms(10), &wire(&f), &mut log);
+        s.mouse_move(25, 5);
+        let f = s.poll(t + ms(20)).unwrap();
+        r.on_frame(t + ms(20), &wire(&f), &mut log);
+        assert_eq!(log.mouse, (25, 5));
     }
 
     #[test]

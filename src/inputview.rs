@@ -122,6 +122,16 @@ impl ViewInput {
         }
     }
 
+    /// The pointer's spot on the picture (0..=65535 both ways), None when it should not count.
+    pub fn mouse_abs(&self, pos: Option<(u16, u16)>) {
+        self.sender.lock().unwrap().mouse_abs(if self.kbm_active() { pos } else { None });
+    }
+
+    /// The host's cursor is hidden (a game holds the mouse): raw motion only, our pointer hidden too.
+    pub fn host_relative(&self) -> bool {
+        self.host_info().is_some_and(|c| c.relative)
+    }
+
     pub fn wheel(&self, v: i32, h: i32) {
         if self.kbm_active() {
             self.sender.lock().unwrap().wheel(v, h);

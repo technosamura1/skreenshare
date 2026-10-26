@@ -84,8 +84,8 @@ pub fn wav(cue: Cue) -> Vec<u8> {
 }
 
 /// Plays the cue without blocking (Windows `PlaySound` from memory). Errors are ignored: a missing sound
-/// device must never break the app.
-#[cfg(windows)]
+/// device must never break the app. (Not in the loss simulator, which has no Windows API even on Windows.)
+#[cfg(all(windows, not(lossim)))]
 pub fn play(cue: Cue) {
     use std::sync::OnceLock;
     use windows::core::PCWSTR;

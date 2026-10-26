@@ -232,6 +232,11 @@ fn remove_border(session: &GraphicsCaptureSession) -> BorderState {
 }
 
 impl WindowCapturer {
+    /// The captured window (remote control maps the viewer's pointer onto it).
+    pub fn hwnd(&self) -> isize {
+        self.hwnd
+    }
+
     pub fn new(h: isize) -> Result<WindowCapturer> {
         if !supported() {
             bail!("эта версия Windows не умеет захватывать отдельные окна (нужна Windows 10 1903 или новее)");
