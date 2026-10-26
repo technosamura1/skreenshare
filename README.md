@@ -399,7 +399,8 @@ screenshare --help                            всё остальное
 `tools/make-import-libs.sh`. Потом сборка и проверка зависимостей:
 
 ```
-cargo build --release
+# статическая библиотека C (/MT): иначе exe требует VCRUNTIME140.dll, которой нет на чистой Windows; на Linux тот же флаг для cargo xwin
+RUSTFLAGS="-C target-feature=+crt-static" cargo build --release
 tools/check-dlls.sh      # Linux/WSL/git-bash: упадёт, если exe или DLL требуют чего-то, чего нет на чистой Windows
 ```
 
