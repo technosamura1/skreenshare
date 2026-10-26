@@ -789,6 +789,8 @@ enum Page {
     Test,
     /// Gamepad test (reached from the settings).
     Pads,
+    /// "Удалённое управление": the full card, reached from the sidebar panel ("Подробнее").
+    Control,
 }
 
 /// How long a new picture takes to replace the old one on a card.
@@ -1202,6 +1204,7 @@ impl GuiApp {
             Page::Join => 20 + sub(&self.join),
             Page::Test => 30 + self.test.is_some() as u32,
             Page::Pads => 40,
+            Page::Control => 41,
         }
     }
 }
@@ -1236,7 +1239,7 @@ impl eframe::App for GuiApp {
         if self.host.as_ref().is_some_and(|s| s.ended) {
             self.ctl.allow = false;
         }
-        if self.page == Page::Host && self.vigem.1.elapsed() > Duration::from_secs(3) {
+        if self.page != Page::Welcome && self.vigem.1.elapsed() > Duration::from_secs(3) {
             self.vigem = (vigem_now(), Instant::now());
         }
         if let DrvUi::Running(rx) = &self.drv {
@@ -1323,6 +1326,7 @@ impl eframe::App for GuiApp {
                             Page::About => self.about_page(ui),
                             Page::Test => self.test_page(ui),
                             Page::Pads => self.pads_page(ui),
+                            Page::Control => self.control_page(ui),
                         }
                         ui.add_space(24.0);
                     });
@@ -1398,6 +1402,15 @@ impl GuiApp {
         if nav_item(ui, Ico::Eye, "Смотреть", self.page == Page::Join, !(host_on || test_on), join_live) {
             self.page = Page::Join;
         }
+        // Remote control lives here, under the two main items: the switch and a status line, the rest on its own page.
+        // Whatever does not fit the height at the smallest window size scrolls.
+        ui.add_space(10.0);
+        let room = (ui.available_height() - (2.0 * 42.0 + 4.0 + 8.0)).max(60.0);
+        let mut open = false;
+        egui::ScrollArea::vertical().max_height(room).auto_shrink([false, true]).show(ui, |ui| open = self.side_control(ui));
+        if open {
+            self.page = Page::Control;
+        }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             if nav_item(ui, Ico::Info, "О программе", self.page == Page::About, true, None) {
@@ -1407,6 +1420,92 @@ impl GuiApp {
                 self.page = Page::Settings;
             }
         });
+    }
+
+    /// The compact "Удалённое управление" panel of the sidebar: the main switch, what is allowed, the driver and the
+    /// viewer's state; "Подробнее" opens the full page. Returns true when that was clicked. Changes go to a running
+    /// show exactly as the full card sends them.
+    fn side_control(&mut self, ui: &mut egui::Ui) -> bool {
+        let before = self.ctl;
+        let (st, revoked_now) = match self.host.as_ref().filter(|s| !s.ended) {
+            Some(s) => (s.ctrl, s.revoke_event),
+            None => (None, false),
+        };
+        if revoked_now {
+            self.ctl.allow = false;
+        }
+        let on_page = self.page == Page::Control;
+        let mut open = false;
+        let ctl = &mut self.ctl;
+        let vigem = self.vigem.0;
+        egui::Frame::new()
+            .fill(c_card())
+            .stroke(Stroke::new(1.0, if on_page { c_accent().gamma_multiply(0.6) } else { c_border() }))
+            .corner_radius(12)
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                    draw_ico(ui.painter(), Ico::Pad, r.center(), 20.0, c_text());
+                    ui.label(RichText::new("Управление").font(bold(14.5)));
+                });
+                ui.checkbox(&mut ctl.allow, "Разрешить зрителю");
+                let what = match (ctl.allow, ctl.pad, ctl.kbm) {
+                    (false, _, _) => "Сейчас выключено",
+                    (true, true, true) => "Геймпад, мышь и клавиатура",
+                    (true, true, false) => "Только геймпад",
+                    (true, false, true) => "Только мышь и клавиатура",
+                    (true, false, false) => "Ничего не выбрано",
+                };
+                ui.label(RichText::new(what).color(c_muted()).size(12.5));
+                if st.is_some_and(|c| c.active) && ctl.allow {
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(150.0), 22.0), Sense::hover());
+                    ui.painter().rect_filled(r, 11.0, c_red().gamma_multiply(0.22));
+                    ui.painter().circle_filled(r.left_center() + Vec2::new(12.0, 0.0), 4.5, c_red());
+                    ui.painter().text(r.left_center() + Vec2::new(24.0, 0.0), egui::Align2::LEFT_CENTER, "Зритель управляет", egui::FontId::proportional(13.0), c_red());
+                } else if st.is_some_and(|c| c.revoked) && !ctl.allow {
+                    ui.label(RichText::new("Отключено аварийным сочетанием").color(c_red()).size(12.5));
+                }
+                if ctl.pad {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                        if vigem {
+                            draw_ico(ui.painter(), Ico::Check, r.center(), 14.0, c_green());
+                            ui.label(RichText::new("Драйвер геймпада есть").color(c_green()).size(12.5));
+                        } else {
+                            draw_ico(ui.painter(), Ico::Warn, r.center(), 14.0, c_yellow());
+                            ui.label(RichText::new("Нет драйвера геймпада").color(c_yellow()).size(12.5));
+                        }
+                    });
+                }
+                let w = ui.available_width();
+                if ui.add_sized([w, 28.0], egui::Button::new(RichText::new("Подробнее").size(13.0))).clicked() {
+                    open = true;
+                }
+            });
+        if self.ctl != before || revoked_now {
+            if let Some(s) = self.host.as_mut().filter(|s| !s.ended) {
+                s.revoke_event = false;
+                s.proc.send(&lg::control_line(self.ctl.allow, self.ctl.pad, self.ctl.kbm));
+            }
+        }
+        open
+    }
+
+    /// "Удалённое управление": the full card (devices, driver and its install button, the emergency hotkey).
+    fn control_page(&mut self, ui: &mut egui::Ui) {
+        if crumb(ui, "Показать") {
+            self.page = Page::Host;
+            return;
+        }
+        page_head(ui, Ico::Pad, "Удалённое управление", "Геймпад, мышь и клавиатура зрителя на вашем компьютере");
+        let live = self.host.as_mut().filter(|s| !s.ended);
+        if control_card(ui, &mut self.ctl, self.vigem.0, &self.drv, live) {
+            start_driver_install(&mut self.drv);
+        }
     }
 
     /// The bottom strip: the network lamp and one line about the live session (the viewer's, the sharer's).
@@ -1439,6 +1538,45 @@ impl GuiApp {
             });
         });
     }
+}
+
+/// Height taken on the host page by everything except the picker's cards (head, card margins, quality, button).
+const HOST_FIXED_H: f32 = 435.0;
+
+/// A row of equal segments (title + small line), one of them chosen. Returns the value that was clicked.
+fn segmented(ui: &mut egui::Ui, items: &[(&str, &str, u32)], cur: u32) -> Option<u32> {
+    let gap = 8.0;
+    let n = items.len() as f32;
+    let w = ((ui.available_width() - gap * (n - 1.0)) / n).floor();
+    let mut out = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for (title, sub, v) in items {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 52.0), Sense::click());
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            let t = hover_t(ui.ctx(), &resp);
+            let on = *v == cur;
+            let st = ui.ctx().animate_bool_with_time(resp.id.with("seg"), on, anim_secs(0.15));
+            let fill = hot(c_field().lerp_to_gamma(c_accent(), st), t);
+            let fg = if st > 0.5 { on_fill(c_accent()) } else { c_text() };
+            let sub_col = if st > 0.5 { on_fill(c_accent()).gamma_multiply(0.85) } else { c_muted() };
+            let p = ui.painter();
+            p.rect_filled(rect, 12.0, fill);
+            p.rect_stroke(rect, 12.0, Stroke::new(1.0, c_border().lerp_to_gamma(c_accent(), st.max(t * 0.6))), egui::StrokeKind::Inside);
+            let g1 = p.layout_no_wrap(title.to_string(), bold(14.5), fg);
+            let g2 = p.layout_no_wrap(sub.to_string(), FontId::proportional(12.5), sub_col);
+            let total = g1.size().y + 2.0 + g2.size().y;
+            let y = rect.center().y - total / 2.0;
+            let (x1, x2) = (rect.center().x - g1.size().x / 2.0, rect.center().x - g2.size().x / 2.0);
+            let h1 = g1.size().y;
+            p.galley(egui::pos2(x1, y), g1, fg);
+            p.galley(egui::pos2(x2, y + h1 + 2.0), g2, sub_col);
+            if resp.clicked() {
+                out = Some(*v);
+            }
+        }
+    });
+    out
 }
 
 /// A pill you can switch on (selected = accent fill), with an optional colour dot. Hover and selection are smooth.
@@ -1728,12 +1866,17 @@ fn page_head(ui: &mut egui::Ui, ico: Ico, t: &str, sub: &str) {
 
 
 fn section(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    section_pad(ui, 20, add)
+}
+
+/// `section` with its own inner margin (the denser cards).
+fn section_pad(ui: &mut egui::Ui, margin: i8, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(c_card())
         .stroke(Stroke::new(1.0, c_border()))
         .corner_radius(16)
         .shadow(card_shadow())
-        .inner_margin(Margin::same(20))
+        .inner_margin(Margin::same(margin))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
@@ -2328,15 +2471,49 @@ impl GuiApp {
         }
     }
 
+    /// "Качество" under the picker: three segments, the chosen rate shown, one line of explanation.
+    fn quality_card(&mut self, ui: &mut egui::Ui) {
+        section_pad(ui, 14, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Качество").font(bold(15.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let t = match self.bitrate {
+                        0 => "Авто · 20–60 Мбит/с",
+                        30 => "Выбрано: 30 Мбит/с",
+                        _ => "Выбрано: 60 Мбит/с",
+                    };
+                    ui.label(RichText::new(t).color(c_muted()).size(13.0));
+                });
+            });
+            let items = [("Авто", "20–60 Мбит/с", 0), ("Стандарт", "30 Мбит/с", 30), ("Высокое качество", "60 Мбит/с", 60)];
+            if let Some(v) = segmented(ui, &items, self.bitrate) {
+                self.bitrate = v;
+            }
+            ui.label(
+                RichText::new(if self.bitrate == 0 {
+                    "Начнёт с 20 Мбит/с и поднимет до 60, пока нет потерь."
+                } else {
+                    "Это потолок: если интернет не успевает, качество снизится само и потом вернётся."
+                })
+                .color(c_muted())
+                .size(12.5),
+            );
+        });
+    }
+
     /// "Что показывать" before the start.
     fn pick_source(&mut self, ui: &mut egui::Ui) {
+        self.pick_source_h(ui, 352.0);
+    }
+
+    fn pick_source_h(&mut self, ui: &mut egui::Ui, max_h: f32) {
         if self.monitors.is_empty() {
             error_text(ui, "Мониторы не найдены");
             return;
         }
         let sel = self.choice;
         let (mut windows, monitors, rects, primary) = (std::mem::take(&mut self.windows), self.monitors.clone(), self.rects.clone(), self.primary);
-        let picked = source_picker(ui, &mut self.thumbs, &mut windows, &monitors, &rects, primary, sel, 352.0);
+        let picked = source_picker(ui, &mut self.thumbs, &mut windows, &monitors, &rects, primary, sel, max_h);
         self.windows = windows;
         if let Some(c) = picked {
             self.choose(c);
@@ -2349,7 +2526,8 @@ impl GuiApp {
     }
 
     /// "Дополнительно": quality, audio, the short-code option. Defaults need no touching.
-    fn advanced(&mut self, ui: &mut egui::Ui, with_audio: bool, with_easy: bool) {
+    fn advanced(&mut self, ui: &mut egui::Ui, with_quality: bool, with_audio: bool, with_easy: bool) {
+        if with_quality {
         ui.label(RichText::new("Качество").font(bold(15.0)));
         ui.horizontal_wrapped(|ui| {
             for (name, v) in [("Авто", 0), ("Стандарт · 30 Мбит/с", 30), ("Высокое качество · 60 Мбит/с", 60)] {
@@ -2367,6 +2545,7 @@ impl GuiApp {
             .color(c_muted())
             .size(13.0),
         );
+        }
         if with_audio {
             ui.add_space(6.0);
             ui.label(RichText::new("Звук").font(bold(15.0)));
@@ -2646,11 +2825,11 @@ impl GuiApp {
         let Some(s) = &mut self.host else {
             section(ui, |ui| {
                 ui.label(RichText::new("Что показывать").font(bold(15.0)));
-                self.pick_source(ui);
+                // The cards give way so that quality and the start button stay on the screen (at 1024x740 and up).
+                let room = ui.ctx().content_rect().height() - 32.0 - HOST_FIXED_H;
+                self.pick_source_h(ui, room.clamp(170.0, 352.0));
             });
-            if control_card(ui, &mut self.ctl, self.vigem.0, &self.drv, None) {
-                start_driver_install(&mut self.drv);
-            }
+            self.quality_card(ui);
             if let Some(e) = &self.start_error {
                 error_text(ui, e);
             }
@@ -2659,7 +2838,7 @@ impl GuiApp {
                 self.start_host(&ctx);
             }
             ui.add_space(6.0);
-            fold(ui, "Дополнительно", |ui| self.advanced(ui, true, true));
+            fold(ui, "Дополнительно", |ui| self.advanced(ui, false, true, true));
             return;
         };
 
@@ -2699,9 +2878,6 @@ impl GuiApp {
                     graph_panel(ui, &s.graph, true);
                 });
             });
-            if control_card(ui, &mut self.ctl, self.vigem.0, &self.drv, Some(&mut *s)) {
-                start_driver_install(&mut self.drv);
-            }
             // Switching without stopping: the same cards as at the start.
             let mut picked = None;
             if !self.monitors.is_empty() {
@@ -2976,7 +3152,7 @@ impl GuiApp {
                 }
             }
             ui.add_space(6.0);
-            fold(ui, "Дополнительно", |ui| self.advanced(ui, false, false));
+            fold(ui, "Дополнительно", |ui| self.advanced(ui, true, false, false));
             return;
         };
 

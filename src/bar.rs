@@ -363,18 +363,28 @@ pub fn draw(buf: &mut [u32], w: i32, h: i32, b: &Bar, st: &State) {
     // slider
     let (x0, x1, yc) = b.track();
     let th = 4 * s;
-    c.round(x0, yc - th / 2, x1 - x0, th, th / 2, DIM, 0.7);
-    let frac = (clamp_level(st.level) / MAX_LEVEL).clamp(0.0, 1.0);
-    let xk = x0 + ((x1 - x0) as f32 * frac) as i32;
-    let fill = if dead { DIM } else { ACCENT };
-    c.round(x0, yc - th / 2, (xk - x0).max(0), th, th / 2, fill, 1.0);
-    let x100 = x0 + ((x1 - x0) as f32 / MAX_LEVEL) as i32;
-    c.rect(x100, yc - 9 * s, s.max(1), 5 * s, FG, 0.55);
-    let active = matches!(st.hover, Hit::Slider(_)) && st.has_audio;
-    c.disc(xk, yc, if active { 8.5 } else { 7.0 } * s as f32, FG, 1.0);
-    c.disc(xk, yc, 3.0 * s as f32, fill, 1.0);
-    let pct = format!("{}%", percent(st.level));
-    c.digits(b.text_x(), b.y + (b.h - 15 * s) / 2, 3 * s, &pct, if dead { DIM } else { FG }, 1.0);
+    if !st.has_audio {
+        // No sound output (the self-test, or no device): the speaker is struck through and the slider is just a flat
+        // faint line without a knob or a percent, so it does not look like something that can be dragged.
+        for i in 0..8 {
+            c.rect(ix + (1 + i) * u, iy + (1 + i) * u, u, u, DIM, 1.0);
+        }
+        c.round(x0, yc - th / 2, x1 - x0, th, th / 2, DIM, 0.25);
+        c.rect(b.text_x(), b.y + b.h / 2 - s, 10 * s, 2 * s, DIM, 1.0);
+    } else {
+        c.round(x0, yc - th / 2, x1 - x0, th, th / 2, DIM, 0.7);
+        let frac = (clamp_level(st.level) / MAX_LEVEL).clamp(0.0, 1.0);
+        let xk = x0 + ((x1 - x0) as f32 * frac) as i32;
+        let fill = if dead { DIM } else { ACCENT };
+        c.round(x0, yc - th / 2, (xk - x0).max(0), th, th / 2, fill, 1.0);
+        let x100 = x0 + ((x1 - x0) as f32 / MAX_LEVEL) as i32;
+        c.rect(x100, yc - 9 * s, s.max(1), 5 * s, FG, 0.55);
+        let active = matches!(st.hover, Hit::Slider(_));
+        c.disc(xk, yc, if active { 8.5 } else { 7.0 } * s as f32, FG, 1.0);
+        c.disc(xk, yc, 3.0 * s as f32, fill, 1.0);
+        let pct = format!("{}%", percent(st.level));
+        c.digits(b.text_x(), b.y + (b.h - 15 * s) / 2, 3 * s, &pct, if dead { DIM } else { FG }, 1.0);
+    }
 
     // remote control: [gamepad icon + count] and, in a wide bar, the label (the label itself is text, drawn by the
     // window code with the font; here only the shapes)
@@ -543,6 +553,61 @@ mod tests {
         assert_eq!(b.level_at(99_999), MAX_LEVEL);
     }
 
+    /// Where the knob is drawn (x of its centre) for a level, the way `draw` places it.
+    fn knob_x(b: &Bar, level: f32) -> i32 {
+        let (x0, x1, _) = b.track();
+        x0 + ((x1 - x0) as f32 * (clamp_level(level) / MAX_LEVEL)) as i32
+    }
+
+    #[test]
+    fn slider_press_and_drag_follow_the_pointer() {
+        for (ww, sc, ctl) in [(1280, 1, false), (1280, 1, true), (800, 1, true), (3840, 2, true)] {
+            let b = Bar::with_control(ww, 720 * sc, sc, ctl);
+            let (x0, x1, yc) = b.track();
+            // a press anywhere along the track (and a little margin at the ends) is a slider hit
+            let mut last = -1.0f32;
+            for px in (x0..=x1).step_by(3) {
+                let Hit::Slider(v) = b.hit(px, yc) else { panic!("no slider at {px} (ww {ww}, ctl {ctl})") };
+                assert!(v >= last, "the level never goes back while moving right");
+                assert!((0.0..=MAX_LEVEL).contains(&v));
+                last = v;
+            }
+            assert!(matches!(b.hit(x0 - 1, yc), Hit::Slider(_)), "margin left of the track");
+            assert!(matches!(b.hit(x1 + 10 * sc, yc), Hit::Slider(_)), "margin right of the track");
+            // a drag leaves the bar sideways and up/down: the level keeps following x only, clamped at the ends
+            assert_eq!(b.level_at(-1000), 0.0);
+            assert_eq!(b.level_at(ww * sc + 1000), MAX_LEVEL);
+            assert!(b.level_at((x0 + x1) / 2) > 0.7 && b.level_at((x0 + x1) / 2) < 0.8);
+            // the knob is drawn where a press on it would put it back
+            for lv in [0.0, 0.25, 0.5, 1.0, 1.25, 1.5] {
+                let back = b.level_at(knob_x(&b, lv));
+                assert!((back - lv).abs() < 0.03 + 2.0 / (x1 - x0) as f32 * MAX_LEVEL, "{lv} -> {back}");
+            }
+            // the track is never covered by another control
+            for px in x0..=x1 {
+                assert!(!matches!(b.hit(px, yc), Hit::Mute | Hit::Stop | Hit::Fullscreen | Hit::Control), "{px}");
+            }
+        }
+    }
+
+    #[test]
+    fn slider_knob_is_drawn_with_sound_and_absent_without() {
+        let (w, h) = (1280, 720);
+        let b = Bar::new(w, h, 1);
+        let (_, _, yc) = b.track();
+        let at = |buf: &Vec<u32>, x: i32| buf[(yc * w + x) as usize];
+        for lv in [0.3f32, 1.0, 1.4] {
+            let mut buf = vec![0x00_20_20_20u32; (w * h) as usize];
+            draw(&mut buf, w, h, &b, &State { level: lv, ..st() });
+            assert_eq!(at(&buf, knob_x(&b, lv)), ACCENT, "knob centre at {lv}");
+        }
+        // no sound output: no knob and no accent fill anywhere, the percent is replaced by a dash
+        let mut buf = vec![0x00_20_20_20u32; (w * h) as usize];
+        draw(&mut buf, w, h, &b, &State { has_audio: false, ..st() });
+        assert!(!buf.contains(&ACCENT), "no accent colour without sound");
+        assert_ne!(at(&buf, knob_x(&b, 1.0)), FG, "no knob");
+    }
+
     #[test]
     fn scaled_bar_geometry() {
         let b = Bar::new(3840, 2160, 2);
@@ -619,6 +684,7 @@ mod tests {
         for (name, state, s, ww) in [
             ("a", st(), 1, 1000),
             ("b", State { muted: true, net: Some(2), fullscreen: true, hover: Hit::Stop, ..st() }, 1, 1000),
+            ("d", State { has_audio: false, ..st() }, 1, 1000),
             ("c", State { net: Some(1), hover: Hit::Fullscreen, level: 1.3, ..st() }, 2, 1400),
         ] {
             let (w, h) = (ww, 160 * s);

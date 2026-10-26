@@ -928,6 +928,12 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         start_fullscreen: !o.windowed,
         last_click: None,
         volume: player.as_ref().map(|p| p.volume.clone()),
+        no_audio_note: if !o.audio {
+            "Звук выключен: в проверке на этом ПК он не передаётся, чтобы не было эха"
+        } else {
+            "Звук недоступен: не удалось открыть устройство вывода"
+        },
+        no_audio_at: None,
         cursor: (0, 0),
         last_move: Instant::now(),
         drag: false,
@@ -966,6 +972,9 @@ struct App {
     last_click: Option<Instant>,
     /// Level and mute of the sound (None when there is no audio output).
     volume: Option<Arc<VolumeCtl>>,
+    /// Why there is no volume control, and when the bar's speaker/slider was last touched without one (shows the note).
+    no_audio_note: &'static str,
+    no_audio_at: Option<Instant>,
     cursor: (i32, i32),
     /// Last mouse movement / touch of the bar: the bar is shown for a while after it (see guilogic::bar_opacity).
     last_move: Instant,
@@ -1104,6 +1113,9 @@ impl App {
         const RED: u32 = 0x00_F0_5A_5A;
         const YELLOW: u32 = 0x00_F0_B4_3C;
         const GREEN: u32 = 0x00_3E_CF_8E;
+        if self.volume.is_none() && self.no_audio_at.is_some_and(|t| t.elapsed() < Duration::from_secs(4)) {
+            return Some((self.no_audio_note.into(), YELLOW, 1.0));
+        }
         if let Some(t) = *self.input.revoked_at.lock().unwrap() {
             if t.elapsed() < Duration::from_secs(5) {
                 return Some(("Показывающий отключил управление".into(), RED, 1.0));
@@ -1317,6 +1329,8 @@ impl ApplicationHandler<UserEv> for App {
                     v.set_level(volume::clamp_level(((v.level() + dy * 0.05) * 20.0).round() / 20.0));
                     v.set_muted(false);
                     volume::save(v);
+                } else {
+                    self.no_audio_at = Some(Instant::now());
                 }
                 self.wake_bar();
             }
@@ -1340,19 +1354,21 @@ impl ApplicationHandler<UserEv> for App {
                     hit => {
                         self.last_click = None;
                         match hit {
-                            Hit::Mute => {
-                                if let Some(v) = &self.volume {
+                            Hit::Mute => match &self.volume {
+                                Some(v) => {
                                     v.toggle_mute();
                                     volume::save(v);
                                 }
-                            }
-                            Hit::Slider(level) => {
-                                if let Some(v) = &self.volume {
+                                None => self.no_audio_at = Some(Instant::now()),
+                            },
+                            Hit::Slider(level) => match &self.volume {
+                                Some(v) => {
                                     v.set_level(level);
                                     v.set_muted(false);
                                     self.drag = true;
                                 }
-                            }
+                                None => self.no_audio_at = Some(Instant::now()),
+                            },
                             Hit::Fullscreen => self.toggle_fullscreen(),
                             Hit::Control => self.toggle_control(),
                             Hit::Stop => {
