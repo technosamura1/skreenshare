@@ -13,6 +13,8 @@ mod capture;
 mod client;
 mod gpuconv;
 mod gpulogic;
+mod hdr;
+mod hdrmath;
 mod guilogic;
 mod glass;
 mod gui;
@@ -226,6 +228,10 @@ fn run(mut a: Args) -> Result<()> {
             let dh = a.num::<u32>("--window-h", 900)?;
             a.finish()?;
             gpuconv::selftest(w, h, dw, dh)?;
+        }
+        "hdrtest" => {
+            a.finish()?;
+            hdr::selftest()?;
         }
         "overlaytest" => {
             let out = PathBuf::from(a.value("--out")?.unwrap_or_else(|| "overlay.bmp".into()));

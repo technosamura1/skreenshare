@@ -4,6 +4,8 @@
 // WGC also draws the mouse cursor into the window picture for us.
 // (Approach and code adapted from the projector project's wincap.rs.)
 use crate::capture::Event;
+use crate::hdr::{self, ToneMapper};
+use crate::hdrmath;
 use crate::source::WinEntry;
 use anyhow::{anyhow, bail, Context, Result};
 use std::sync::{Arc, Condvar, Mutex};
@@ -23,6 +25,7 @@ use windows::Win32::Foundation::{HMODULE, HWND, LPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::Foundation::CloseHandle;
@@ -31,6 +34,14 @@ use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDe
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+fn pool_format(hdr: bool) -> DirectXPixelFormat {
+    if hdr {
+        DirectXPixelFormat::R16G16B16A16Float
+    } else {
+        DirectXPixelFormat::B8G8R8A8UIntNormalized
+    }
+}
 
 fn hwnd(v: isize) -> HWND {
     HWND(v as *mut core::ffi::c_void)
@@ -166,7 +177,13 @@ pub struct WindowCapturer {
     arrived: Arc<(Mutex<bool>, Condvar)>,
     token: i64,
     pool_size: SizeInt32,
-    staging: Option<(ID3D11Texture2D, u32, u32)>,
+    staging: Option<(ID3D11Texture2D, u32, u32, i32)>,
+    /// HDR handling (see hdr.rs): the monitor's state, the format the frame pool was made with, the GPU tone
+    /// mapper (made on first use) and whether it has failed for good (then the CPU conversion is used).
+    hdr: hdr::Watcher,
+    pool_hdr: bool,
+    tone: Option<ToneMapper>,
+    tone_failed: bool,
     /// Size of the window picture in `pixels` (it changes when the user resizes the window).
     pub width: u32,
     pub height: u32,
@@ -251,7 +268,14 @@ impl WindowCapturer {
                 interop.CreateForWindow(hwnd(h)).context("не удалось начать захват этого окна (оно защищено или недоступно)")?;
             let size = item.Size()?;
             let size = SizeInt32 { Width: size.Width.max(2), Height: size.Height.max(2) };
-            let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&d3d_device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size)?;
+            // With "Use HDR" on, ask for float16 (scRGB) and tone-map it to SDR ourselves; otherwise the 8-bit
+            // format, exactly as before.
+            let hdr = hdr::Watcher::start(hdr::Target::Window(h));
+            let pool_hdr = hdr.get().active;
+            if pool_hdr {
+                println!("HDR включён на мониторе окна: захват во float16, затем перевод в SDR (белый SDR {:.0} нит)", hdr.get().white_nits);
+            }
+            let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&d3d_device, pool_format(pool_hdr), 2, size)?;
             let arrived = Arc::new((Mutex::new(false), Condvar::new()));
             let a2 = arrived.clone();
             let token = pool.FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, windows::core::IInspectable>::new(
@@ -277,6 +301,10 @@ impl WindowCapturer {
                 token,
                 pool_size: size,
                 staging: None,
+                hdr,
+                pool_hdr,
+                tone: None,
+                tone_failed: false,
                 width: size.Width as u32,
                 height: size.Height as u32,
                 pixels: vec![0; size.Width as usize * size.Height as usize * 4],
@@ -310,6 +338,12 @@ impl WindowCapturer {
             }
         }
         let Some(frame) = last else { return Ok(false) };
+        // HDR was switched on/off on this monitor: later frames must come in the matching format.
+        let now = self.hdr.get().active;
+        if now != self.pool_hdr {
+            self.pool_hdr = now;
+            self.pool.Recreate(&self.d3d_device, pool_format(now), 2, self.pool_size)?;
+        }
         let r = self.copy_frame(&frame);
         let _ = frame.Close();
         r.map(|_| true)
@@ -322,13 +356,30 @@ impl WindowCapturer {
             // The window was resized: later frames must come in the new size.
             if content.Width != self.pool_size.Width || content.Height != self.pool_size.Height {
                 self.pool_size = SizeInt32 { Width: cw as i32, Height: ch as i32 };
-                self.pool.Recreate(&self.d3d_device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, self.pool_size)?;
+                self.pool.Recreate(&self.d3d_device, pool_format(self.pool_hdr), 2, self.pool_size)?;
             }
             let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
             let tex: ID3D11Texture2D = access.GetInterface()?;
             let mut d = D3D11_TEXTURE2D_DESC::default();
             tex.GetDesc(&mut d);
-            if self.staging.as_ref().is_none_or(|(_, w, h)| (*w, *h) != (d.Width, d.Height)) {
+            // A float16 / PQ picture (HDR): tone-map it to 8-bit SDR on the GPU; if that is not possible, read it
+            // as it is and convert on the CPU below. 8-bit frames (every SDR PC) skip all of this.
+            let hdr_fmt = d.Format;
+            let mut tex = tex;
+            if hdr::is_hdr_format(hdr_fmt) && !self.tone_failed {
+                let gain = self.hdr.get().gain();
+                match self.tonemap(&tex, gain) {
+                    Ok(t8) => {
+                        tex = t8;
+                        tex.GetDesc(&mut d);
+                    }
+                    Err(e) => {
+                        println!("HDR: видеокарта не смогла перевести картинку в SDR ({e:#}); перехожу на процессор");
+                        self.tone_failed = true;
+                    }
+                }
+            }
+            if self.staging.as_ref().is_none_or(|(_, w, h, f)| (*w, *h, *f) != (d.Width, d.Height, d.Format.0)) {
                 d.Usage = D3D11_USAGE_STAGING;
                 d.BindFlags = 0;
                 d.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
@@ -337,9 +388,9 @@ impl WindowCapturer {
                 d.ArraySize = 1;
                 let mut st = None;
                 self.device.CreateTexture2D(&d, None, Some(&mut st))?;
-                self.staging = Some((st.ok_or_else(|| anyhow!("CreateTexture2D"))?, d.Width, d.Height));
+                self.staging = Some((st.ok_or_else(|| anyhow!("CreateTexture2D"))?, d.Width, d.Height, d.Format.0));
             }
-            let (st, tw, th) = self.staging.clone().unwrap();
+            let (st, tw, th, _) = self.staging.clone().unwrap();
             self.context.CopyResource(&st, &tex);
             let mut m = D3D11_MAPPED_SUBRESOURCE::default();
             self.context.Map(&st, 0, D3D11_MAP_READ, 0, Some(&mut m))?;
@@ -350,12 +401,25 @@ impl WindowCapturer {
             self.height = h;
             let row = w as usize * 4;
             self.pixels.resize(row * h as usize, 0);
-            for y in 0..h as usize {
-                self.pixels[y * row..(y + 1) * row].copy_from_slice(&src[y * m.RowPitch as usize..][..row]);
+            if d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+                hdrmath::convert_f16_to_bgra(src, m.RowPitch as usize, w as usize, h as usize, self.hdr.get().gain(), &mut self.pixels);
+            } else if d.Format == DXGI_FORMAT_R10G10B10A2_UNORM {
+                hdrmath::convert_pq10_to_bgra(src, m.RowPitch as usize, w as usize, h as usize, self.hdr.get().gain(), &mut self.pixels);
+            } else {
+                for y in 0..h as usize {
+                    self.pixels[y * row..(y + 1) * row].copy_from_slice(&src[y * m.RowPitch as usize..][..row]);
+                }
             }
             self.context.Unmap(&st, 0);
         }
         Ok(())
+    }
+
+    fn tonemap(&mut self, tex: &ID3D11Texture2D, gain: f32) -> Result<ID3D11Texture2D> {
+        if self.tone.is_none() {
+            self.tone = Some(ToneMapper::new(&self.device, &self.context)?);
+        }
+        self.tone.as_mut().unwrap().run(tex, gain)
     }
 
     /// Whether the captured window still exists.

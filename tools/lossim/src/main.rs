@@ -33,6 +33,9 @@ mod easy;
 #[path = "../../../src/viewperf.rs"]
 #[allow(dead_code)]
 mod viewperf;
+#[path = "../../../src/hdrmath.rs"]
+#[allow(dead_code)]
+mod hdrmath;
 #[path = "../../../src/gpulogic.rs"]
 #[allow(dead_code)]
 mod gpulogic;

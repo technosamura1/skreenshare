@@ -1,7 +1,9 @@
 // Screen capture via DXGI Desktop Duplication. Frames are copied to CPU memory (BGRA), which also
 // works when the monitor hangs off a different GPU (e.g. iGPU) than the one doing NVENC.
 // Desktop Duplication does not include the mouse cursor, so we draw it ourselves.
-use anyhow::{bail, Context, Result};
+use crate::hdr::{self, ToneMapper};
+use crate::hdrmath;
+use anyhow::{anyhow, bail, Context, Result};
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, POINT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -78,6 +80,14 @@ pub struct Capturer {
     output: IDXGIOutput1,
     dupl: Option<IDXGIOutputDuplication>,
     staging: Option<ID3D11Texture2D>,
+    staging_fmt: i32,
+    /// HDR handling (see hdr.rs): the monitor's state, whether the current duplication was asked for in HDR
+    /// formats, the GPU tone mapper (made on first use), whether it failed for good, and the CPU fallback's buffer.
+    hdr: hdr::Watcher,
+    dupl_hdr: bool,
+    tone: Option<ToneMapper>,
+    tone_failed: bool,
+    hdr_cpu: Vec<u8>,
     /// Desktop orientation (what the user sees); for rotated monitors the texture is tex_w x tex_h.
     pub width: u32,
     pub height: u32,
@@ -126,6 +136,12 @@ impl Capturer {
                 output,
                 dupl: None,
                 staging: None,
+                staging_fmt: 0,
+                hdr: hdr::Watcher::start(hdr::Target::Point(monitor.left + 1, monitor.top + 1)),
+                dupl_hdr: false,
+                tone: None,
+                tone_failed: false,
+                hdr_cpu: Vec::new(),
                 width: 0,
                 height: 0,
                 tex_w: 0,
@@ -143,10 +159,22 @@ impl Capturer {
         self.dupl = None;
         self.staging = None;
         unsafe {
-            let dupl = self
-                .output
-                .DuplicateOutput(&self.device)
-                .context("DuplicateOutput (захват экрана недоступен)")?;
+            // With "Use HDR" on, ask for the float16 / 10-bit picture (the plain 8-bit one is clipped and far too
+            // bright); everything else, and any failure of that, goes the way it always did.
+            self.dupl_hdr = self.hdr.get().active;
+            let hdr_dupl = if self.dupl_hdr {
+                let formats = [DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM];
+                self.output.cast::<IDXGIOutput5>().and_then(|o| o.DuplicateOutput1(&self.device, 0, &formats)).ok()
+            } else {
+                None
+            };
+            let dupl = match hdr_dupl {
+                Some(d) => {
+                    println!("HDR включён на мониторе: захват во float16, затем перевод в SDR (белый SDR {:.0} нит)", self.hdr.get().white_nits);
+                    d
+                }
+                None => self.output.DuplicateOutput(&self.device).context("DuplicateOutput (захват экрана недоступен)")?,
+            };
             let desc = dupl.GetDesc();
             // ModeDesc is already in desktop orientation; the acquired texture is in scan-out orientation.
             self.width = desc.ModeDesc.Width;
@@ -163,6 +191,13 @@ impl Capturer {
     pub fn next(&mut self, timeout_ms: u32) -> Result<Event> {
         if self.dupl.is_none() {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            return Ok(match self.reinit() {
+                Ok(()) => Event::Reset,
+                Err(_) => Event::Timeout,
+            });
+        }
+        if self.hdr.get().active != self.dupl_hdr {
+            self.dupl = None; // HDR was switched on/off: start the duplication again in the matching format
             return Ok(match self.reinit() {
                 Ok(()) => Event::Reset,
                 Err(_) => Event::Timeout,
@@ -200,13 +235,27 @@ impl Capturer {
         unsafe {
             if info.LastPresentTime != 0 {
                 if let Some(res) = res {
-                    let tex: ID3D11Texture2D = res.cast()?;
-                    if self.staging.is_none() {
-                        let mut d = D3D11_TEXTURE2D_DESC::default();
-                        tex.GetDesc(&mut d);
-                        if (d.Width, d.Height) != (self.tex_w, self.tex_h) {
-                            bail!("неожиданный размер кадра {}x{} (ждал {}x{})", d.Width, d.Height, self.tex_w, self.tex_h);
+                    let mut tex: ID3D11Texture2D = res.cast()?;
+                    let mut d = D3D11_TEXTURE2D_DESC::default();
+                    tex.GetDesc(&mut d);
+                    if (d.Width, d.Height) != (self.tex_w, self.tex_h) {
+                        bail!("неожиданный размер кадра {}x{} (ждал {}x{})", d.Width, d.Height, self.tex_w, self.tex_h);
+                    }
+                    // Float16 / PQ picture (only when HDR is on): to 8-bit SDR on the GPU, else on the CPU below.
+                    let hdr_fmt = d.Format;
+                    if hdr::is_hdr_format(hdr_fmt) && !self.tone_failed {
+                        match self.tonemap(&tex) {
+                            Ok(t8) => {
+                                tex = t8;
+                                tex.GetDesc(&mut d);
+                            }
+                            Err(e) => {
+                                println!("HDR: видеокарта не смогла перевести картинку в SDR ({e:#}); перехожу на процессор");
+                                self.tone_failed = true;
+                            }
                         }
+                    }
+                    if self.staging.is_none() || self.staging_fmt != d.Format.0 {
                         d.Usage = D3D11_USAGE_STAGING;
                         d.BindFlags = 0;
                         d.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
@@ -216,13 +265,27 @@ impl Capturer {
                         let mut st = None;
                         self.device.CreateTexture2D(&d, None, Some(&mut st))?;
                         self.staging = st;
+                        self.staging_fmt = d.Format.0;
                     }
                     let st = self.staging.clone().unwrap();
                     self.context.CopyResource(&st, &tex);
                     let mut m = D3D11_MAPPED_SUBRESOURCE::default();
                     self.context.Map(&st, 0, D3D11_MAP_READ, 0, Some(&mut m))?;
                     let src = std::slice::from_raw_parts(m.pData as *const u8, m.RowPitch as usize * self.tex_h as usize);
-                    self.copy_rotated(src, m.RowPitch as usize);
+                    if d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || d.Format == DXGI_FORMAT_R10G10B10A2_UNORM {
+                        let (tw, th, gain) = (self.tex_w as usize, self.tex_h as usize, self.hdr.get().gain());
+                        let mut buf = std::mem::take(&mut self.hdr_cpu);
+                        buf.resize(tw * th * 4, 0);
+                        if d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+                            hdrmath::convert_f16_to_bgra(src, m.RowPitch as usize, tw, th, gain, &mut buf);
+                        } else {
+                            hdrmath::convert_pq10_to_bgra(src, m.RowPitch as usize, tw, th, gain, &mut buf);
+                        }
+                        self.copy_rotated(&buf, tw * 4);
+                        self.hdr_cpu = buf;
+                    } else {
+                        self.copy_rotated(src, m.RowPitch as usize);
+                    }
                     self.context.Unmap(&st, 0);
                 }
             }
@@ -244,6 +307,14 @@ impl Capturer {
             }
         }
         Ok(())
+    }
+
+    fn tonemap(&mut self, tex: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
+        if self.tone.is_none() {
+            self.tone = Some(ToneMapper::new(&self.device, &self.context)?);
+        }
+        let gain = self.hdr.get().gain();
+        self.tone.as_mut().unwrap().run(tex, gain).map_err(|e| anyhow!("{e:#}"))
     }
 
     /// Texture (scan-out orientation) -> desktop buffer (what the user sees).
