@@ -125,10 +125,10 @@ pub struct State {
     pub time: f32,
 }
 
-const BG: u32 = 0x00_14_16_1B;
+const BG: u32 = 0x00_0D_11_18;
 const FG: u32 = 0x00_E8_EA_EE;
 const DIM: u32 = 0x00_6A_6F_7B;
-const ACCENT: u32 = 0x00_4C_8D_FF;
+const ACCENT: u32 = 0x00_2F_86_F6;
 const RED: u32 = 0x00_F0_5A_5A;
 const GREEN: u32 = 0x00_3E_CF_8E;
 const YELLOW: u32 = 0x00_F0_B4_3C;
@@ -179,6 +179,31 @@ impl Cv<'_> {
                     1.0
                 };
                 self.px(xx, yy, color, alpha * cov);
+            }
+        }
+    }
+    /// A 1-unit outline just inside the rounded rectangle's edge (anti-aliased), for the glassy border.
+    fn outline(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, t: i32, color: u32, alpha: f32) {
+        let cover = |xx: i32, yy: i32, x: i32, y: i32, w: i32, h: i32, r: i32| -> f32 {
+            if xx < x || yy < y || xx >= x + w || yy >= y + h {
+                return 0.0;
+            }
+            let dx = if xx < x + r { x + r - xx } else if xx >= x + w - r { xx - (x + w - r - 1) } else { 0 };
+            let dy = if yy < y + r { y + r - yy } else if yy >= y + h - r { yy - (y + h - r - 1) } else { 0 };
+            if dx > 0 && dy > 0 {
+                (r as f32 - ((dx * dx + dy * dy) as f32).sqrt() + 0.5).clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        };
+        for yy in y.max(0)..(y + h).min(self.h) {
+            for xx in x.max(0)..(x + w).min(self.w) {
+                let out = cover(xx, yy, x, y, w, h, r);
+                let inn = cover(xx, yy, x + t, y + t, w - 2 * t, h - 2 * t, (r - t).max(0));
+                let c = out * (1.0 - inn);
+                if c > 0.0 {
+                    self.px(xx, yy, color, alpha * c);
+                }
             }
         }
     }
@@ -236,9 +261,10 @@ pub fn draw(buf: &mut [u32], w: i32, h: i32, b: &Bar, st: &State) {
     }
     let mut c = Cv { buf, w, h, k: st.opacity.clamp(0.0, 1.0) };
     let s = b.s;
-    c.round(b.x, b.y, b.w, b.h, 18 * s, BG, 0.82);
-    // hairline highlight on top edge
-    c.rect(b.x + 18 * s, b.y, b.w - 36 * s, s.max(1), FG, 0.12);
+    c.round(b.x, b.y, b.w, b.h, 18 * s, BG, 0.88);
+    // glassy 1px border, brighter on the top edge
+    c.outline(b.x, b.y, b.w, b.h, 18 * s, s.max(1), 0x00_8F_A6_C8, 0.22);
+    c.rect(b.x + 18 * s, b.y + s.max(1), b.w - 36 * s, s.max(1), FG, 0.06);
 
     let hov = |c: &mut Cv, r: (i32, i32, i32, i32), on: bool| {
         if on {

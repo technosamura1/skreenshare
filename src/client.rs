@@ -194,7 +194,7 @@ fn log_path() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("screenshare").join("viewer.log"))
 }
 
-/// Appends a line to %LOCALAPPDATA%\screenshare\viewer.log (cut when it grows past 1 MB): something a friend
+/// Appends a line to %LOCALAPPDATA%\screenshare\viewer.log (cut when it grows past 1 MB): something a user
 /// can send over when "it lags".
 fn log_line(line: &str) {
     use std::io::Write;
