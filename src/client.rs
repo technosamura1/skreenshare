@@ -449,6 +449,11 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             let (mut sent0, mut comp0, mut dec0, mut vrx0, mut vmiss0, mut alost0, mut aexp0) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
             let (mut au0, mut arec0, mut aconc0) = (crate::playout::PlayStats::default(), 0u64, 0u64);
             let mut keyreq = KeyRequester::new();
+            // Network lamp, judged once a second from this side's own counters.
+            let mut nq = crate::netq::NetQuality::new(crate::netq::Side::Viewer);
+            let (mut nq_rx0, mut nq_miss0, mut nq_res0) = (0u64, 0u64, 0u64);
+            let mut nq_emit = Instant::now() - Duration::from_secs(10);
+            ui::net(&nq);
             // Ping right away: the first round-trip time sets the retry timing for lost packets.
             send_ping(&sock, peer, token, &sh, &mut out);
             while sh.running.load(Ordering::Relaxed) {
@@ -477,8 +482,27 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         gave_up: sh.rx_gave_up.load(Ordering::Relaxed),
                         requested: 0,
                     };
-                    ratectl::encode_report(&st, &mut out);
+                    ratectl::encode_report_rtt(&st, sh.rtt_us.load(Ordering::Relaxed), &mut out);
                     let _ = sock.send_to(&out, peer);
+                }
+                if tick % 10 == 0 {
+                    let (rx, miss, res) =
+                        (sh.rx_received.load(Ordering::Relaxed), sh.rx_missed.load(Ordering::Relaxed), sh.rx_residual.load(Ordering::Relaxed));
+                    let (drx, dmiss, dres) = (rx.saturating_sub(nq_rx0), miss.saturating_sub(nq_miss0), res.saturating_sub(nq_res0));
+                    (nq_rx0, nq_miss0, nq_res0) = (rx, miss, res);
+                    let total = (drx + dmiss).max(1) as f64;
+                    let rtt = sh.rtt_us.load(Ordering::Relaxed);
+                    let sample = crate::netq::Sample {
+                        dt_ms: 1000,
+                        loss: dmiss as f64 / total,
+                        residual: dres as f64 / total,
+                        rtt_ms: (rtt > 0).then(|| rtt as f64 / 1000.0),
+                        ..Default::default()
+                    };
+                    if drx + dmiss > 0 && (nq.update(sample).is_some() || nq_emit.elapsed() > Duration::from_secs(2)) {
+                        nq_emit = Instant::now();
+                        ui::net(&nq);
+                    }
                 }
                 if sh.now_ms().saturating_sub(sh.last_seen_ms.load(Ordering::Relaxed)) > 10_000 {
                     println!("Связь потеряна.");
@@ -564,8 +588,9 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         _ => "CPU (GPU не работает)",
                     };
                     let _ = proxy.send_event(UserEv::Title(format!(
-                        "screenshare — {short} · {fps:.0} к/с · декод {dec_ms:.1} мс · пинг {:.0} мс — F11: полный экран",
-                        sh.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0
+                        "screenshare — {short} · {fps:.0} к/с · декод {dec_ms:.1} мс · пинг {:.0} мс · {} — F11: полный экран",
+                        sh.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                        nq.text()
                     )));
                     (b0, f0) = (b, f);
                     stat_t = Instant::now();

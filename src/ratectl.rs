@@ -12,6 +12,8 @@ pub struct ReportDelta {
     pub missed: u64,
     pub residual: u64,
     pub gave_up: u64,
+    /// The viewer's last round-trip time in microseconds (0 = not reported: an older viewer).
+    pub rtt_us: u64,
 }
 
 impl ReportDelta {
@@ -21,8 +23,14 @@ impl ReportDelta {
 }
 
 /// Viewer -> host report body: running totals, u64 LE each: received | missed | residual | gave_up.
+#[allow(dead_code)]
 pub fn encode_report(s: &Stats, out: &mut Vec<u8>) {
-    for v in [s.received, s.missed, s.residual, s.gave_up] {
+    encode_report_rtt(s, 0, out)
+}
+
+/// Same plus the viewer's round-trip time (a fifth number; an older host ignores it).
+pub fn encode_report_rtt(s: &Stats, rtt_us: u64, out: &mut Vec<u8>) {
+    for v in [s.received, s.missed, s.residual, s.gave_up, rtt_us] {
         out.extend_from_slice(&v.to_le_bytes());
     }
 }
@@ -50,6 +58,7 @@ impl ReportTracker {
             missed: now[1].saturating_sub(self.last[1]),
             residual: now[2].saturating_sub(self.last[2]),
             gave_up: now[3].saturating_sub(self.last[3]),
+            rtt_us: body.get(32..40).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap())),
         };
         self.last = now;
         (d.total() > 0).then_some(d)
@@ -65,10 +74,36 @@ const REPAIR_FAIL: f64 = 0.4;
 const SOFT_LOSS: f64 = 0.04;
 const SOFT_FLOOR: f64 = 0.6;
 
+/// "Авто": the start-of-session ramp. Starts low, steps up while the link is clean and the round-trip time stays put,
+/// stops at the first sign of trouble (and backs off one step), after which the ordinary adaptive logic takes over.
+#[derive(Clone, Copy, Debug)]
+pub struct Ramp {
+    last_step: Instant,
+    /// Smallest round-trip time seen (ms): the "quiet link" reference.
+    base_rtt_ms: f64,
+}
+
+/// Where Авто starts (Mbit/s), unless the cap is lower.
+pub fn auto_start(max: f64) -> f64 {
+    RAMP_START.min(max)
+}
+
+const RAMP_START: f64 = 20.0;
+const RAMP_STEP: Duration = Duration::from_millis(1500);
+const RAMP_FACTOR: f64 = 1.25;
+/// Raw loss that is still "near zero" for the ramp.
+const RAMP_LOSS: f64 = 0.005;
+
 pub struct RateControl {
     max: f64,
     pub cur: f64,
+    /// Some while the Авто ramp is still climbing.
+    pub ramp: Option<Ramp>,
+    /// Set by the ramp when trouble ended it (Авто settled below the maximum).
+    pub ramp_stopped_by_loss: bool,
     last_down: Option<Instant>,
+    /// Last cut made by the ordinary logic (not the Авто ramp settling): what the network lamp reports.
+    cut_at: Option<Instant>,
     last_up: Option<Instant>,
     clean_since: Instant,
     /// How long the link must be clean before the next increase (grows if probing keeps failing).
@@ -83,7 +118,51 @@ impl RateControl {
     const HOLD_MAX: Duration = Duration::from_secs(24);
 
     pub fn new(max: f64, now: Instant) -> Self {
-        RateControl { max, cur: max, last_down: None, last_up: None, clean_since: now, hold: Self::HOLD_BASE, window: VecDeque::new() }
+        RateControl {
+            max,
+            cur: max,
+            ramp: None,
+            ramp_stopped_by_loss: false,
+            last_down: None,
+            cut_at: None,
+            last_up: None,
+            clean_since: now,
+            hold: Self::HOLD_BASE,
+            window: VecDeque::new(),
+        }
+    }
+
+    /// Авто: start at `RAMP_START` (or lower when the cap is lower) and climb to `max`.
+    pub fn new_auto(max: f64, now: Instant) -> Self {
+        let mut rc = Self::new(max, now);
+        rc.cur = RAMP_START.min(max);
+        if rc.cur < max {
+            rc.ramp = Some(Ramp { last_step: now, base_rtt_ms: f64::INFINITY });
+        }
+        rc
+    }
+
+    /// The most the controller may ask for (the cap of the preset, or of the software encoder).
+    pub fn max(&self) -> f64 {
+        self.max
+    }
+
+    /// Lowers the cap (a software encoder can't produce more); a running ramp then simply ends at it.
+    pub fn clamp_max(&mut self, cap: f64) {
+        if cap < self.max {
+            self.max = cap;
+        }
+        if self.cur > self.max {
+            self.cur = self.max;
+        }
+        if self.cur >= self.max {
+            self.ramp = None;
+        }
+    }
+
+    /// True when quality was recently cut: the lamp says "снизил качество".
+    pub fn recently_cut(&self, now: Instant) -> bool {
+        self.cut_at.is_some_and(|t| now.duration_since(t) < Duration::from_secs(30))
     }
 
     /// Feed one report interval; returns the new target bitrate (Mbit/s) if it changed.
@@ -105,6 +184,11 @@ impl RateControl {
         let raw = missed as f64 / total;
         let res = residual as f64 / total;
         let before = self.cur;
+        if let Some(r) = self.ramp {
+            if self.update_ramp(now, d, raw, res, r) {
+                return ((self.cur - before).abs() > 1e-9).then_some(self.cur);
+            }
+        }
         let factor = if d.gave_up > 0 || res > 0.02 || raw > 0.25 {
             Some(0.7)
         } else if (res > 0.004 && res > REPAIR_FAIL * raw) || raw > 0.12 || (raw > SOFT_LOSS && self.cur > self.max * SOFT_FLOOR) {
@@ -122,6 +206,7 @@ impl RateControl {
                 }
                 self.cur = (self.cur * f).max(Self::MIN);
                 self.last_down = Some(now);
+                self.cut_at = Some(now);
             }
             self.clean_since = now;
         } else if res > 0.0 && res > REPAIR_FAIL * raw || raw > 0.03 {
@@ -137,12 +222,51 @@ impl RateControl {
     }
 }
 
+impl RateControl {
+    /// One report during the Авто ramp. Returns true when the ramp handled the report (still climbing or just
+    /// stopped); false when the ordinary logic should look at it (the ramp is over and `self.ramp` is None).
+    fn update_ramp(&mut self, now: Instant, d: ReportDelta, raw: f64, res: f64, mut r: Ramp) -> bool {
+        let rtt_ms = d.rtt_us as f64 / 1000.0;
+        if rtt_ms > 0.0 {
+            r.base_rtt_ms = r.base_rtt_ms.min(rtt_ms);
+        }
+        // Round-trip time stable = not above the quiet value by much (a filling queue shows up here before any loss).
+        let rtt_bad = rtt_ms > 0.0 && r.base_rtt_ms.is_finite() && rtt_ms > r.base_rtt_ms * 1.5 + 25.0;
+        let trouble = d.gave_up > 0 || res > 0.0 || raw > RAMP_LOSS * 24.0 || rtt_bad;
+        if trouble {
+            // Step back to the last rate that was fine and stay there; the ordinary logic keeps adapting from here.
+            let prev = (self.cur / RAMP_FACTOR).max(RAMP_START.min(self.max) * 0.75).max(Self::MIN);
+            self.cur = if self.cur > RAMP_START.min(self.max) { prev.max(RAMP_START.min(self.max)) } else { self.cur };
+            self.cur = self.cur.min(self.max);
+            self.ramp = None;
+            self.ramp_stopped_by_loss = true;
+            self.last_down = Some(now);
+            self.clean_since = now;
+            self.hold = Self::HOLD_MAX / 2; // do not poke at the limit again soon
+            self.window.clear();
+            return true;
+        }
+        // Reordering alone shows up as a few % "missed" that is repaired at once; what really counts is damage that retransmission could not repair (residual / gave_up) and the round-trip time.
+        if raw <= RAMP_LOSS * 16.0 && now.duration_since(r.last_step) >= RAMP_STEP {
+            self.cur = (self.cur * RAMP_FACTOR).min(self.max);
+            r.last_step = now;
+            if self.cur >= self.max {
+                self.ramp = None; // reached the top
+                self.clean_since = now;
+                return true;
+            }
+        }
+        self.ramp = Some(r);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn d(received: u64, missed: u64, residual: u64, gave_up: u64) -> ReportDelta {
-        ReportDelta { received, missed, residual, gave_up }
+        ReportDelta { received, missed, residual, gave_up, rtt_us: 0 }
     }
 
     #[test]
@@ -250,5 +374,109 @@ mod tests {
             }
             assert!(rc.cur >= max * SOFT_FLOOR * 0.85 - 1e-9 && rc.cur >= RateControl::MIN, "max {max}: {}", rc.cur);
         }
+    }
+
+    fn drive(rc: &mut RateControl, t0: Instant, secs: u32, dd: impl Fn(u32) -> ReportDelta) -> Vec<f64> {
+        let mut seen = vec![rc.cur];
+        for i in 1..=secs * 2 {
+            rc.update(t0 + Duration::from_millis(500 * i as u64), dd(i));
+            seen.push(rc.cur);
+        }
+        seen
+    }
+
+    fn with_rtt(mut x: ReportDelta, ms: u64) -> ReportDelta {
+        x.rtt_us = ms * 1000;
+        x
+    }
+
+    #[test]
+    fn auto_starts_at_20_and_ramps_to_60_on_a_clean_link() {
+        let t = Instant::now();
+        let mut rc = RateControl::new_auto(60.0, t);
+        assert_eq!(rc.cur, 20.0);
+        let seen = drive(&mut rc, t, 30, |_| with_rtt(d(1000, 0, 0, 0), 30));
+        assert_eq!(rc.cur, 60.0, "{seen:?}");
+        assert!(rc.ramp.is_none() && !rc.ramp_stopped_by_loss);
+        // it takes a few seconds, not an instant jump, and never overshoots
+        let first60 = seen.iter().position(|&v| v == 60.0).unwrap();
+        assert!(first60 >= 8 && first60 <= 24, "reached 60 after {first60} reports");
+        assert!(seen.iter().all(|&v| v <= 60.0));
+    }
+
+    #[test]
+    fn auto_stops_and_backs_off_one_step_when_loss_appears() {
+        let t = Instant::now();
+        let mut rc = RateControl::new_auto(60.0, t);
+        // clean for 4 s, then the link starts losing packets that repairs cannot fix
+        let (mut peak, mut at_stop) = (0.0f64, None);
+        for i in 1..=40u64 {
+            let rep = if i < 8 { with_rtt(d(1000, 0, 0, 0), 30) } else { with_rtt(d(900, 100, 40, 0), 30) };
+            let was_ramping = rc.ramp.is_some();
+            rc.update(t + Duration::from_millis(500 * i), rep);
+            if was_ramping && rc.ramp.is_none() && at_stop.is_none() {
+                at_stop = Some(rc.cur);
+            }
+            if at_stop.is_none() {
+                peak = peak.max(rc.cur);
+            }
+        }
+        assert!(rc.ramp_stopped_by_loss);
+        let at_stop = at_stop.expect("ramp stopped");
+        assert!(peak > 20.0 && peak < 60.0, "peak {peak}");
+        assert!(at_stop < peak && at_stop >= 20.0, "peak {peak}, after stop {at_stop}");
+    }
+
+    #[test]
+    fn auto_stops_when_the_round_trip_time_balloons_even_without_loss() {
+        let t = Instant::now();
+        let mut rc = RateControl::new_auto(60.0, t);
+        let seen = drive(&mut rc, t, 20, |i| with_rtt(d(1000, 0, 0, 0), if i < 10 { 30 } else { 400 }));
+        assert!(rc.ramp_stopped_by_loss && rc.cur < 60.0, "{seen:?}");
+        // and no more climbing right after
+        let at_stop = rc.cur;
+        let t2 = t + Duration::from_secs(10);
+        for i in 1..=4 {
+            rc.update(t2 + Duration::from_millis(500 * i), with_rtt(d(1000, 0, 0, 0), 400));
+        }
+        assert!(rc.cur <= at_stop + 1e-9);
+    }
+
+    #[test]
+    fn auto_after_the_ramp_still_cuts_on_loss_and_recovers_slowly() {
+        let t = Instant::now();
+        let mut rc = RateControl::new_auto(60.0, t);
+        drive(&mut rc, t, 30, |_| with_rtt(d(1000, 0, 0, 0), 30));
+        assert_eq!(rc.cur, 60.0);
+        let t2 = t + Duration::from_secs(30);
+        assert!(rc.update(t2 + Duration::from_millis(500), d(700, 300, 100, 0)).is_some());
+        assert!(rc.cur < 45.0);
+        assert!(rc.recently_cut(t2 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn clamp_max_ends_the_ramp_at_a_software_encoder_cap() {
+        let t = Instant::now();
+        let mut rc = RateControl::new_auto(60.0, t);
+        rc.clamp_max(15.0);
+        assert_eq!((rc.cur, rc.max(), rc.ramp.is_none()), (15.0, 15.0, true));
+        let mut m = RateControl::new(30.0, t);
+        m.clamp_max(100.0);
+        assert_eq!((m.cur, m.max()), (30.0, 30.0));
+    }
+
+    #[test]
+    fn report_carries_the_round_trip_time_and_old_reports_still_parse() {
+        let st = Stats { received: 100, missed: 5, recovered: 4, residual: 1, gave_up: 0, requested: 0 };
+        let mut b = Vec::new();
+        encode_report_rtt(&st, 42_000, &mut b);
+        let mut tr = ReportTracker::default();
+        let dd = tr.on_report(&b).unwrap();
+        assert_eq!((dd.received, dd.missed, dd.residual, dd.rtt_us), (100, 5, 1, 42_000));
+        let mut old = Vec::new();
+        for v in [200u64, 5, 1, 0] {
+            old.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(tr.on_report(&old).unwrap().rtt_us, 0);
     }
 }

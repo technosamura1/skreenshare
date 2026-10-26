@@ -66,6 +66,42 @@ fn exe_of(pid: u32) -> Option<String> {
     }
 }
 
+/// The process whose sound belongs to window `h`: its owner, except for Store (UWP) apps, whose frame window belongs
+/// to ApplicationFrameHost.exe while the app itself (and its sound) lives in another process, found among the
+/// frame's child windows. None when the window is gone.
+pub fn audio_pid_of(h: isize) -> Option<u32> {
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd(h), Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+        let host = exe_of(pid).is_some_and(|e| e.to_ascii_lowercase().ends_with("applicationframehost.exe"));
+        if host {
+            struct Ctx {
+                frame: u32,
+                found: u32,
+            }
+            unsafe extern "system" fn cb(c: HWND, lp: LPARAM) -> BOOL {
+                let ctx = unsafe { &mut *(lp.0 as *mut Ctx) };
+                let mut p = 0u32;
+                unsafe { GetWindowThreadProcessId(c, Some(&mut p)) };
+                if p != 0 && p != ctx.frame {
+                    ctx.found = p;
+                    return BOOL(0);
+                }
+                BOOL(1)
+            }
+            let mut ctx = Ctx { frame: pid, found: 0 };
+            let _ = EnumChildWindows(Some(hwnd(h)), Some(cb), LPARAM(&mut ctx as *mut Ctx as isize));
+            if ctx.found != 0 {
+                return Some(ctx.found);
+            }
+        }
+        Some(pid)
+    }
+}
+
 /// Top-level windows a person would call "a window": visible, titled, not a tool window / background app,
 /// not ours (windows of this program, including a viewer window of the self-test, are skipped). Roughly what
 /// Alt+Tab shows.

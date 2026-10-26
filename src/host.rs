@@ -2,6 +2,8 @@
 use crate::capture::{self, Capturer, Event, MonitorInfo};
 use crate::audiopkt::AudioTx;
 use crate::net::{self, Code};
+use crate::audiosel::{self, AudioPlan, AudioPrefs};
+use crate::netq::{NetQuality, Sample, Side};
 use crate::ratectl::{RateControl, ReportTracker};
 use crate::retx::{self, pacer_rate, KeyGate, Poll};
 use crate::ui::{self, Exchange};
@@ -19,11 +21,14 @@ pub struct HostOpts {
     pub monitor: Option<usize>,
     /// Stream only this window (HWND). The stream keeps the monitor's resolution; the window is letterboxed in it.
     pub window: Option<isize>,
+    /// "Авто": start low and ramp up to `bitrate_mbps` (the ceiling) while the link is clean.
+    pub auto_bitrate: bool,
     pub bitrate_mbps: u32,
     pub fps: u32,
     pub preset: String,
     pub max_send_mbps: u32,
     pub audio: bool,
+    pub audio_prefs: AudioPrefs,
     pub exchange: Exchange,
 }
 
@@ -84,20 +89,10 @@ impl Shared {
 
 enum AudioSource {
     Off,
-    /// Process loopback: everything except the voice app (if one is running).
-    Filtered(#[allow(dead_code)] crate::loopback::Capture, Option<u32>),
-    /// Plain loopback of the whole system; only used when no voice app is running.
+    /// Process loopback: only one window's process, or everything except the voice app / ourselves.
+    Process(#[allow(dead_code)] crate::loopback::Capture),
+    /// Plain loopback of the whole system; only used when process loopback is unavailable and nothing must be excluded.
     Everything(#[allow(dead_code)] cpal::Stream),
-}
-
-impl AudioSource {
-    /// PID of the voice app this source keeps out (None also for "nothing to exclude").
-    fn excluded(&self) -> Option<u32> {
-        match self {
-            AudioSource::Filtered(_, pid) => *pid,
-            _ => None,
-        }
-    }
 }
 
 type AudioSink = Box<dyn FnMut(&[i16], u32) + Send>;
@@ -146,29 +141,53 @@ fn audio_sender(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, sh: Arc<Shar
     })
 }
 
-/// Never streams the voice chat back to the friend: if it can't be excluded, no audio at all.
-fn start_audio(make_sink: &dyn Fn() -> AudioSink) -> AudioSource {
+/// What to capture for the current source, given the user's checkboxes: see `audiosel::choose`.
+fn plan_audio(prefs: AudioPrefs, window: Option<isize>) -> AudioPlan {
+    let window_pid = window.and_then(crate::wincap::audio_pid_of);
+    audiosel::choose(prefs, window_pid, crate::loopback::find_voice_app().map(|v| v.0), std::process::id())
+}
+
+/// Starts the capture for `want`. Never streams the voice chat back to the friend: if a running voice app should be
+/// excluded and can't be, no audio at all. `fallback` is what is used when "only this window" is not possible
+/// (older Windows): the same choice with the window checkbox off. `shown` is the window title, for the status line.
+fn start_audio(make_sink: &dyn Fn() -> AudioSink, want: AudioPlan, fallback: AudioPlan, shown: Option<&str>) -> AudioSource {
     use crate::loopback::{self, Mode};
     // Sync test: capture only the beacon, so the viewer's own playback on this PC isn't re-captured.
     if let Some(pid) = std::env::var("SS_AUDIO_ONLY_PID").ok().and_then(|v| v.parse().ok()) {
         return match loopback::start(pid, Mode::Include, make_sink()) {
-            Ok(c) => AudioSource::Filtered(c, loopback::find_voice_app().map(|v| v.0)),
+            Ok(c) => AudioSource::Process(c),
             Err(e) => {
                 ui::audio_status(&format!("Звук не захватывается: {e:#}"));
                 AudioSource::Off
             }
         };
     }
-    let voice = loopback::find_voice_app();
-    // With no voice app we still use process loopback (excluding ourselves) to get the same format.
-    let target = voice.map(|v| v.0).unwrap_or(std::process::id());
+    let mut window_note = String::new();
+    if let AudioPlan::OnlyProcess(pid) = want {
+        match loopback::start(pid, Mode::Include, make_sink()) {
+            Ok(c) => {
+                ui::audio_status(&format!(
+                    "Звук: только из окна «{}» — другие программы и Discord не слышны",
+                    crate::source::ellipsize(shown.unwrap_or("окно"), 40)
+                ));
+                return AudioSource::Process(c);
+            }
+            Err(e) => window_note = format!(" (звук только из окна здесь недоступен: {e:#})"),
+        }
+    }
+    let target = if matches!(want, AudioPlan::OnlyProcess(_)) { fallback.pid() } else { want.pid() };
+    let me = std::process::id();
+    let voice = loopback::find_voice_app().filter(|v| v.0 == target);
     match loopback::start(target, Mode::Exclude, make_sink()) {
         Ok(c) => {
-            ui::audio_status(&match voice {
-                Some((_, name)) => format!("Звук: передаётся всё, кроме {name} — эха не будет"),
-                None => "Звук: передаётся весь звук компьютера (Discord не запущен)".to_string(),
+            ui::audio_status(&match (&voice, target == me) {
+                (Some((_, name)), _) => format!("Звук: передаётся всё, кроме {name} — эха не будет{window_note}"),
+                (None, true) if loopback::find_voice_app().is_some() => {
+                    format!("Звук: передаётся весь звук компьютера, Discord тоже слышен{window_note}")
+                }
+                _ => format!("Звук: передаётся весь звук компьютера{window_note}"),
             });
-            AudioSource::Filtered(c, voice.map(|v| v.0))
+            AudioSource::Process(c)
         }
         Err(e) if voice.is_some() => {
             ui::audio_status(&format!(
@@ -179,7 +198,7 @@ fn start_audio(make_sink: &dyn Fn() -> AudioSink) -> AudioSource {
         }
         Err(_) => match crate::audio::start_capture(make_sink()) {
             Ok(s) => {
-                ui::audio_status("Звук: передаётся весь звук компьютера");
+                ui::audio_status(&format!("Звук: передаётся весь звук компьютера{window_note}"));
                 AudioSource::Everything(s)
             }
             Err(e) => {
@@ -392,7 +411,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         sent_bytes: AtomicU64::new(0),
         resent: AtomicU64::new(0),
         loss_bp: AtomicU32::new(0),
-        send_rate: AtomicU64::new(pacer_rate(o.bitrate_mbps as f64, o.max_send_mbps)),
+        send_rate: AtomicU64::new(pacer_rate(if o.auto_bitrate { crate::ratectl::auto_start(o.bitrate_mbps as f64) } else { o.bitrate_mbps as f64 }, o.max_send_mbps)),
         peer_opus: AtomicBool::new(false),
         audio_hist: Mutex::new(None),
         backlog: AtomicUsize::new(0),
@@ -522,8 +541,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
 
     let seq = Arc::new(AtomicU32::new(0));
     let sender_for_audio = || audio_sender(sock.clone(), peer, token, sh.clone(), seq.clone());
-    let mut audio = if o.audio { start_audio(&sender_for_audio) } else { AudioSource::Off };
-    let mut audio_check = Instant::now();
+    let mut prefs = o.audio_prefs;
 
     // The stream canvas is the monitor's size whatever is shown, so going from a window back to the full screen
     // (or the other way round) never changes the resolution the viewer gets.
@@ -560,6 +578,19 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             Cap::Screen(Capturer::new(&monitor)?)
         }
     };
+    // The window whose process is the sound source (None while a whole screen is shown).
+    let mut audio_window = match &cap {
+        Cap::Window(_) => o.window,
+        Cap::Screen(_) => None,
+    };
+    let mut audio_want = plan_audio(prefs, audio_window);
+    let mut audio = if o.audio {
+        start_audio(&sender_for_audio, audio_want, plan_audio(AudioPrefs { window_only: false, ..prefs }, None), window_title.as_deref())
+    } else {
+        AudioSource::Off
+    };
+    let mut audio_check = Instant::now();
+    let mut audio_dirty = false;
     let (mut pv, pv_thread) = Preview::new();
     let mut scaler = BgraScaler::new();
     let mut scratch: Vec<u8> = Vec::new();
@@ -577,7 +608,21 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     let mut stat_enc = Duration::ZERO;
     let mut stat_bytes0 = 0u64;
     let mut flash = crate::avsync::FlashEdge::default();
-    let mut rc = RateControl::new(o.bitrate_mbps as f64, Instant::now());
+    let mut rc = if o.auto_bitrate {
+        RateControl::new_auto(o.bitrate_mbps as f64, Instant::now())
+    } else {
+        RateControl::new(o.bitrate_mbps as f64, Instant::now())
+    };
+    let rate_mode = |rc: &RateControl| if rc.ramp.is_some() { "ramp" } else if o.auto_bitrate { "auto" } else { "fixed" };
+    if o.auto_bitrate {
+        ui::rate(rc.cur, rate_mode(&rc));
+    }
+    // Network lamp: judged from each viewer report (loss, round-trip time, retransmissions, did we cut quality).
+    let mut nq = NetQuality::new(Side::Host);
+    let mut nq_t = Instant::now();
+    let mut nq_emit = Instant::now() - Duration::from_secs(10);
+    let (mut nq_bytes, mut nq_resent) = (0u64, 0u64);
+    ui::net(&nq);
     let mut stat_resent0 = 0u64;
     let mut stat_updates = 0u32;
     let mut stat_skipped0 = 0u64;
@@ -585,19 +630,60 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     while sh.running.load(Ordering::Relaxed) {
         let loss = sh.loss_bp.load(Ordering::Relaxed) as f64 / 10_000.0;
         while let Ok(d) = rep_rx.try_recv() {
-            if let Some(mbps) = rc.update(Instant::now(), d) {
+            let t = Instant::now();
+            if let Some(mbps) = rc.update(t, d) {
                 if let Some(e) = enc.as_mut() {
                     e.set_bitrate((mbps * 1e6) as u64);
                 }
                 sh.send_rate.store(pacer_rate(mbps, o.max_send_mbps), Ordering::Relaxed);
+                if o.auto_bitrate {
+                    ui::rate(mbps, rate_mode(&rc));
+                }
+            }
+            let (bytes, resent) = (sh.sent_bytes.load(Ordering::Relaxed), sh.resent.load(Ordering::Relaxed));
+            let pkts = (bytes.saturating_sub(nq_bytes) / 1200).max(1) as f64;
+            let total = d.total().max(1) as f64;
+            let sample = Sample {
+                dt_ms: (t.duration_since(nq_t).as_millis() as u32).clamp(100, 2000),
+                loss: d.missed as f64 / total,
+                residual: d.residual as f64 / total,
+                rtt_ms: (d.rtt_us > 0).then(|| d.rtt_us as f64 / 1000.0),
+                retx: (resent.saturating_sub(nq_resent) as f64 / pkts).min(1.0),
+                cut: rc.recently_cut(t),
+                bitrate: rc.cur,
+                max_bitrate: rc.max(),
+            };
+            (nq_t, nq_bytes, nq_resent) = (t, bytes, resent);
+            if nq.update(sample).is_some() || nq_emit.elapsed() > Duration::from_secs(2) {
+                nq_emit = Instant::now();
+                ui::net(&nq);
             }
         }
-        // Discord started, quit or restarted: re-aim the exclusion so its voices never leak in.
-        if o.audio && audio_check.elapsed() > Duration::from_secs(3) {
+        // The sound checkboxes changed in the GUI.
+        if let Some(l) = ui::take_audio_request() {
+            if let Some(p) = prefs.parse_line(&l) {
+                if p != prefs {
+                    prefs = p;
+                    audio_dirty = true;
+                }
+            }
+        }
+        // Re-aim the audio capture when something changed: the shown window / screen, the checkboxes, or Discord
+        // started, quit or restarted (its voices must never leak in).
+        if o.audio && (audio_dirty || audio_check.elapsed() > Duration::from_secs(3)) {
             audio_check = Instant::now();
-            if audio.excluded() != crate::loopback::find_voice_app().map(|v| v.0) {
+            audio_dirty = false;
+            let want = plan_audio(prefs, audio_window);
+            if want != audio_want {
+                audio_want = want;
                 drop(std::mem::replace(&mut audio, AudioSource::Off)); // release the old capture first
-                audio = start_audio(&sender_for_audio);
+                // The packet sequence is shared, so the viewer's timeline simply continues after the short gap.
+                audio = start_audio(
+                    &sender_for_audio,
+                    want,
+                    plan_audio(AudioPrefs { window_only: false, ..prefs }, None),
+                    window_title.as_deref(),
+                );
             }
         }
         let now = Instant::now();
@@ -635,6 +721,8 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     format!("Захват окна «{}» не удался", crate::source::ellipsize(&title, 40))
                 };
                 cap = fall_back_to_screen(&why, &monitor)?;
+                audio_window = None; // back to the system sound without Discord
+                audio_dirty = true;
                 canvas = match &cap {
                     Cap::Screen(c) => (c.width, c.height),
                     Cap::Window(_) => canvas,
@@ -650,11 +738,17 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         }
         // The GUI asked to show something else while streaming.
         if let Some(req) = ui::take_source_request() {
+            let req_window = match &req {
+                crate::source::SourceReq::Window(h) => Some(*h),
+                _ => None,
+            };
             match open_requested(req, &monitor, matches!(cap, Cap::Screen(_))) {
                 Ok(Some(n)) => {
                     // The old capture is released only now, after the new one works.
                     cap = n.cap;
                     window_title = n.title;
+                    audio_window = req_window.filter(|_| matches!(cap, Cap::Window(_)));
+                    audio_dirty = true;
                     if let Some(m) = n.monitor {
                         monitor = m;
                     }
@@ -718,9 +812,9 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             // Software encoding: its own frame rate and a bitrate the CPU can really produce.
             period = Duration::from_secs_f64(1.0 / e.fps as f64);
             if let Some(cap) = e.max_mbps {
-                if rc.cur > cap {
-                    rc = RateControl::new(cap, Instant::now());
-                    sh.send_rate.store(pacer_rate(cap, o.max_send_mbps), Ordering::Relaxed);
+                if cap < rc.max() {
+                    rc.clamp_max(cap);
+                    sh.send_rate.store(pacer_rate(rc.cur, o.max_send_mbps), Ordering::Relaxed);
                 }
             }
             enc = Some(e);

@@ -1,6 +1,8 @@
 // Launcher window (egui). Streaming itself runs in child processes (`host --ipc` / `client --ipc`),
 // which keeps the fast viewer path untouched and lets the GUI stop them cleanly.
+use crate::audiosel;
 use crate::capture;
+use crate::netq;
 use crate::easy;
 use crate::preview;
 use crate::source::{self, Choice, WinEntry};
@@ -23,6 +25,7 @@ const TEXT: Color32 = Color32::from_rgb(0xe8, 0xea, 0xf0);
 const MUTED: Color32 = Color32::from_rgb(0x8b, 0x90, 0xa0);
 const ACCENT: Color32 = Color32::from_rgb(0x4f, 0x7c, 0xff);
 const GREEN: Color32 = Color32::from_rgb(0x3e, 0xcf, 0x8e);
+const YELLOW: Color32 = Color32::from_rgb(0xf0, 0xb4, 0x3c);
 const RED: Color32 = Color32::from_rgb(0xef, 0x5b, 0x5b);
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -167,6 +170,10 @@ struct Session {
     /// Viewer diagnostics (`@DIAG`): decoder type, timings, queue, jitter.
     diag: String,
     audio: String,
+    /// Video bitrate now and how it is chosen (`@RATE`): "ramp" (Авто is probing), "auto" or "fixed".
+    rate: Option<(f64, String)>,
+    /// Network lamp (`@NET`): level, short text, numbers for the tooltip.
+    net: Option<(netq::Level, String, String)>,
     /// Encoder in use and, if the video card was skipped, the reason.
     encoder: String,
     enc_warn: String,
@@ -196,6 +203,8 @@ impl Session {
             stats: String::new(),
             diag: String::new(),
             audio: String::new(),
+            rate: None,
+            net: None,
             encoder: String::new(),
             enc_warn: String::new(),
             source: String::new(),
@@ -228,6 +237,12 @@ impl Session {
                 self.enc_warn = a.to_string();
             } else if let Some(a) = l.strip_prefix("@AUDIO ") {
                 self.audio = a.to_string();
+            } else if let Some(r) = l.strip_prefix("@RATE ") {
+                if let Some((v, m)) = r.split_once('|') {
+                    self.rate = v.trim().parse().ok().map(|v| (v, m.trim().to_string()));
+                }
+            } else if let Some(n) = l.strip_prefix("@NET ") {
+                self.net = netq::decode(n);
             } else if let Some(p) = l.strip_prefix("@PREVIEW ") {
                 self.preview_raw = Some(p.to_string()); // only the newest picture matters
             } else if let Some(t) = l.strip_prefix("@PVLABEL ") {
@@ -349,8 +364,11 @@ struct GuiApp {
     choice: Choice,
     choice_label: String,
     windows: Vec<WinEntry>,
+    /// Mbit/s ceiling of the chosen preset; 0 = Авто (the default).
     bitrate: u32,
     audio: bool,
+    /// "Звук только из этого окна" and "Не передавать звук Discord".
+    audio_prefs: audiosel::AudioPrefs,
     fullscreen: bool,
     host: Option<Session>,
     join: Option<Session>,
@@ -380,8 +398,9 @@ impl GuiApp {
             choice: Choice::Screen,
             choice_label: "Весь экран".into(),
             windows: wincap::list_windows(),
-            bitrate: 30,
+            bitrate: 0,
             audio: true,
+            audio_prefs: audiosel::AudioPrefs::default(),
             fullscreen: true,
             host: None,
             join: None,
@@ -406,9 +425,19 @@ impl GuiApp {
     fn host_args(&self, sub: &str) -> Vec<String> {
         let mut a = vec![sub.to_string()];
         a.extend(source::host_args(self.choice, self.primary));
-        a.extend(["--bitrate".to_string(), self.bitrate.to_string()]);
+        if self.bitrate == 0 {
+            a.push("--auto-bitrate".into());
+        } else {
+            a.extend(["--bitrate".to_string(), self.bitrate.to_string()]);
+        }
         if !self.audio {
             a.push("--no-audio".into());
+        }
+        if !self.audio_prefs.window_only {
+            a.push("--audio-all".into());
+        }
+        if !self.audio_prefs.exclude_voice {
+            a.push("--keep-voice".into());
         }
         a
     }
@@ -524,6 +553,35 @@ fn status_dot(ui: &mut egui::Ui, color: Color32, text: &str) {
         ui.painter().circle_filled(r.center(), 6.0, color);
         ui.label(RichText::new(text).font(bold(17.0)));
     });
+}
+
+/// Network lamp: a coloured dot and a short text; the numbers behind it are in the tooltip.
+fn net_lamp(ui: &mut egui::Ui, s: &Session) {
+    let Some((level, text, details)) = &s.net else { return };
+    let color = match level {
+        netq::Level::Good => GREEN,
+        netq::Level::Weak => YELLOW,
+        netq::Level::Bad => RED,
+    };
+    ui.horizontal(|ui| {
+        let (r, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+        ui.painter().circle_filled(r.center(), 6.0, color);
+        let t = ui.label(RichText::new(text).color(color).size(15.0));
+        let tip = if details.is_empty() { "Пока нет данных".to_string() } else { details.clone() };
+        resp.on_hover_text(tip.clone());
+        t.on_hover_text(tip);
+    });
+}
+
+/// Host: what "Авто" chose.
+fn rate_line(ui: &mut egui::Ui, s: &Session) {
+    let Some((mbps, mode)) = &s.rate else { return };
+    let text = match mode.as_str() {
+        "ramp" => format!("Авто: подбираю скорость… сейчас {mbps:.0} Мбит/с"),
+        "auto" => format!("Авто: выбрано {mbps:.0} Мбит/с (меняется, если сеть ухудшится)"),
+        _ => return,
+    };
+    ui.label(RichText::new(text).color(TEXT));
 }
 
 fn code_box(ui: &mut egui::Ui, code: &str, copied_at: &mut Option<Instant>) {
@@ -695,8 +753,8 @@ impl GuiApp {
             }
             ui.add_space(8.0);
             ui.label(RichText::new("Качество").font(bold(15.0)));
-            ui.horizontal(|ui| {
-                for (name, v) in [("Стандарт · 30 Мбит/с", 30), ("Высокое качество · 60 Мбит/с", 60)] {
+            ui.horizontal_wrapped(|ui| {
+                for (name, v) in [("Авто", 0), ("Стандарт · 30 Мбит/с", 30), ("Высокое качество · 60 Мбит/с", 60)] {
                     if ui.selectable_label(self.bitrate == v, name).clicked() {
                         self.bitrate = v;
                     }
@@ -704,8 +762,8 @@ impl GuiApp {
             });
             ui.label(
                 RichText::new(
-                    "Это потолок: если у друга не успевает интернет, программа сама снижает качество, а потом возвращает. \
-                     «Высокое» — когда у обоих быстрый интернет или вы в одной сети.",
+                    "«Авто» в начале сама подбирает скорость: стартует с 20 Мбит/с и поднимает до 60, пока нет потерь. \
+                     «Стандарт» и «Высокое» — потолок: если интернет не успевает, программа сама снижает качество, а потом возвращает.",
                 )
                 .color(MUTED)
                 .size(13.0),
@@ -713,6 +771,12 @@ impl GuiApp {
             if with_audio {
                 ui.add_space(8.0);
                 ui.checkbox(&mut self.audio, "Передавать звук компьютера");
+                if self.audio {
+                    if matches!(self.choice, Choice::Window(_)) {
+                        ui.checkbox(&mut self.audio_prefs.window_only, "Звук только из этого окна");
+                    }
+                    ui.checkbox(&mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе друг услышит сам себя эхом");
+                }
             }
         });
     }
@@ -779,9 +843,24 @@ impl GuiApp {
             // The preview is made only while this window is visible and the switch is on.
             drive_preview(ui.ctx(), self.show_preview, s);
             live_source_picker(ui, s, &mut self.choice, &mut self.choice_label, &mut self.windows, &self.monitors, self.primary);
+            if self.audio {
+                let before = self.audio_prefs;
+                section(ui, |ui| {
+                    ui.label(RichText::new("Звук").font(bold(15.0)));
+                    if matches!(self.choice, Choice::Window(_)) {
+                        ui.checkbox(&mut self.audio_prefs.window_only, "Звук только из этого окна");
+                    }
+                    ui.checkbox(&mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе друг услышит сам себя эхом");
+                });
+                if self.audio_prefs != before {
+                    s.proc.send(&self.audio_prefs.line());
+                }
+            }
             let s = &*s;
             section(ui, |ui| {
                 status_dot(ui, GREEN, "Идёт трансляция");
+                net_lamp(ui, s);
+                rate_line(ui, s);
                 ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
                 if !s.encoder.is_empty() {
                     ui.label(RichText::new(&s.encoder).color(TEXT));
@@ -859,6 +938,7 @@ impl GuiApp {
             if s.connected && !s.ended {
                 section(ui, |ui| {
                     status_dot(ui, GREEN, "Подключено");
+                    net_lamp(ui, s);
                     ui.label("Окно просмотра открыто. F11 или двойной клик — переключить полный экран.");
                     ui.label(RichText::new(if s.stats.is_empty() { "собираю статистику..." } else { &s.stats }).color(MUTED));
                     if !s.diag.is_empty() {

@@ -147,6 +147,8 @@ pub struct Cfg {
     pub secs: f64,
     pub seed: u64,
     pub audio: bool,
+    /// "Авто": start low and ramp up to `bitrate_mbps`.
+    pub auto: bool,
 }
 
 impl Cfg {
@@ -164,6 +166,7 @@ impl Cfg {
             secs: 60.0,
             seed: 1,
             audio: true,
+            auto: false,
         }
     }
 }
@@ -227,9 +230,9 @@ pub fn run(cfg: &Cfg) -> Out {
     let legacy_cooldown = Duration::from_millis(250);
     let mut legacy_last_key: Option<u64> = None;
     let mut legacy_pending = true;
-    let mut rc = ratectl::RateControl::new(cfg.bitrate_mbps, at(0));
+    let mut rc = if cfg.auto { ratectl::RateControl::new_auto(cfg.bitrate_mbps, at(0)) } else { ratectl::RateControl::new(cfg.bitrate_mbps, at(0)) };
     let mut tracker = ratectl::ReportTracker::default();
-    let mut bitrate = cfg.bitrate_mbps;
+    let mut bitrate = rc.cur;
     let mut pace = retx::pacer_rate(bitrate, MAX_SEND_MBPS) as f64;
     let mut chan: VecDeque<Frame> = VecDeque::new();
     let mut chain_broken = false;
@@ -486,7 +489,7 @@ pub fn run(cfg: &Cfg) -> Out {
             if cfg.new {
                 let mut p = Vec::new();
                 net::write_header(&mut p, net::PT_REPORT, TOKEN);
-                ratectl::encode_report(&re.stats, &mut p);
+                ratectl::encode_report_rtt(&re.stats, rtt.as_micros() as u64, &mut p);
                 up.send(t, &p, &mut rng);
             }
         }

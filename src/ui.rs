@@ -70,6 +70,20 @@ pub fn audio_status(text: &str) {
     }
 }
 
+/// Current video bitrate for the GUI: `@RATE <Мбит/с>|<ramp|auto|fixed>`.
+pub fn rate(mbps: f64, mode: &str) {
+    if ipc() {
+        println!("@RATE {mbps:.1}|{mode}");
+    }
+}
+
+/// Network lamp for the GUI (host and viewer): `@NET <level>|<text>|<details>`, see netq.rs.
+pub fn net(q: &crate::netq::NetQuality) {
+    if ipc() {
+        println!("@NET {}", crate::netq::encode(q));
+    }
+}
+
 /// What is being shown ("Показываю окно ..."), or `warn`: the chosen window was lost and the full screen is
 /// shown instead (the GUI paints that line red).
 pub fn source_status(text: &str, warn: bool) {
@@ -137,6 +151,13 @@ pub fn control_line(l: &str) -> bool {
             PREVIEW_BEAT.store(clock_ms() + 1, Ordering::Relaxed);
             false
         }
+        l if l.starts_with("AUDIO") => {
+            // `AUDIO window=1 voice=1`: the sound checkboxes changed. Only the newest line matters.
+            if let Ok(mut g) = AUDIO_REQ.lock() {
+                *g = Some(l.to_string());
+            }
+            false
+        }
         l => {
             // `SOURCE ...`: change what is streamed. Only the newest request matters.
             if let Some(r) = crate::source::SourceReq::parse(l) {
@@ -147,6 +168,13 @@ pub fn control_line(l: &str) -> bool {
             false
         }
     }
+}
+
+static AUDIO_REQ: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The newest `AUDIO ...` line from the GUI, if one arrived since the last call.
+pub fn take_audio_request() -> Option<String> {
+    AUDIO_REQ.lock().ok().and_then(|mut g| g.take())
 }
 
 static SOURCE_REQ: std::sync::Mutex<Option<crate::source::SourceReq>> = std::sync::Mutex::new(None);

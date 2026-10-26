@@ -18,6 +18,12 @@ mod playout;
 #[path = "../../../src/preview.rs"]
 #[allow(dead_code)]
 mod preview;
+#[path = "../../../src/netq.rs"]
+#[allow(dead_code)]
+mod netq;
+#[path = "../../../src/audiosel.rs"]
+#[allow(dead_code)]
+mod audiosel;
 #[path = "../../../src/encsel.rs"]
 #[allow(dead_code)]
 mod encsel;
@@ -170,5 +176,19 @@ mod simtests {
             assert!(new.keyreq <= 2);
             assert!(new.a_glitches * 5 < old.a_glitches, "{} vs {}", new.a_glitches, old.a_glitches);
         }
+    }
+
+    #[test]
+    fn auto_finds_the_bottleneck_and_keeps_the_picture_smooth() {
+        // 40 Mbit/s link, ceiling 60: ends near the link capacity, no collapse
+        let o = sim::run(&Cfg { cap_mbps: 40.0, bitrate_mbps: 60.0, auto: true, secs: 60.0, ..Cfg::base("a", true, Loss::None) });
+        eprintln!("auto@40: end {:.1} avg {:.1} fps {:.1} min {:.0} freeze {:.1}s", o.bitrate_end, o.bitrate_avg, o.fps, o.fps_min, o.freeze_s);
+        assert!(o.bitrate_end > 15.0 && o.bitrate_end < 45.0, "end {}", o.bitrate_end);
+        assert!(o.fps > 45.0 && o.freeze_s < 5.0, "fps {} freeze {}", o.fps, o.freeze_s);
+        // a roomy link: climbs to the ceiling (without jitter: reordering looks like loss to the older cut logic, fixed 60 shows the same)
+        let o = sim::run(&Cfg { cap_mbps: 200.0, bitrate_mbps: 60.0, auto: true, jitter_ms: 0.0, secs: 40.0, ..Cfg::base("a", true, Loss::None) });
+        eprintln!("auto@200: end {:.1} avg {:.1} fps {:.1}", o.bitrate_end, o.bitrate_avg, o.fps);
+        assert!(o.bitrate_end > 55.0, "end {}", o.bitrate_end);
+        assert!(o.fps > 55.0, "fps {}", o.fps);
     }
 }

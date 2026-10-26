@@ -3,6 +3,7 @@
 
 mod audio;
 mod audiopkt;
+mod audiosel;
 mod avsync;
 mod bundle;
 mod capture;
@@ -15,6 +16,7 @@ mod loopback;
 mod easy;
 mod encsel;
 mod net;
+mod netq;
 mod opus;
 mod opusaudio;
 mod playout;
@@ -41,8 +43,11 @@ screenshare — показ экрана другу напрямую, без се
 
 Без параметров — окно программы. Параметры (для продвинутых):
   screenshare host   [--monitor N] [--window HWND] [--bitrate МБИТ] [--fps N] [--preset p1..p7]
-                     [--max-send МБИТ] [--no-audio] [--exchange-dir ПАПКА]
-                     --bitrate по умолчанию 30 (окно программы даёт 30 «Стандарт» и 60 «Высокое качество»), --max-send 100.
+                     [--max-send МБИТ] [--no-audio] [--audio-all] [--keep-voice] [--auto-bitrate] [--exchange-dir ПАПКА]
+                     --bitrate по умолчанию 30 (окно программы даёт «Авто», 30 «Стандарт» и 60 «Высокое качество»), --max-send 100.
+                     --auto-bitrate — «Авто»: старт с 20 Мбит/с и подъём до --bitrate (по умолчанию 60), пока нет потерь.
+                     Звук окна: при показе окна берётся звук только его процесса; --audio-all — всегда весь звук,
+                     --keep-voice — не вырезать Discord. В stdin во время показа: «AUDIO window=0|1 voice=0|1».
                      Во время показа окно программы может сменить источник: строка «SOURCE monitor N» / «SOURCE window HWND» в stdin.
   screenshare client [--no-audio] [--cpu-decode] [--cpu-convert] [--windowed] [--exchange-dir ПАПКА]
                      [--frames N --screenshot ФАЙЛ.bmp]
@@ -116,14 +121,19 @@ fn exchange(a: &mut Args) -> Result<Exchange> {
 }
 
 fn host_opts(a: &mut Args) -> Result<host::HostOpts> {
+    // Авто: --auto-bitrate; --bitrate is then the ceiling of the ramp (60 unless given).
+    let auto_bitrate = a.flag("--auto-bitrate");
+    let bitrate_mbps = a.num("--bitrate", if auto_bitrate { 60 } else { 30 })?;
     Ok(host::HostOpts {
         window: a.value("--window")?.map(|v| v.parse::<isize>()).transpose().context("--window")?,
         monitor: a.value("--monitor")?.map(|v| v.parse::<usize>()).transpose().context("--monitor")?,
-        bitrate_mbps: a.num("--bitrate", 30)?,
+        auto_bitrate,
+        bitrate_mbps,
         fps: a.num("--fps", 60)?,
         preset: a.value("--preset")?.unwrap_or_else(|| "p4".into()),
         max_send_mbps: a.num("--max-send", 100)?,
         audio: !a.flag("--no-audio"),
+        audio_prefs: audiosel::AudioPrefs { window_only: !a.flag("--audio-all"), exclude_voice: !a.flag("--keep-voice") },
         exchange: exchange(a)?,
     })
 }
