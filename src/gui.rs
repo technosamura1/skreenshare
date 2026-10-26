@@ -969,6 +969,8 @@ struct GuiApp {
     /// Host option: short room code instead of two long codes (beta).
     easy: bool,
     input: String,
+    /// The clipboard was already looked at for a code on this visit of the «Смотреть» page.
+    clip_checked: bool,
     copied_at: Option<Instant>,
     start_error: Option<String>,
     /// Remote control switches of the host page. Consent is per session: off at every new start.
@@ -1070,6 +1072,7 @@ impl GuiApp {
             pick_anchor: None,
             easy: false,
             input: String::new(),
+            clip_checked: false,
             copied_at: None,
             start_error: None,
             ctl: CtlUi { allow: false, pad: true, kbm: true },
@@ -1082,6 +1085,7 @@ impl GuiApp {
 
     /// Ends the session of the page that is open (and clears the typed code); the page itself stays.
     fn go_home(&mut self) {
+        self.clip_checked = false;
         match self.page {
             Page::Host => {
                 self.host = None;
@@ -2228,14 +2232,14 @@ fn classic_host_codes(ui: &mut egui::Ui, s: &mut Session, input: &mut String, co
     if s.code.is_some() {
         section(ui, |ui| {
             step(ui, 2, "Вставьте код ответа от зрителя");
-            code_input(ui, input, "C...");
+            let enter = code_input(ui, input, "C...");
             if let Some(e) = &s.bad_code {
                 error_text(ui, e);
             }
             let sent = s.status.starts_with("Соединяюсь");
             if sent && s.bad_code.is_none() {
                 spinner_line(ui, "Соединяюсь...");
-            } else if big_button(ui, "Подключить", c_accent(), !input.trim().is_empty()) {
+            } else if big_button(ui, "Подключить", c_accent(), !input.trim().is_empty()) || enter {
                 s.bad_code = None;
                 s.proc.send(input.trim());
             }
@@ -2261,14 +2265,55 @@ fn code_box_big(ui: &mut egui::Ui, code: &str, copied_at: &mut Option<Instant>) 
     }
 }
 
-fn code_input(ui: &mut egui::Ui, input: &mut String, hint: &str) {
-    ui.add(
-        egui::TextEdit::singleline(input)
-            .hint_text(hint)
-            .font(FontId::monospace(15.0))
-            .margin(Margin::symmetric(12, 10))
-            .desired_width(f32::INFINITY),
-    );
+fn clipboard_text() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+/// The code field: Ctrl+V, a «Вставить» button, and right click (Вставить / Копировать / Очистить).
+/// Spaces, line breaks and quotes a messenger adds are dropped. True: Enter was pressed.
+fn code_input(ui: &mut egui::Ui, input: &mut String, hint: &str) -> bool {
+    let mut paste = false;
+    let resp = ui
+        .horizontal(|ui| {
+            let r = ui.add(
+                egui::TextEdit::singleline(input)
+                    .hint_text(hint)
+                    .font(FontId::monospace(15.0))
+                    .margin(Margin::symmetric(12, 10))
+                    .desired_width((ui.available_width() - 112.0).max(120.0)),
+            );
+            let b = egui::Button::new(RichText::new("Вставить").size(14.0)).fill(c_card_hover()).corner_radius(8).min_size(egui::vec2(104.0, r.rect.height()));
+            if ui.add(b).on_hover_text("Вставить код из буфера обмена").clicked() {
+                paste = true;
+            }
+            r
+        })
+        .inner;
+    resp.context_menu(|ui| {
+        if ui.button("Вставить").clicked() {
+            paste = true;
+            ui.close();
+        }
+        if ui.add_enabled(!input.is_empty(), egui::Button::new("Копировать")).clicked() {
+            ui.ctx().copy_text(input.clone());
+            ui.close();
+        }
+        if ui.add_enabled(!input.is_empty(), egui::Button::new("Очистить")).clicked() {
+            input.clear();
+            ui.close();
+        }
+    });
+    if paste {
+        if let Some(t) = clipboard_text() {
+            *input = crate::guilogic::clean_code(&t);
+        }
+    } else if resp.changed() {
+        let c = crate::guilogic::clean_code(input);
+        if c != *input {
+            *input = c;
+        }
+    }
+    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !input.is_empty()
 }
 
 fn fps_hint(ui: &mut egui::Ui) {
@@ -3239,7 +3284,14 @@ impl GuiApp {
         if !have_reply {
             section(ui, |ui| {
                 step(ui, 1, "Введите код трансляции");
-                code_input(ui, &mut self.input, "код: K7QM-X2PD (beta) или длинный H…");
+                // A code just copied from the messenger goes in by itself.
+                if !self.clip_checked && self.input.is_empty() && self.join.is_none() {
+                    self.clip_checked = true;
+                    if let Some(t) = clipboard_text().filter(|t| crate::guilogic::looks_like_code(t)) {
+                        self.input = crate::guilogic::clean_code(&t);
+                    }
+                }
+                let enter = code_input(ui, &mut self.input, "код: K7QM-X2PD (beta) или длинный H…");
                 if let Some(e) = self.join.as_ref().and_then(|s| s.bad_code.as_ref()) {
                     error_text(ui, e);
                 }
@@ -3248,7 +3300,7 @@ impl GuiApp {
                 }
                 if self.join.as_ref().is_some_and(|s| s.bad_code.is_none()) {
                     spinner_line(ui, "Проверяю код...");
-                } else if big_button_i(ui, Some(Ico::Eye), "Смотреть", c_accent(), !self.input.trim().is_empty()) {
+                } else if big_button_i(ui, Some(Ico::Eye), "Смотреть", c_accent(), !self.input.trim().is_empty()) || enter {
                     if let Some(s) = &mut self.join {
                         let code = self.input.trim().to_string();
                         s.bad_code = None;

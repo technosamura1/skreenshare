@@ -429,6 +429,8 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         let sh = sh.clone();
         input.spawn(sock.clone(), peer, token, move || sh.running.load(Ordering::Relaxed));
     }
+    // The viewer's laser pointer and reactions, drawn over the picture on this screen.
+    let annot_view = crate::annotview::AnnotView::spawn(input.region_handle());
     let (nack_tx, nack_rx) = mpsc::channel::<(u32, Vec<u16>)>();
     let (rep_tx, rep_rx) = mpsc::channel::<crate::ratectl::ReportDelta>();
 
@@ -472,6 +474,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     }
                     // Remote control: only from the connected viewer's address, and only acted on if the owner allowed it.
                     net::PT_INPUT if from == peer => input.on_input(body),
+                net::PT_ANNOT if from == peer => annot_view.on_packet(body),
                     net::PT_ANACK => {
                         // Resend audio the viewer is still missing (a few per request: it only asks for what it needs).
                         let hist = sh.audio_hist.lock().unwrap().clone();

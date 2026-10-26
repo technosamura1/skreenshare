@@ -1,6 +1,8 @@
 // GUI app: no console window when started by double-click. CLI use attaches to the parent console.
 #![windows_subsystem = "windows"]
 
+mod annot;
+mod annotview;
 mod audio;
 mod audiolab;
 mod audiopkt;
@@ -258,6 +260,13 @@ fn run(mut a: Args) -> Result<()> {
             let secs = a.num::<u64>("--seconds", 20)?;
             a.finish()?;
             avsync::run_beacon(secs)?;
+        }
+        "annottest" => {
+            // The laser pointer and reactions overlay on a monitor (to look at; nothing is sent).
+            let mon = a.num::<usize>("--monitor", 0)?;
+            a.finish()?;
+            let m = host::pick_monitor(Some(mon), false)?;
+            annotview::demo(inputhost::Region::Screen { canvas: (m.width, m.height), rect: (m.left, m.top, m.width as i32, m.height as i32) });
         }
         "badgetest" => {
             let secs = a.num::<u64>("--seconds", 8)?;

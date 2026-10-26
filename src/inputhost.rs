@@ -85,14 +85,27 @@ fn window_rect(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
     }
 }
 
+/// Where `region` sits on the desktop now (left, top, width, height): the monitor, or the window as it is.
+pub fn region_rect(region: Region) -> Option<(i32, i32, i32, i32)> {
+    match region {
+        Region::Screen { rect, .. } => Some(rect),
+        Region::Window { hwnd, .. } => window_rect(hwnd),
+    }
+}
+
+/// The desktop point under spot `pos` (0..=65535 both ways) of the picture of `region`.
+pub fn region_point(region: Region, pos: (u16, u16)) -> Option<(i32, i32)> {
+    let target = region_rect(region)?;
+    Some(match region {
+        Region::Screen { canvas, .. } => crate::source::picture_to_screen(pos, canvas, None, target),
+        Region::Window { canvas, content, .. } => crate::source::picture_to_screen(pos, canvas, Some(content), target),
+    })
+}
+
 /// Puts the cursor on spot (x, y) of the picture (0..=65535 both ways) of `region`; returns the screen point.
 pub fn place_cursor(region: Region, x: u16, y: u16) -> Option<(i32, i32)> {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
-    let (canvas, content, target) = match region {
-        Region::Screen { canvas, rect } => (canvas, None, rect),
-        Region::Window { canvas, content, hwnd } => (canvas, Some(content), window_rect(hwnd)?),
-    };
-    let (px, py) = crate::source::picture_to_screen((x, y), canvas, content, target);
+    let (px, py) = region_point(region, (x, y))?;
     // Absolute SendInput speaks 0..65535 over the whole virtual desktop (all monitors, physical pixels).
     let (vx, vy, vw, vh) = unsafe {
         (
@@ -264,6 +277,11 @@ impl InputHost {
     }
 
     /// What the stream shows right now (called for every frame: the window may have been resized or switched).
+    /// The picture's place, shared (the laser pointer overlay reads it too).
+    pub fn region_handle(&self) -> Arc<Mutex<Option<Region>>> {
+        self.region.clone()
+    }
+
     pub fn set_region(&self, r: Region) {
         *self.region.lock().unwrap() = Some(r);
     }

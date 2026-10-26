@@ -32,6 +32,8 @@ pub struct ViewInput {
     xi: Option<XInput>,
     /// The host took control away (shown once in the window).
     pub revoked_at: Mutex<Option<Instant>>,
+    /// Laser pointer and reactions (work without remote control).
+    annot: Mutex<crate::annot::Sender>,
 }
 
 impl ViewInput {
@@ -47,6 +49,7 @@ impl ViewInput {
             rumble: Mutex::new(RumbleRx::new()),
             xi: XInput::load(),
             revoked_at: Mutex::new(None),
+            annot: Mutex::new(crate::annot::Sender::new(start)),
         })
     }
 
@@ -143,6 +146,15 @@ impl ViewInput {
         self.sender.lock().unwrap().release_kbm();
     }
 
+    /// Where the laser points on the picture (0..=65535 both ways); None = off.
+    pub fn laser(&self, pos: Option<(u16, u16)>) {
+        self.annot.lock().unwrap().set_laser(pos);
+    }
+
+    pub fn react(&self, r: crate::annot::Reaction) {
+        self.annot.lock().unwrap().react(r);
+    }
+
     pub fn spawn(self: &Arc<Self>, sock: Arc<UdpSocket>, host: SocketAddr, token: u32, alive: impl Fn() -> bool + Send + 'static) {
         let me = self.clone();
         std::thread::Builder::new()
@@ -207,6 +219,12 @@ impl ViewInput {
                             inputproto::encode(&f, &mut out);
                             let _ = sock.send_to(&out, host);
                         }
+                    }
+                    let a = me.annot.lock().unwrap().poll(now);
+                    if let Some(a) = a {
+                        net::write_header(&mut out, net::PT_ANNOT, token);
+                        crate::annot::encode(&a, &mut out);
+                        let _ = sock.send_to(&out, host);
                     }
                     // 4. motors stop by themselves when the host goes quiet
                     for i in me.rumble.lock().unwrap().tick(now) {

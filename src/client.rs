@@ -327,9 +327,29 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
     // Remote control: its own thread; it sends nothing until the "Управление" switch is on and the host allows it.
     let control = o.control;
     let input = ViewInput::new();
-    if control {
+    // Always: the laser pointer and reactions go through the same thread (the input itself stays off).
+    {
         let sh = sh.clone();
         input.spawn(sock.clone(), peer, token, move || sh.running.load(Ordering::Relaxed));
+    }
+    // SS_ANNOT_SCRIPT=1 (tests): the laser circles the picture and every reaction goes out once.
+    if std::env::var("SS_ANNOT_SCRIPT").is_ok() {
+        let (inp, sh) = (input.clone(), sh.clone());
+        std::thread::spawn(move || {
+            use crate::annot::Reaction;
+            let t0 = Instant::now();
+            let all = [Reaction::Laugh, Reaction::Heart, Reaction::Yes, Reaction::No];
+            while sh.running.load(Ordering::Relaxed) && t0.elapsed() < Duration::from_secs(12) {
+                let a = t0.elapsed().as_secs_f64();
+                inp.laser(Some(((32768.0 + a.cos() * 16000.0) as u16, (32768.0 + a.sin() * 16000.0) as u16)));
+                let k = (a / 2.0) as usize;
+                if a > 1.0 && (a - 1.0) % 2.0 < 0.02 && k < 5 {
+                    inp.react(all[(k + 3) % 4]);
+                }
+                std::thread::sleep(Duration::from_millis(16));
+            }
+            inp.laser(None);
+        });
     }
 
     let player = if o.audio {
@@ -1009,6 +1029,8 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         capture_t: None,
         mouse_frac: (0.0, 0.0),
         pad_panel: false,
+        laser: false,
+        toast: None,
     };
     event_loop.run_app(&mut app)?;
 
@@ -1064,6 +1086,10 @@ struct App {
     mouse_frac: (f64, f64),
     /// F2: the gamepad test panel.
     pad_panel: bool,
+    /// L: the pointer is a laser on the host's screen.
+    laser: bool,
+    /// A short confirmation (a reaction went out).
+    toast: Option<(String, Instant)>,
 }
 
 /// The bar fades 0.4 s after 2.6 s without mouse movement; ~30 fps of redraws only while it is visible.
@@ -1219,8 +1245,52 @@ impl App {
         self.input.key(sc as u16, down, ev.repeat);
     }
 
-    /// What to tell the viewer about remote control right now (a short line, a dot colour).
+    /// L (laser) and 1-4 (reactions) by their place on the keyboard, whatever the layout. True: handled.
+    fn annot_key(&mut self, ev: &winit::event::KeyEvent) -> bool {
+        use crate::annot::Reaction;
+        use winit::keyboard::{KeyCode, PhysicalKey};
+        let PhysicalKey::Code(k) = ev.physical_key else { return false };
+        let r = match k {
+            KeyCode::KeyL => {
+                self.laser = !self.laser;
+                let spot = if self.laser { self.picture_spot(winit::dpi::PhysicalPosition::new(self.cursor.0 as f64, self.cursor.1 as f64)) } else { None };
+                self.input.laser(spot);
+                self.redraw();
+                return true;
+            }
+            KeyCode::Digit1 | KeyCode::Numpad1 => Reaction::Laugh,
+            KeyCode::Digit2 | KeyCode::Numpad2 => Reaction::Heart,
+            KeyCode::Digit3 | KeyCode::Numpad3 => Reaction::Yes,
+            KeyCode::Digit4 | KeyCode::Numpad4 => Reaction::No,
+            _ => return false,
+        };
+        self.input.react(r);
+        self.toast = Some((format!("Отправлено: {}", r.name()), Instant::now()));
+        self.redraw();
+        true
+    }
+
+    /// The line at the top: a reaction just sent, the laser, remote control, or the first-minute tip.
     fn hint(&self) -> Option<(String, u32, f32)> {
+        const LASER: u32 = 0x00_FF_40_40;
+        if let Some((t, at)) = &self.toast {
+            if at.elapsed() < Duration::from_millis(1500) {
+                return Some((t.clone(), 0x00_3E_CF_8E, 1.0));
+            }
+        }
+        if self.laser && !self.captured {
+            return Some(("Лазерная указка у показывающего на экране · L — выключить · 1 смех · 2 сердечко · 3 ДА · 4 НЕТ".into(), LASER, 0.85));
+        }
+        if let Some(h) = self.ctl_hint() {
+            return Some(h);
+        }
+        let t = self.started.elapsed();
+        (t > Duration::from_secs(2) && t < Duration::from_secs(12))
+            .then(|| ("L — лазерная указка · 1–4 — реакции (смех, сердечко, ДА, НЕТ)".into(), LASER, 0.85))
+    }
+
+    /// What to tell the viewer about remote control right now (a short line, a dot colour).
+    fn ctl_hint(&self) -> Option<(String, u32, f32)> {
         const RED: u32 = 0x00_F0_5A_5A;
         const YELLOW: u32 = 0x00_F0_B4_3C;
         const GREEN: u32 = 0x00_3E_CF_8E;
@@ -1368,6 +1438,10 @@ impl ApplicationHandler<UserEv> for App {
                 self.input.wheel(y.round() as i32, x.round() as i32);
             }
             WindowEvent::CursorMoved { position, .. } if self.captured => {
+                if self.laser {
+                    self.laser = false;
+                    self.input.laser(None);
+                }
                 if !self.relative_mode {
                     let spot = self.picture_spot(position);
                     self.input.mouse_abs(spot);
@@ -1403,6 +1477,7 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::Resized(s) => {
                 self.sh.win_size.store(((s.width as u64) << 32) | s.height as u64, Ordering::Relaxed);
             }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat && self.annot_key(&event) => {}
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
                 match event.logical_key {
                     Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
@@ -1424,6 +1499,9 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let moved = (position.x as i32 - self.cursor.0).abs() + (position.y as i32 - self.cursor.1).abs() >= 2;
                 self.cursor = (position.x as i32, position.y as i32);
+                if self.laser {
+                    self.input.laser(self.picture_spot(position));
+                }
                 if moved {
                     self.last_move = Instant::now();
                     self.set_cursor(true);
@@ -1441,6 +1519,7 @@ impl ApplicationHandler<UserEv> for App {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
+                self.input.laser(None);
                 self.hover = Hit::Outside;
                 self.redraw();
             }
@@ -1643,6 +1722,11 @@ impl App {
         // Remote-control overlays: the hint line and the F2 gamepad test.
         {
             let mut ob = crate::overlay::Buf { px: &mut buf, w: ww as i32, h: wh as i32 };
+            if self.laser && !self.captured {
+                // Our own dot right away (the host's comes back only with the picture).
+                ob.disc(self.cursor.0, self.cursor.1, 9.0 * sc as f32, 0x00_FF_30_30, 0.3);
+                ob.disc(self.cursor.0, self.cursor.1, 4.5 * sc as f32, 0x00_FF_30_30, 1.0);
+            }
             if let Some((text, dot, a)) = hint.as_ref() {
                 crate::overlay::hint(&mut ob, ww as i32 / 2, 20 * sc, sc, text, Some(*dot), *a);
             }

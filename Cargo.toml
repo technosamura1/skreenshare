@@ -1,6 +1,6 @@
 [package]
 name = "screenshare"
-version = "0.11.7"
+version = "0.12.0"
 edition = "2021"
 
 [dependencies]
@@ -17,6 +17,7 @@ softbuffer = "0.4"
 socket2 = "0.6"
 vigem-client = { version = "0.1.4", features = ["unstable_xtarget_notification"] }
 windows-core = "0.62"
+windows-numerics = "0.3"
 winit = "0.30"
 zstd = "0.14"
 sha2 = "0.11.1"
@@ -39,8 +40,11 @@ features = [
     "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",
     "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",

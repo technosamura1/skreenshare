@@ -460,9 +460,36 @@ pub fn test_finished(host: TestHalf, client: TestHalf) -> bool {
     (host.ended && host.connected) || (client.ended && client.connected)
 }
 
+/// A code as pasted from a messenger: no spaces or line breaks inside (long codes get wrapped), no quotes
+/// or backticks around it.
+pub fn clean_code(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | '`' | '«' | '»' | '“' | '”')).collect()
+}
+
+/// The clipboard holds something that looks like a code (short room code or a long one), not random text.
+pub fn looks_like_code(s: &str) -> bool {
+    let c = clean_code(s);
+    let b = c.as_bytes();
+    // K7QM-X2PD
+    let short = b.len() == 9 && b[4] == b'-' && b.iter().enumerate().all(|(i, ch)| i == 4 || ch.is_ascii_uppercase() || ch.is_ascii_digit());
+    // H… / C… (long codes; a random password in the clipboard must not land in the field)
+    let long = (40..=4000).contains(&b.len()) && matches!(b[0], b'H' | b'C') && c.chars().all(|ch| ch.is_ascii_alphanumeric() || "-_+/=".contains(ch));
+    short || long
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_codes_are_cleaned() {
+        assert_eq!(clean_code(" «K7QM-X2PD»\r\n"), "K7QM-X2PD");
+        assert_eq!(clean_code("Habc\ndef ghi"), "Habcdefghi");
+        assert!(looks_like_code("K7QM-X2PD"));
+        assert!(!looks_like_code("привет, держи код"));
+        assert!(!looks_like_code("abc"));
+        assert!(!looks_like_code("hunter2hunter2"), "a password is not a code");
+    }
 
     #[test]
     fn fit_keeps_aspect_and_never_enlarges() {
