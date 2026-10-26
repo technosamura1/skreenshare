@@ -162,6 +162,13 @@ pub fn control_line(l: &str) -> bool {
             PREVIEW_BEAT.store(clock_ms() + 1, Ordering::Relaxed);
             false
         }
+        l if l.starts_with("CONTROL") => {
+            // `CONTROL on=1 pad=1 kbm=1`: what the host's owner allows the viewer to control. Newest line wins.
+            if let Ok(mut g) = CONTROL_REQ.lock() {
+                *g = Some(l.to_string());
+            }
+            false
+        }
         l if l.starts_with("AUDIO") => {
             // `AUDIO window=1 voice=1`: the sound checkboxes changed. Only the newest line matters.
             if let Ok(mut g) = AUDIO_REQ.lock() {
@@ -178,6 +185,20 @@ pub fn control_line(l: &str) -> bool {
             }
             false
         }
+    }
+}
+
+static CONTROL_REQ: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The newest `CONTROL ...` line from the GUI, if one arrived since the last call.
+pub fn take_control_request() -> Option<String> {
+    CONTROL_REQ.lock().ok().and_then(|mut g| g.take())
+}
+
+/// Remote-control state for the GUI (`@CTRL on=1 pad=1 kbm=1 vigem=1 pads=2 active=0 revoked=0`); nothing in a console.
+pub fn ctrl_status(text: &str) {
+    if ipc() {
+        println!("@CTRL {text}");
     }
 }
 

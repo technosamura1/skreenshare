@@ -31,6 +31,13 @@ pub const PT_ANACK: u8 = 0xA6;
 /// Client -> host: what this viewer understands (sent about once a second): flags u8, bit 0 = Opus audio.
 pub const PT_CAPS: u8 = 0xA7;
 pub const CAP_OPUS: u8 = 1;
+/// The viewer understands PT_CTRL / PT_RUMBLE and may send PT_INPUT (remote control, v0.11.0).
+pub const CAP_INPUT: u8 = 2;
+/// Remote control (see inputproto.rs): viewer -> host input state, host -> viewer permission and driver state,
+/// host -> viewer force feedback. Old programs ignore these types.
+pub const PT_INPUT: u8 = 0xA8;
+pub const PT_CTRL: u8 = 0xA9;
+pub const PT_RUMBLE: u8 = 0xAA;
 
 pub const ROLE_HOST: u8 = 1;
 pub const ROLE_CLIENT: u8 = 2;

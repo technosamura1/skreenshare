@@ -30,6 +30,8 @@ pub struct HostOpts {
     pub audio: bool,
     pub audio_prefs: AudioPrefs,
     pub exchange: Exchange,
+    /// What the viewer may control at the start (the window can change it while streaming). Nothing by default.
+    pub control: crate::inputlogic::Perms,
 }
 
 pub fn pick_monitor(choice: Option<usize>, interactive: bool) -> Result<MonitorInfo> {
@@ -421,6 +423,12 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         let sh = sh.clone();
         ui::on_stop(move || sh.running.store(false, Ordering::Relaxed));
     }
+    // Remote control: its own thread (timeout, emergency hotkey, answers); packets are applied by the receiver below.
+    let input = crate::inputhost::InputHost::new(o.control);
+    {
+        let sh = sh.clone();
+        input.spawn(sock.clone(), peer, token, move || sh.running.load(Ordering::Relaxed));
+    }
     let (nack_tx, nack_rx) = mpsc::channel::<(u32, Vec<u16>)>();
     let (rep_tx, rep_rx) = mpsc::channel::<crate::ratectl::ReportDelta>();
 
@@ -428,6 +436,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     {
         let sock = sock.clone();
         let sh = sh.clone();
+        let input = input.clone();
         std::thread::spawn(move || {
             let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
             let mut buf = [0u8; 2048];
@@ -459,7 +468,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     net::PT_PUNCH => net::answer_punch(&sock, token, net::ROLE_HOST, body, from),
                     net::PT_CAPS => {
                         sh.peer_opus.store(body.first().is_some_and(|f| f & net::CAP_OPUS != 0), Ordering::Relaxed);
+                        input.set_peer_caps(body.first().copied().unwrap_or(0));
                     }
+                    // Remote control: only from the connected viewer's address, and only acted on if the owner allowed it.
+                    net::PT_INPUT if from == peer => input.on_input(body),
                     net::PT_ANACK => {
                         // Resend audio the viewer is still missing (a few per request: it only asks for what it needs).
                         let hist = sh.audio_hist.lock().unwrap().clone();

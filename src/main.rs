@@ -16,7 +16,13 @@ mod guilogic;
 mod glass;
 mod gui;
 mod icon;
+mod inputview;
+mod overlay;
+mod xinput;
 mod host;
+mod inputhost;
+mod inputlogic;
+mod inputproto;
 mod loopback;
 mod easy;
 mod encsel;
@@ -142,11 +148,17 @@ fn host_opts(a: &mut Args) -> Result<host::HostOpts> {
         audio: !a.flag("--no-audio"),
         audio_prefs: audiosel::AudioPrefs { window_only: !a.flag("--audio-all"), exclude_voice: !a.flag("--keep-voice") },
         exchange: exchange(a)?,
+        control: {
+            let on = a.flag("--control");
+            let (no_pad, no_kbm) = (a.flag("--no-control-pad"), a.flag("--no-control-kbm"));
+            inputlogic::Perms { allowed: on, pad: !no_pad, kbm: !no_kbm }
+        },
     })
 }
 
 fn client_opts(a: &mut Args) -> Result<client::ClientOpts> {
     Ok(client::ClientOpts {
+        control: !a.flag("--no-control"),
         audio: !a.flag("--no-audio"),
         hw_decode: !a.flag("--cpu-decode"),
         cpu_convert: a.flag("--cpu-convert"),

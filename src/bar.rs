@@ -14,6 +14,8 @@ pub enum Hit {
     Slider(f32),
     Fullscreen,
     Stop,
+    /// The "Управление" switch (remote control).
+    Control,
 }
 
 const PAD: i32 = 12;
@@ -26,6 +28,9 @@ const H: i32 = 56;
 const BOTTOM_GAP: i32 = 28;
 const MAX_W: i32 = 520;
 const MIN_TRACK: i32 = 40;
+/// Remote-control button: icon + count + label, or icon + count only in a narrow window.
+const CTL_W: i32 = 150;
+const CTL_W_COMPACT: i32 = 76;
 
 /// Where the bar is and how big (integer UI scale `s`: 1 normal, 2 on 200% DPI).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,14 +40,38 @@ pub struct Bar {
     pub w: i32,
     pub h: i32,
     pub s: i32,
+    /// Width of the remote-control button (0: no such button, an older host).
+    pub ctl_w: i32,
 }
 
 impl Bar {
     pub fn new(ww: i32, wh: i32, s: i32) -> Bar {
+        Bar::with_control(ww, wh, s, false)
+    }
+
+    /// `ctl`: the host understands remote control, so the bar has the "Управление" button too (and is wider).
+    pub fn with_control(ww: i32, wh: i32, s: i32, ctl: bool) -> Bar {
         let s = s.clamp(1, 4);
-        let w = (MAX_W * s).min(ww - 16 * s).max(1);
+        let full = MAX_W + SEP + CTL_W;
+        let (maxw, ctl_w) = if !ctl {
+            (MAX_W, 0)
+        } else if ww >= (full + 16) * s {
+            (full, CTL_W)
+        } else {
+            (MAX_W + SEP + CTL_W_COMPACT, CTL_W_COMPACT)
+        };
+        let w = (maxw * s).min(ww - 16 * s).max(1);
         let h = H * s;
-        Bar { x: ((ww - w) / 2).max(0), y: (wh - h - BOTTOM_GAP * s).max(0), w, h, s }
+        Bar { x: ((ww - w) / 2).max(0), y: (wh - h - BOTTOM_GAP * s).max(0), w, h, s, ctl_w }
+    }
+
+    /// The remote-control button (zero-sized when there is none). Sits left of the lamp.
+    pub fn ctl_rect(&self) -> (i32, i32, i32, i32) {
+        if self.ctl_w == 0 {
+            return (0, 0, 0, 0);
+        }
+        let x = self.lamp_left() - (SEP + self.ctl_w) * self.s;
+        (x, self.btn_y(), self.ctl_w * self.s, BTN * self.s)
     }
 
     fn btn_y(&self) -> i32 {
@@ -67,7 +96,8 @@ impl Bar {
     }
     /// Percent text position (left edge).
     fn text_x(&self) -> i32 {
-        self.lamp_left() - (SEP + TEXT_W) * self.s
+        let left = if self.ctl_w > 0 { self.ctl_rect().0 - SEP * self.s } else { self.lamp_left() };
+        left - (SEP + TEXT_W) * self.s
     }
     /// Track: x range and the y of its centre.
     pub fn track(&self) -> (i32, i32, i32) {
@@ -99,6 +129,9 @@ impl Bar {
         if inside(self.full_rect()) {
             return Hit::Fullscreen;
         }
+        if self.ctl_w > 0 && inside(self.ctl_rect()) {
+            return Hit::Control;
+        }
         let (x0, x1, yc) = self.track();
         let pad = 10 * self.s;
         if px >= x0 - pad && px <= x1 + pad && (py - yc).abs() <= 16 * self.s {
@@ -123,6 +156,21 @@ pub struct State {
     pub opacity: f32,
     /// Seconds, for the lamp pulse.
     pub time: f32,
+    /// Remote control (None: the host is older and has none).
+    pub ctl: Option<Ctl>,
+}
+
+/// The remote-control button's state.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ctl {
+    /// The switch is on.
+    pub on: bool,
+    /// The host's owner allows control right now.
+    pub allowed: bool,
+    /// Gamepads connected to this PC.
+    pub pads: u8,
+    /// The mouse is captured.
+    pub captured: bool,
 }
 
 const BG: u32 = 0x00_0D_11_18;
@@ -254,6 +302,22 @@ impl Cv<'_> {
     }
 }
 
+/// A small gamepad: body, d-pad, four buttons. `x`,`y`: top-left of a 26x16 (unit `s`) box.
+fn gamepad_icon(c: &mut Cv, x: i32, y: i32, s: i32, col: u32) {
+    c.round(x, y + 2 * s, 26 * s, 12 * s, 6 * s, col, 1.0);
+    // grips
+    c.round(x + s, y + 8 * s, 7 * s, 8 * s, 3 * s, col, 1.0);
+    c.round(x + 18 * s, y + 8 * s, 7 * s, 8 * s, 3 * s, col, 1.0);
+    // cut-outs (what is drawn over the body is the bar's dark colour)
+    let dark = 0x00_1B_20_2B;
+    c.rect(x + 5 * s, y + 6 * s, 6 * s, 2 * s, dark, 0.9);
+    c.rect(x + 7 * s, y + 4 * s, 2 * s, 6 * s, dark, 0.9);
+    c.disc(x + 18 * s, y + 5 * s, 1.3 * s as f32, dark, 0.9);
+    c.disc(x + 21 * s, y + 8 * s, 1.3 * s as f32, dark, 0.9);
+    c.disc(x + 15 * s, y + 8 * s, 1.3 * s as f32, dark, 0.9);
+    c.disc(x + 18 * s, y + 11 * s, 1.3 * s as f32, dark, 0.9);
+}
+
 /// Draws the bar into `buf` (`w`x`h` pixels, 0x00RRGGBB, tightly packed). Does nothing when fully faded.
 pub fn draw(buf: &mut [u32], w: i32, h: i32, b: &Bar, st: &State) {
     if w <= 0 || h <= 0 || buf.len() < (w * h) as usize || st.opacity <= 0.0 {
@@ -312,6 +376,29 @@ pub fn draw(buf: &mut [u32], w: i32, h: i32, b: &Bar, st: &State) {
     let pct = format!("{}%", percent(st.level));
     c.digits(b.text_x(), b.y + (b.h - 15 * s) / 2, 3 * s, &pct, if dead { DIM } else { FG }, 1.0);
 
+    // remote control: [gamepad icon + count] and, in a wide bar, the label (the label itself is text, drawn by the
+    // window code with the font; here only the shapes)
+    if let Some(ct) = st.ctl {
+        let r = b.ctl_rect();
+        let live = ct.on && ct.allowed;
+        let waiting = ct.on && !ct.allowed;
+        if ct.on {
+            c.round(r.0, r.1, r.2, r.3, 12 * s, if live { ACCENT } else { YELLOW }, if live { 0.85 } else { 0.30 });
+        } else if st.hover == Hit::Control {
+            c.round(r.0, r.1, r.2, r.3, 12 * s, FG, 0.14);
+        } else {
+            c.outline(r.0, r.1, r.2, r.3, 12 * s, s.max(1), FG, 0.20);
+        }
+        let col = if ct.on { 0x00_FF_FF_FF } else if ct.pads > 0 { FG } else { DIM };
+        gamepad_icon(&mut c, r.0 + 10 * s, r.1 + (r.3 - 16 * s) / 2, s, col);
+        let count = format!("{}", ct.pads.min(9));
+        c.digits(r.0 + 10 * s + 30 * s, r.1 + (r.3 - 10 * s) / 2, 2 * s, &count, col, 1.0);
+        if waiting {
+            let q = 5.0 * s as f32;
+            c.disc(r.0 + r.2 - 10 * s, r.1 + 10 * s, q, YELLOW, 0.5 + 0.5 * (st.time * 4.0).sin().abs());
+        }
+    }
+
     // network lamp: a dot in the level's colour with a soft pulsing ring
     let (lx, ly) = b.lamp_center();
     let lamp = match st.net {
@@ -360,7 +447,7 @@ mod tests {
     use super::*;
 
     fn st() -> State {
-        State { level: 0.75, muted: false, has_audio: true, net: Some(0), fullscreen: false, hover: Hit::Outside, opacity: 1.0, time: 0.4 }
+        State { level: 0.75, muted: false, has_audio: true, net: Some(0), fullscreen: false, hover: Hit::Outside, opacity: 1.0, time: 0.4, ctl: None }
     }
 
     #[test]
@@ -389,6 +476,47 @@ mod tests {
             assert!(b.text_x() + TEXT_W <= b.lamp_left(), "text before the lamp");
             assert!(b.lamp_center().0 < b.full_rect().0);
             assert!(b.full_rect().0 + b.full_rect().2 <= b.stop_rect().0);
+        }
+    }
+
+    #[test]
+    fn control_button_fits_and_is_hit() {
+        for (ww, wh, sc) in [(1280, 720, 1), (1920, 1080, 1), (3840, 2160, 2), (900, 500, 1), (700, 400, 1)] {
+            let b = Bar::with_control(ww, wh, sc, true);
+            assert!(b.x >= 0 && b.x + b.w <= ww, "{b:?}");
+            let c = b.ctl_rect();
+            assert!(c.2 > 0);
+            let (tx0, tx1, _) = b.track();
+            assert!(tx1 <= b.text_x() || ww < 760, "track ends before the text in {ww}");
+            assert!(c.0 + c.2 <= b.lamp_left(), "button before the lamp");
+            assert!(b.text_x() + TEXT_W <= c.0, "percent text before the button in {ww}");
+            assert!(tx0 < tx1);
+            assert_eq!(b.hit(c.0 + c.2 / 2, c.1 + c.3 / 2), Hit::Control);
+            let m = b.mute_rect();
+            assert_eq!(b.hit(m.0 + 2, m.1 + 2), Hit::Mute);
+        }
+        // without the button nothing changes
+        let a = Bar::new(1280, 720, 1);
+        assert_eq!(a.ctl_w, 0);
+        assert_eq!(a.w, MAX_W);
+    }
+
+    #[test]
+    fn control_button_draws_in_every_state() {
+        let (w, h) = (900, 300);
+        let b = Bar::with_control(w, h, 1, true);
+        let base = vec![0x00_20_20_20u32; (w * h) as usize];
+        for (on, allowed, pads, captured) in [(false, false, 0, false), (false, true, 2, false), (true, false, 1, false), (true, true, 3, true)] {
+            let mut buf = base.clone();
+            draw(&mut buf, w, h, &b, &State { ctl: Some(Ctl { on, allowed, pads, captured }), ..st() });
+            let r = b.ctl_rect();
+            let mut changed = false;
+            for y in r.1..r.1 + r.3 {
+                for x in r.0..r.0 + r.2 {
+                    changed |= buf[(y * w + x) as usize] != base[(y * w + x) as usize];
+                }
+            }
+            assert!(changed, "button drawn for {on} {allowed} {pads}");
         }
     }
 

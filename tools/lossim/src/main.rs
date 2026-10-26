@@ -39,6 +39,12 @@ mod gpulogic;
 #[path = "../../../src/volume.rs"]
 #[allow(dead_code)]
 mod volume;
+#[path = "../../../src/inputproto.rs"]
+#[allow(dead_code)]
+mod inputproto;
+#[path = "../../../src/inputlogic.rs"]
+#[allow(dead_code)]
+mod inputlogic;
 #[path = "../../../src/net.rs"]
 mod net;
 #[path = "../../../src/ratectl.rs"]

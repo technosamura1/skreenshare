@@ -10,6 +10,7 @@ use crate::ui::{self, Exchange};
 use crate::video::{self, Decoder, OwnedFrame, Scaler};
 use ffmpeg_next::ffi::{AVFrame, AVPixelFormat};
 use crate::bar::{self, Bar, Hit};
+use crate::inputview::ViewInput;
 use crate::volume::{self, VolumeCtl};
 use crate::viewperf::{self, Acc, CostGovernor, HwWatch, JitterMeter};
 use anyhow::Result;
@@ -21,12 +22,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, StartCause, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, StartCause, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{Fullscreen, Window, WindowId};
 
 pub struct ClientOpts {
+    /// Remote control (gamepad, mouse, keyboard to the host when its owner allows it). `--no-control` turns it off.
+    pub control: bool,
     pub exchange: Exchange,
     pub audio: bool,
     pub hw_decode: bool,
@@ -290,6 +294,13 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         let sh = sh.clone();
         ui::on_stop(move || sh.running.store(false, Ordering::Relaxed));
     }
+    // Remote control: its own thread; it sends nothing until the "Управление" switch is on and the host allows it.
+    let control = o.control;
+    let input = ViewInput::new();
+    if control {
+        let sh = sh.clone();
+        input.spawn(sock.clone(), peer, token, move || sh.running.load(Ordering::Relaxed));
+    }
 
     let player = if o.audio {
         match crate::audio::start_playback() {
@@ -319,6 +330,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
     {
         let sock = sock.clone();
         let sh = sh.clone();
+        let input = input.clone();
         std::thread::spawn(move || {
             boost_thread();
             let _ = sock.set_read_timeout(Some(Duration::from_millis(10)));
@@ -374,6 +386,9 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                                     sh.rtt_us.store(now.saturating_sub(t), Ordering::Relaxed);
                                 }
                                 net::PT_PUNCH => net::answer_punch(&sock, token, net::ROLE_CLIENT, body, from),
+                                // Remote control answers from the host (permissions, force feedback).
+                                net::PT_CTRL if control && from == peer => input.on_ctrl(body),
+                                net::PT_RUMBLE if control && from == peer => input.on_rumble(body),
                                 net::PT_BYE => {
                                     println!("Показ остановлен на другой стороне.");
                                     sh.running.store(false, Ordering::Relaxed);
@@ -470,10 +485,11 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     let _ = sock.send_to(&out, peer);
                     sh.keyreqs.store(keyreq.sent, Ordering::Relaxed);
                 }
-                if audio_on && tick % 10 == 1 {
-                    // Tell the host which audio formats we understand (it only sends Opus to viewers that say so).
+                if (audio_on || control) && tick % 10 == 1 {
+                    // Tell the host what we understand: Opus audio (it only sends Opus to viewers that say so)
+                    // and remote control (it only sends control answers to viewers that say so).
                     net::write_header(&mut out, net::PT_CAPS, token);
-                    out.push(net::CAP_OPUS);
+                    out.push(if audio_on { net::CAP_OPUS } else { 0 } | if control { net::CAP_INPUT } else { 0 });
                     let _ = sock.send_to(&out, peer);
                 }
                 if tick % 5 == 0 {
@@ -919,6 +935,14 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         bar_drawn: true,
         cursor_shown: true,
         started: Instant::now(),
+        control,
+        input: input.clone(),
+        captured: false,
+        mods: ModifiersState::empty(),
+        esc_since: None,
+        capture_t: None,
+        mouse_frac: (0.0, 0.0),
+        pad_panel: false,
     };
     event_loop.run_app(&mut app)?;
 
@@ -952,6 +976,19 @@ struct App {
     bar_drawn: bool,
     cursor_shown: bool,
     started: Instant,
+    /// Remote control is enabled (no `--no-control`).
+    control: bool,
+    input: Arc<ViewInput>,
+    /// The mouse is captured: pointer confined and hidden, mouse and keys go to the host.
+    captured: bool,
+    mods: ModifiersState,
+    /// Esc is held (since when): one second releases the mouse.
+    esc_since: Option<Instant>,
+    capture_t: Option<Instant>,
+    /// Sub-pixel rest of raw mouse movement.
+    mouse_frac: (f64, f64),
+    /// F2: the gamepad test panel.
+    pad_panel: bool,
 }
 
 /// The bar fades 0.4 s after 2.6 s without mouse movement; ~30 fps of redraws only while it is visible.
@@ -971,7 +1008,7 @@ impl App {
     fn bar_geometry(&self) -> Option<Bar> {
         let w = self.window.as_ref()?;
         let size = w.inner_size();
-        Some(Bar::new(size.width as i32, size.height as i32, self.scale()))
+        Some(Bar::with_control(size.width as i32, size.height as i32, self.scale(), self.ctl_available()))
     }
 
     /// 0..1: how visible the bar is right now. It stays up while the pointer is on it or the slider is dragged.
@@ -997,6 +1034,112 @@ impl App {
                 w.set_cursor_visible(shown);
             }
         }
+    }
+
+    /// The host understands remote control (it has answered) and this viewer has it enabled.
+    fn ctl_available(&self) -> bool {
+        self.control && self.input.host_info().is_some()
+    }
+
+    fn set_capture(&mut self, on: bool) {
+        if on == self.captured {
+            return;
+        }
+        self.captured = on;
+        self.input.captured.store(on, Ordering::Relaxed);
+        self.esc_since = None;
+        self.mouse_frac = (0.0, 0.0);
+        if let Some(w) = &self.window {
+            if on {
+                use winit::window::CursorGrabMode;
+                if w.set_cursor_grab(CursorGrabMode::Confined).is_err() {
+                    let _ = w.set_cursor_grab(CursorGrabMode::Locked);
+                }
+                w.set_cursor_visible(false);
+                self.cursor_shown = false;
+                self.capture_t = Some(Instant::now());
+            } else {
+                let _ = w.set_cursor_grab(winit::window::CursorGrabMode::None);
+                w.set_cursor_visible(true);
+                self.cursor_shown = true;
+                self.capture_t = None;
+                self.last_move = Instant::now();
+            }
+        }
+        if !on {
+            self.input.release_kbm();
+        }
+        self.redraw();
+    }
+
+    fn toggle_control(&mut self) {
+        if !self.ctl_available() {
+            return;
+        }
+        let on = !self.input.want.load(Ordering::Relaxed);
+        self.input.want.store(on, Ordering::Relaxed);
+        *self.input.revoked_at.lock().unwrap() = None;
+        if !on {
+            self.set_capture(false);
+        }
+        self.wake_bar();
+    }
+
+    /// A key of the viewer's keyboard while the mouse is captured: goes to the host as a scan code.
+    fn forward_key(&mut self, ev: &winit::event::KeyEvent) {
+        let down = ev.state == ElementState::Pressed;
+        if matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
+            self.esc_since = if down { self.esc_since.or(Some(Instant::now())) } else { None };
+        }
+        let Some(sc) = ev.physical_key.to_scancode() else { return };
+        // Plain or 0xE0-extended scan codes only (Pause and the like are left out).
+        if sc == 0 || sc > 0xFFFF || !matches!(sc >> 8, 0 | 0xE0) || sc & 0xFF == 0 {
+            return;
+        }
+        self.input.key(sc as u16, down, ev.repeat);
+    }
+
+    /// What to tell the viewer about remote control right now (a short line, a dot colour).
+    fn hint(&self) -> Option<(String, u32, f32)> {
+        const RED: u32 = 0x00_F0_5A_5A;
+        const YELLOW: u32 = 0x00_F0_B4_3C;
+        const GREEN: u32 = 0x00_3E_CF_8E;
+        if let Some(t) = *self.input.revoked_at.lock().unwrap() {
+            if t.elapsed() < Duration::from_secs(5) {
+                return Some(("Показывающий отключил управление".into(), RED, 1.0));
+            }
+        }
+        if !self.ctl_available() || !self.input.want.load(Ordering::Relaxed) {
+            return None;
+        }
+        let info = self.input.host_info()?;
+        if !info.allowed {
+            return Some(("Ждём, пока показывающий разрешит управление".into(), YELLOW, 1.0));
+        }
+        if self.captured {
+            let fresh = self.capture_t.is_some_and(|t| t.elapsed() < Duration::from_secs(6));
+            return Some(if fresh {
+                ("Управление включено · Ctrl+Alt+Shift (или держите Esc 1 с) — отпустить мышь".into(), GREEN, 1.0)
+            } else {
+                ("Управление включено".into(), GREEN, 0.6)
+            });
+        }
+        if info.kbm {
+            let t = if info.pad && self.input.pad_count() > 0 {
+                "Геймпад уже передаётся. Нажмите на картинку, чтобы управлять мышью и клавиатурой"
+            } else {
+                "Нажмите на картинку, чтобы управлять мышью и клавиатурой"
+            };
+            return Some((t.into(), GREEN, 1.0));
+        }
+        if info.pad {
+            return Some(("Геймпад передаётся показывающему (мышь и клавиатура не разрешены)".into(), GREEN, 1.0));
+        }
+        Some(("Показывающий не разрешил ни геймпад, ни мышь с клавиатурой".into(), YELLOW, 1.0))
+    }
+
+    fn overlay_active(&self) -> bool {
+        self.pad_panel || self.captured || self.hint().is_some()
     }
 
     fn save_volume(&self) {
@@ -1068,6 +1211,47 @@ impl ApplicationHandler<UserEv> for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
         match ev {
             WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::Focused(false) => {
+                // Leaving the window lets go of the mouse and of every key.
+                self.set_capture(false);
+                self.input.release_kbm();
+            }
+            WindowEvent::ModifiersChanged(m) => {
+                self.mods = m.state();
+                if self.captured && self.mods.control_key() && self.mods.alt_key() && self.mods.shift_key() {
+                    self.set_capture(false);
+                }
+            }
+            // While the mouse is captured everything goes to the host (the release chord is Ctrl+Alt+Shift).
+            WindowEvent::KeyboardInput { event, .. } if self.captured => self.forward_key(&event),
+            WindowEvent::MouseInput { state, button, .. } if self.captured => {
+                let b = match button {
+                    MouseButton::Left => 0,
+                    MouseButton::Right => 1,
+                    MouseButton::Middle => 2,
+                    MouseButton::Back => 3,
+                    MouseButton::Forward => 4,
+                    MouseButton::Other(_) => return,
+                };
+                self.input.mouse_button(b, state == ElementState::Pressed);
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.captured => {
+                let (x, y) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x * 120.0, y * 120.0),
+                    MouseScrollDelta::PixelDelta(p) => (p.x as f32 * 3.0, p.y as f32 * 3.0),
+                };
+                self.input.wheel(y.round() as i32, x.round() as i32);
+            }
+            WindowEvent::CursorMoved { .. } if self.captured => {}
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat && matches!(event.logical_key, Key::Named(NamedKey::F2)) =>
+            {
+                // Gamepad test panel.
+                if self.control {
+                    self.pad_panel = !self.pad_panel;
+                    self.redraw();
+                }
+            }
             WindowEvent::Resized(s) => {
                 self.sh.win_size.store(((s.width as u64) << 32) | s.height as u64, Ordering::Relaxed);
             }
@@ -1140,6 +1324,10 @@ impl ApplicationHandler<UserEv> for App {
                 // A click on the bar belongs to the bar (and does not count towards the double click).
                 self.set_hover();
                 match self.hover {
+                    Hit::Outside if self.ctl_available() && self.input.kbm_active() => {
+                        // A click on the picture takes the mouse for the host.
+                        self.set_capture(true);
+                    }
                     Hit::Outside => {
                         let now = Instant::now();
                         if self.last_click.is_some_and(|t| now.duration_since(t) < Duration::from_millis(400)) {
@@ -1166,6 +1354,7 @@ impl ApplicationHandler<UserEv> for App {
                                 }
                             }
                             Hit::Fullscreen => self.toggle_fullscreen(),
+                            Hit::Control => self.toggle_control(),
                             Hit::Stop => {
                                 self.save_volume();
                                 el.exit();
@@ -1188,7 +1377,32 @@ impl ApplicationHandler<UserEv> for App {
         }
     }
 
+    fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, ev: DeviceEvent) {
+        // Raw mouse movement (no pointer acceleration, not stopped by the window edge) while captured.
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = ev {
+            if self.captured {
+                let x = dx + self.mouse_frac.0;
+                let y = dy + self.mouse_frac.1;
+                let (ix, iy) = (x.trunc(), y.trunc());
+                self.mouse_frac = (x - ix, y - iy);
+                self.input.mouse_move(ix as i32, iy as i32);
+            }
+        }
+    }
+
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // The host switched control off (or it was revoked): the mouse is let go at once.
+        if self.captured && !self.input.kbm_active() {
+            self.set_capture(false);
+        }
+        if self.captured && self.esc_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(1)) {
+            self.set_capture(false);
+        }
+        if self.overlay_active() {
+            el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + BAR_TICK));
+            self.redraw();
+            return;
+        }
         // A still picture sends no frames, so the bar needs its own clock. While it is on screen (or has to be
         // wiped once more after fading out) tick at ~30 fps; otherwise sleep until something happens.
         if self.bar_opacity() > 0.0 || self.bar_drawn {
@@ -1202,6 +1416,12 @@ impl ApplicationHandler<UserEv> for App {
 impl App {
     fn draw(&mut self) {
         let t0 = Instant::now();
+        let ctl = if self.ctl_available() {
+            Some((self.input.want.load(Ordering::Relaxed), self.input.host_info().is_some_and(|i| i.allowed), self.input.pad_count()))
+        } else {
+            None
+        };
+        let hint = self.hint();
         let (Some(w), Some(surface)) = (&self.window, &mut self.surface) else { return };
         let size = w.inner_size();
         let (Some(ww), Some(wh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
@@ -1236,6 +1456,7 @@ impl App {
             crate::guilogic::bar_opacity(self.last_move.elapsed().as_millis())
         };
         self.bar_drawn = opacity > 0.0;
+        let sc = (w.scale_factor().round() as i32).max(1);
         if opacity > 0.0 {
             let st = bar::State {
                 level: self.volume.as_ref().map_or(1.0, |v| v.level()),
@@ -1246,8 +1467,46 @@ impl App {
                 hover: self.hover,
                 opacity,
                 time: self.started.elapsed().as_secs_f32(),
+                ctl: ctl.map(|(on, allowed, pads)| bar::Ctl { on, allowed, pads: pads as u8, captured: self.captured }),
             };
-            bar::draw(&mut buf, ww as i32, wh as i32, &Bar::new(ww as i32, wh as i32, (w.scale_factor().round() as i32).max(1)), &st);
+            let geom = Bar::with_control(ww as i32, wh as i32, sc, ctl.is_some());
+            bar::draw(&mut buf, ww as i32, wh as i32, &geom, &st);
+            if geom.ctl_w > 90 * sc {
+                if let Some((on, allowed, _)) = ctl {
+                    let mut ob = crate::overlay::Buf { px: &mut buf, w: ww as i32, h: wh as i32 };
+                    let col = if on && allowed { 0x00_FF_FF_FF } else if on { 0x00_F0_B4_3C } else { 0x00_E8_EA_EE };
+                    // faded with the bar through the label's colour: simple, the label is small
+                    if opacity > 0.5 {
+                        crate::overlay::bar_label(&mut ob, geom.ctl_rect(), sc, "Управление", col);
+                    }
+                }
+            }
+        }
+        // Remote-control overlays: the hint line and the F2 gamepad test.
+        {
+            let mut ob = crate::overlay::Buf { px: &mut buf, w: ww as i32, h: wh as i32 };
+            if let Some((text, dot, a)) = hint.as_ref() {
+                crate::overlay::hint(&mut ob, ww as i32 / 2, 20 * sc, sc, text, Some(*dot), *a);
+            }
+            if self.pad_panel {
+                let slots = *self.input.slots_view();
+                let pads = *self.input.pads.lock().unwrap();
+                let mut rows = Vec::new();
+                for (slot, st) in pads.iter().enumerate() {
+                    if let Some(st) = st {
+                        let virt = slots.iter().position(|s| *s == Some(slot)).map(|v| v + 1);
+                        rows.push(crate::overlay::PadRow { virt, slot, st: *st });
+                    }
+                }
+                let note = match self.input.host_info() {
+                    Some(i) if i.allowed && i.pad && self.input.want.load(Ordering::Relaxed) => "Управление включено: геймпад передаётся показывающему.",
+                    Some(i) if i.allowed && !i.pad => "Показывающий не разрешил геймпад.",
+                    Some(i) if !i.allowed => "Показывающий пока не разрешил управление.",
+                    Some(_) => "Включите «Управление» в панели внизу, чтобы геймпад попал в игру.",
+                    None => "Показывающий не поддерживает удалённое управление (нужна версия 0.11.0).",
+                };
+                crate::overlay::pad_panel(&mut ob, sc, &rows, note, 1.0);
+            }
         }
         // The mouse cursor goes away with the bar in full screen (the stream already shows the host's).
         let hide = opacity <= 0.0 && w.fullscreen().is_some();
