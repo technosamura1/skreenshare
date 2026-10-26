@@ -84,6 +84,17 @@ pub fn net(q: &crate::netq::NetQuality) {
     }
 }
 
+/// One point of the GUI's 60-second quality graph, about once a second: `@GRAPH <Мбит/с>|<пинг мс или ->|<потери %>`.
+/// Only the launcher pipe sees it; nothing of this goes over the network.
+pub fn graph(mbps: f64, rtt_ms: Option<f64>, loss: f64) {
+    if ipc() {
+        match rtt_ms {
+            Some(r) => println!("@GRAPH {mbps:.2}|{r:.0}|{:.1}", loss * 100.0),
+            None => println!("@GRAPH {mbps:.2}|-|{:.1}", loss * 100.0),
+        }
+    }
+}
+
 /// What is being shown ("Показываю окно ..."), or `warn`: the chosen window was lost and the full screen is
 /// shown instead (the GUI paints that line red).
 pub fn source_status(text: &str, warn: bool) {

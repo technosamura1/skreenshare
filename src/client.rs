@@ -9,7 +9,8 @@ use crate::retx;
 use crate::ui::{self, Exchange};
 use crate::video::{self, Decoder, OwnedFrame, Scaler};
 use ffmpeg_next::ffi::{AVFrame, AVPixelFormat};
-use crate::volume::{self, Hit, Panel, VolumeCtl};
+use crate::bar::{self, Bar, Hit};
+use crate::volume::{self, VolumeCtl};
 use crate::viewperf::{self, Acc, CostGovernor, HwWatch, JitterMeter};
 use anyhow::Result;
 use std::net::{SocketAddr, UdpSocket};
@@ -20,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, StartCause, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -145,6 +146,8 @@ struct Shared {
     /// 0 = CPU decoder, 1 = GPU (D3D11VA), 2 = GPU requested but FFmpeg fell back to its CPU decoder,
     /// 3 = GPU decoder failed at run time and we switched to the CPU.
     dec_mode: AtomicU8,
+    /// Network lamp for the player bar: 0 good, 1 weak, 2 bad, 255 not known yet.
+    net_level: AtomicU8,
     /// ConvPath code: where colour conversion and scaling run right now.
     conv_mode: AtomicU8,
     /// The decoder asks the receiver for a fresh keyframe (after switching decoders).
@@ -275,6 +278,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         picture: Mutex::new(Picture { w: 0, h: 0, px: Vec::new(), flash: false, seq: 0 }),
         qdepth: AtomicUsize::new(0),
         dec_mode: AtomicU8::new(0),
+        net_level: AtomicU8::new(255),
         conv_mode: AtomicU8::new(0),
         want_resync: AtomicBool::new(false),
         dropped_full: AtomicU64::new(0),
@@ -454,6 +458,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             let (mut nq_rx0, mut nq_miss0, mut nq_res0) = (0u64, 0u64, 0u64);
             let mut nq_emit = Instant::now() - Duration::from_secs(10);
             ui::net(&nq);
+            let mut gr_bytes0 = 0u64;
             // Ping right away: the first round-trip time sets the retry timing for lost packets.
             send_ping(&sock, peer, token, &sh, &mut out);
             while sh.running.load(Ordering::Relaxed) {
@@ -503,6 +508,13 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         nq_emit = Instant::now();
                         ui::net(&nq);
                     }
+                    if drx + dmiss > 0 {
+                        sh.net_level.store(nq.level as u8, Ordering::Relaxed);
+                    }
+                    // One point per second for the launcher's graph (bitrate = what arrived, ping, loss before repairs).
+                    let rb = sh.recv_bytes.load(Ordering::Relaxed);
+                    ui::graph(rb.saturating_sub(gr_bytes0) as f64 * 8.0 / 1e6, (rtt > 0).then(|| rtt as f64 / 1000.0), sample.loss);
+                    gr_bytes0 = rb;
                 }
                 if sh.now_ms().saturating_sub(sh.last_seen_ms.load(Ordering::Relaxed)) > 10_000 {
                     println!("Связь потеряна.");
@@ -900,8 +912,13 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         start_fullscreen: !o.windowed,
         last_click: None,
         volume: player.as_ref().map(|p| p.volume.clone()),
-        overlay: None,
         cursor: (0, 0),
+        last_move: Instant::now(),
+        drag: false,
+        hover: Hit::Outside,
+        bar_drawn: true,
+        cursor_shown: true,
+        started: Instant::now(),
     };
     event_loop.run_app(&mut app)?;
 
@@ -925,21 +942,20 @@ struct App {
     last_click: Option<Instant>,
     /// Level and mute of the sound (None when there is no audio output).
     volume: Option<Arc<VolumeCtl>>,
-    /// The volume panel a right click opens.
-    overlay: Option<Overlay>,
     cursor: (i32, i32),
+    /// Last mouse movement / touch of the bar: the bar is shown for a while after it (see guilogic::bar_opacity).
+    last_move: Instant,
+    /// The left button is held on the volume slider.
+    drag: bool,
+    hover: Hit,
+    /// The last picture had the bar on it (so one more redraw is needed to wipe it off when it has faded out).
+    bar_drawn: bool,
+    cursor_shown: bool,
+    started: Instant,
 }
 
-/// The open volume panel.
-struct Overlay {
-    panel: Panel,
-    /// The left button is held on the slider.
-    dragging: bool,
-    /// Hides itself this long after the last touch.
-    last_touch: Instant,
-}
-
-const OVERLAY_HIDE: Duration = Duration::from_secs(4);
+/// The bar fades 0.4 s after 2.6 s without mouse movement; ~30 fps of redraws only while it is visible.
+const BAR_TICK: Duration = Duration::from_millis(33);
 
 impl App {
     fn redraw(&self) {
@@ -948,34 +964,64 @@ impl App {
         }
     }
 
-    fn open_overlay(&mut self) {
-        let (Some(w), Some(_)) = (&self.window, &self.volume) else { return };
-        let size = w.inner_size();
-        let s = w.scale_factor().round() as i32;
-        let panel = Panel::place(size.width as i32, size.height as i32, self.cursor.0, self.cursor.1, s);
-        self.overlay = Some(Overlay { panel, dragging: false, last_touch: Instant::now() });
-        w.set_cursor_visible(true);
-        w.request_redraw();
+    fn scale(&self) -> i32 {
+        self.window.as_ref().map_or(1, |w| (w.scale_factor().round() as i32).max(1))
     }
 
-    fn close_overlay(&mut self) {
-        if self.overlay.take().is_some() {
-            if let Some(v) = &self.volume {
-                volume::save(v);
-            }
+    fn bar_geometry(&self) -> Option<Bar> {
+        let w = self.window.as_ref()?;
+        let size = w.inner_size();
+        Some(Bar::new(size.width as i32, size.height as i32, self.scale()))
+    }
+
+    /// 0..1: how visible the bar is right now. It stays up while the pointer is on it or the slider is dragged.
+    fn bar_opacity(&self) -> f32 {
+        let on_bar = self.drag || self.hover != Hit::Outside;
+        if on_bar {
+            return 1.0;
+        }
+        crate::guilogic::bar_opacity(self.last_move.elapsed().as_millis())
+    }
+
+    /// The bar was touched: show it again, and the mouse cursor with it.
+    fn wake_bar(&mut self) {
+        self.last_move = Instant::now();
+        self.set_cursor(true);
+        self.redraw();
+    }
+
+    fn set_cursor(&mut self, shown: bool) {
+        if self.cursor_shown != shown {
+            self.cursor_shown = shown;
             if let Some(w) = &self.window {
-                w.set_cursor_visible(w.fullscreen().is_none());
-                w.request_redraw();
+                w.set_cursor_visible(shown);
             }
         }
     }
 
-    fn toggle_fullscreen(&self) {
+    fn save_volume(&self) {
+        if let Some(v) = &self.volume {
+            volume::save(v);
+        }
+    }
+
+    fn toggle_fullscreen(&mut self) {
         let Some(w) = &self.window else { return };
         let fs = w.fullscreen().is_none();
         w.set_fullscreen(fs.then_some(Fullscreen::Borderless(None)));
-        // The stream already shows the host's cursor; ours on top would just be in the way.
-        w.set_cursor_visible(!fs);
+        // In full screen the stream already shows the host's cursor, ours only appears together with the bar.
+        self.wake_bar();
+    }
+
+    /// What the pointer is over; only counts while the bar is actually visible.
+    fn set_hover(&mut self) {
+        let visible = self.drag
+            || self.hover != Hit::Outside
+            || crate::guilogic::bar_opacity(self.last_move.elapsed().as_millis()) > 0.05;
+        self.hover = match self.bar_geometry() {
+            Some(b) if visible => b.hit(self.cursor.0, self.cursor.1),
+            _ => Hit::Outside,
+        };
     }
 }
 
@@ -985,13 +1031,16 @@ impl ApplicationHandler<UserEv> for App {
             return;
         }
         let mut attrs = Window::default_attributes()
-            .with_title("screenshare — F11 или двойной клик: полный экран / окно · правая кнопка: громкость")
+            .with_title("screenshare — F11 или двойной клик: полный экран / окно")
+            .with_window_icon(crate::icon::window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         if self.start_fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
         let window = Rc::new(el.create_window(attrs).expect("create window"));
-        window.set_cursor_visible(!self.start_fullscreen);
+        self.cursor_shown = !self.start_fullscreen;
+        window.set_cursor_visible(self.cursor_shown);
+        self.last_move = Instant::now();
         window.focus_window();
         let ctx = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         self.surface = Some(softbuffer::Surface::new(&ctx, window.clone()).expect("softbuffer surface"));
@@ -1025,93 +1074,106 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
                 match event.logical_key {
                     Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
-                    Key::Named(NamedKey::Escape) if self.overlay.is_some() => self.close_overlay(),
                     Key::Named(NamedKey::Escape) => {
                         if self.window.as_ref().is_some_and(|w| w.fullscreen().is_some()) {
                             self.toggle_fullscreen();
                         }
                     }
-                    _ => {}
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x as i32, position.y as i32);
-                if let (Some(ov), Some(v)) = (&mut self.overlay, &self.volume) {
-                    if ov.dragging {
-                        v.set_level(ov.panel.level_at(self.cursor.0));
-                        v.set_muted(false);
-                        ov.last_touch = Instant::now();
-                        self.redraw();
-                    }
-                }
-            }
-            // Right click: the volume panel (the left button keeps its double-click-for-fullscreen job).
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
-                if self.overlay.is_some() {
-                    self.close_overlay();
-                } else {
-                    self.open_overlay();
-                }
-            }
-            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                if let Some(ov) = &mut self.overlay {
-                    if ov.dragging {
-                        ov.dragging = false;
-                        if let Some(v) = &self.volume {
-                            volume::save(v);
-                        }
-                    }
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } if self.overlay.is_some() => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => (p.y / 40.0) as f32,
-                };
-                if let (Some(ov), Some(v)) = (&mut self.overlay, &self.volume) {
-                    v.set_level((v.level() + dy * 0.05).max(0.0));
-                    v.set_muted(false);
-                    ov.last_touch = Instant::now();
-                    volume::save(v);
-                }
-                self.redraw();
-            }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. }
-                if self.overlay.is_some() =>
-            {
-                let hit = self.overlay.as_ref().map_or(Hit::Outside, |o| o.panel.hit(self.cursor.0, self.cursor.1));
-                match hit {
-                    Hit::Outside => self.close_overlay(),
-                    Hit::Mute => {
+                    Key::Character(c) if c.eq_ignore_ascii_case("m") => {
                         if let Some(v) = &self.volume {
                             v.toggle_mute();
                             volume::save(v);
                         }
+                        self.wake_bar();
                     }
-                    Hit::Slider(level) => {
-                        if let Some(v) = &self.volume {
-                            v.set_level(level);
-                            v.set_muted(false);
-                        }
-                        if let Some(o) = &mut self.overlay {
-                            o.dragging = true;
-                        }
+                    _ => {}
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let moved = (position.x as i32 - self.cursor.0).abs() + (position.y as i32 - self.cursor.1).abs() >= 2;
+                self.cursor = (position.x as i32, position.y as i32);
+                if moved {
+                    self.last_move = Instant::now();
+                    self.set_cursor(true);
+                }
+                let before = self.hover;
+                self.set_hover();
+                if self.drag {
+                    if let (Some(b), Some(v)) = (self.bar_geometry(), &self.volume) {
+                        v.set_level(b.level_at(self.cursor.0));
+                        v.set_muted(false);
                     }
-                    Hit::Inside => {}
                 }
-                if let Some(o) = &mut self.overlay {
-                    o.last_touch = Instant::now();
+                if moved || before != self.hover {
+                    self.redraw();
                 }
-                self.last_click = None;
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.hover = Hit::Outside;
                 self.redraw();
             }
+            // Right click: show the bar (and keep it up a little longer).
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                self.wake_bar();
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                if self.drag {
+                    self.drag = false;
+                    self.save_volume();
+                    self.last_move = Instant::now();
+                }
+            }
+            // Wheel: volume in 5% steps, anywhere in the window.
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y / 40.0) as f32,
+                };
+                if let Some(v) = &self.volume {
+                    v.set_level(volume::clamp_level(((v.level() + dy * 0.05) * 20.0).round() / 20.0));
+                    v.set_muted(false);
+                    volume::save(v);
+                }
+                self.wake_bar();
+            }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                let now = Instant::now();
-                if self.last_click.is_some_and(|t| now.duration_since(t) < Duration::from_millis(400)) {
-                    self.toggle_fullscreen();
-                    self.last_click = None;
-                } else {
-                    self.last_click = Some(now);
+                // A click on the bar belongs to the bar (and does not count towards the double click).
+                self.set_hover();
+                match self.hover {
+                    Hit::Outside => {
+                        let now = Instant::now();
+                        if self.last_click.is_some_and(|t| now.duration_since(t) < Duration::from_millis(400)) {
+                            self.toggle_fullscreen();
+                            self.last_click = None;
+                        } else {
+                            self.last_click = Some(now);
+                        }
+                    }
+                    hit => {
+                        self.last_click = None;
+                        match hit {
+                            Hit::Mute => {
+                                if let Some(v) = &self.volume {
+                                    v.toggle_mute();
+                                    volume::save(v);
+                                }
+                            }
+                            Hit::Slider(level) => {
+                                if let Some(v) = &self.volume {
+                                    v.set_level(level);
+                                    v.set_muted(false);
+                                    self.drag = true;
+                                }
+                            }
+                            Hit::Fullscreen => self.toggle_fullscreen(),
+                            Hit::Stop => {
+                                self.save_volume();
+                                el.exit();
+                            }
+                            _ => {}
+                        }
+                        self.wake_bar();
+                    }
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),
@@ -1119,19 +1181,20 @@ impl ApplicationHandler<UserEv> for App {
         }
     }
 
+    fn new_events(&mut self, _el: &ActiveEventLoop, cause: StartCause) {
+        // The bar animates (fade, lamp pulse) only while it is visible; this timer is the only thing that wakes us.
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            self.redraw();
+        }
+    }
+
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        // The panel hides itself a few seconds after the last touch (a still picture sends no frames to wake us).
-        match &self.overlay {
-            Some(o) if !o.dragging => {
-                let deadline = o.last_touch + OVERLAY_HIDE;
-                if Instant::now() >= deadline {
-                    self.close_overlay();
-                    el.set_control_flow(ControlFlow::Wait);
-                } else {
-                    el.set_control_flow(ControlFlow::WaitUntil(deadline));
-                }
-            }
-            _ => el.set_control_flow(ControlFlow::Wait),
+        // A still picture sends no frames, so the bar needs its own clock. While it is on screen (or has to be
+        // wiped once more after fading out) tick at ~30 fps; otherwise sleep until something happens.
+        if self.bar_opacity() > 0.0 || self.bar_drawn {
+            el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + BAR_TICK));
+        } else {
+            el.set_control_flow(ControlFlow::Wait);
         }
     }
 }
@@ -1150,8 +1213,11 @@ impl App {
         let mut p = self.sh.picture.lock().unwrap();
         let flash = std::mem::take(&mut p.flash);
         let (pw, ph) = (p.w as usize, p.h as usize);
-        if pw == 0 || pw > ww || ph > wh || p.px.len() < pw * ph {
+        if pw == 0 || p.px.len() < pw * ph {
             buf.fill(0);
+        } else if !crate::scale::matches_window(pw, ph, ww, wh) {
+            // The window was resized and the decoder has not caught up yet: stretch smoothly instead of black bars.
+            crate::scale::blit_fit(&mut buf, ww, wh, &p.px, pw, ph);
         } else {
             let (ox, oy) = ((ww - pw) / 2, (wh - ph) / 2);
             buf[..oy * ww].fill(0);
@@ -1164,10 +1230,33 @@ impl App {
             buf[(oy + ph) * ww..].fill(0);
         }
         drop(p);
-        if let (Some(o), Some(v)) = (&self.overlay, &self.volume) {
-            volume::draw_panel(&mut buf, ww as i32, wh as i32, &o.panel, v.level(), v.muted());
+        let opacity = if self.drag || self.hover != Hit::Outside {
+            1.0
+        } else {
+            crate::guilogic::bar_opacity(self.last_move.elapsed().as_millis())
+        };
+        self.bar_drawn = opacity > 0.0;
+        if opacity > 0.0 {
+            let st = bar::State {
+                level: self.volume.as_ref().map_or(1.0, |v| v.level()),
+                muted: self.volume.as_ref().is_some_and(|v| v.muted()),
+                has_audio: self.volume.is_some(),
+                net: Some(self.sh.net_level.load(Ordering::Relaxed)).filter(|&n| n < 3),
+                fullscreen: w.fullscreen().is_some(),
+                hover: self.hover,
+                opacity,
+                time: self.started.elapsed().as_secs_f32(),
+            };
+            bar::draw(&mut buf, ww as i32, wh as i32, &Bar::new(ww as i32, wh as i32, (w.scale_factor().round() as i32).max(1)), &st);
         }
+        // The mouse cursor goes away with the bar in full screen (the stream already shows the host's).
+        let hide = opacity <= 0.0 && w.fullscreen().is_some();
+        let want_cursor = !hide;
         let _ = buf.present();
+        if self.cursor_shown != want_cursor {
+            self.cursor_shown = want_cursor;
+            w.set_cursor_visible(want_cursor);
+        }
         self.sh.diag.lock().unwrap().present.add(t0.elapsed().as_micros() as u64);
         if flash {
             crate::avsync::log("client_video", crate::avsync::now_us());

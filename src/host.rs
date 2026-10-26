@@ -623,6 +623,8 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     let mut nq_emit = Instant::now() - Duration::from_secs(10);
     let (mut nq_bytes, mut nq_resent) = (0u64, 0u64);
     ui::net(&nq);
+    // One graph point per second for the launcher (what was actually sent, ping, loss).
+    let (mut gr_t, mut gr_bytes) = (Instant::now(), sh.sent_bytes.load(Ordering::Relaxed));
     let mut stat_resent0 = 0u64;
     let mut stat_updates = 0u32;
     let mut stat_skipped0 = 0u64;
@@ -657,6 +659,13 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             if nq.update(sample).is_some() || nq_emit.elapsed() > Duration::from_secs(2) {
                 nq_emit = Instant::now();
                 ui::net(&nq);
+            }
+            if gr_t.elapsed() >= Duration::from_millis(950) {
+                let secs = gr_t.elapsed().as_secs_f64();
+                gr_t = t;
+                let sent = sh.sent_bytes.load(Ordering::Relaxed);
+                ui::graph(sent.saturating_sub(gr_bytes) as f64 * 8.0 / 1e6 / secs, sample.rtt_ms, sample.loss);
+                gr_bytes = sent;
             }
         }
         // The sound checkboxes changed in the GUI.

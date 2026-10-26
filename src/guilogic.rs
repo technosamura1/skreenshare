@@ -135,6 +135,163 @@ pub fn friendly_error(raw: &str) -> (&'static str, &'static str) {
     }
 }
 
+// ---------------------------------------------------------------- look: theme, accent, settings (0.9.0)
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Accent {
+    Blue,
+    Purple,
+    Green,
+}
+
+impl Accent {
+    pub const ALL: [Accent; 3] = [Accent::Blue, Accent::Purple, Accent::Green];
+    pub fn key(self) -> &'static str {
+        match self {
+            Accent::Blue => "blue",
+            Accent::Purple => "purple",
+            Accent::Green => "green",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Accent::Blue => "Синий",
+            Accent::Purple => "Фиолетовый",
+            Accent::Green => "Зелёный",
+        }
+    }
+    pub fn parse(s: Option<&str>) -> Accent {
+        match s.map(str::trim) {
+            Some("purple") => Accent::Purple,
+            Some("green") => Accent::Green,
+            _ => Accent::Blue,
+        }
+    }
+}
+
+/// Everything about the look that is kept in gui.ini.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Look {
+    pub light: bool,
+    pub accent: Accent,
+    /// Animations on (off = every change is instant and nothing repaints by itself).
+    pub anim: bool,
+    /// Short sound cues on connect / disconnect / error.
+    pub sounds: bool,
+    /// Windows 11 glass (Mica) backdrop; takes effect at the next start.
+    pub glass: bool,
+}
+
+impl Default for Look {
+    fn default() -> Look {
+        Look { light: false, accent: Accent::Blue, anim: true, sounds: true, glass: false }
+    }
+}
+
+impl Look {
+    /// Reads the keys `theme`, `accent`, `anim`, `sounds`, `glass`; anything unknown means the default.
+    pub fn from_ini(text: &str) -> Look {
+        let get = |t: &str, k: &str| crate::volume::ini_get(t, k).map(str::to_string);
+        let d = Look::default();
+        let flag = |k: &str, def: bool| match get(text, k).as_deref().map(str::trim) {
+            Some("1") => true,
+            Some("0") => false,
+            _ => def,
+        };
+        Look {
+            light: get(text, "theme").as_deref().map(str::trim) == Some("light"),
+            accent: Accent::parse(get(text, "accent").as_deref()),
+            anim: flag("anim", d.anim),
+            sounds: flag("sounds", d.sounds),
+            glass: flag("glass", d.glass),
+        }
+    }
+}
+
+/// 0..1 -> 0..1, fast start and a soft stop (page and card transitions).
+pub fn ease_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t)
+}
+
+/// Progress of a transition that started `elapsed_ms` ago and lasts `dur_ms` (a zero duration is "done").
+pub fn progress(elapsed_ms: u128, dur_ms: u128) -> f32 {
+    if dur_ms == 0 {
+        1.0
+    } else {
+        (elapsed_ms as f32 / dur_ms as f32).clamp(0.0, 1.0)
+    }
+}
+
+// ---------------------------------------------------------------- the 60-second quality graph
+
+/// How many one-second samples the graph keeps.
+pub const GRAPH_LEN: usize = 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct GraphPoint {
+    pub mbps: f32,
+    /// None = unknown (no ping answer yet).
+    pub rtt_ms: Option<f32>,
+    pub loss_pct: f32,
+}
+
+/// Parses the payload of `@GRAPH <Мбит/с>|<пинг мс или ->|<потери %>`.
+pub fn parse_graph(payload: &str) -> Option<GraphPoint> {
+    let mut it = payload.trim().split('|');
+    let mbps: f32 = it.next()?.trim().parse().ok()?;
+    let rtt = it.next()?.trim();
+    let loss: f32 = it.next()?.trim().parse().ok()?;
+    let rtt_ms = if rtt == "-" { None } else { Some(rtt.parse::<f32>().ok()?) };
+    if !mbps.is_finite() || !loss.is_finite() || mbps < 0.0 || loss < 0.0 || rtt_ms.is_some_and(|r| !r.is_finite() || r < 0.0) {
+        return None;
+    }
+    Some(GraphPoint { mbps, rtt_ms, loss_pct: loss.min(100.0) })
+}
+
+/// The last `GRAPH_LEN` samples, oldest first.
+#[derive(Default, Debug)]
+pub struct Graph {
+    pub pts: std::collections::VecDeque<GraphPoint>,
+}
+
+impl Graph {
+    pub fn push(&mut self, p: GraphPoint) {
+        if self.pts.len() >= GRAPH_LEN {
+            self.pts.pop_front();
+        }
+        self.pts.push_back(p);
+    }
+}
+
+/// A round upper bound for a graph axis: at least `floor`, then 1/2/5 x 10^n above the biggest value.
+pub fn nice_max(v: f32, floor: f32) -> f32 {
+    let v = if v.is_finite() { v.max(floor) } else { floor };
+    let mag = 10f32.powf(v.log10().floor());
+    for k in [1.0, 2.0, 5.0, 10.0] {
+        if v <= k * mag * 1.0001 {
+            return k * mag;
+        }
+    }
+    10.0 * mag
+}
+
+// ---------------------------------------------------------------- how the player bar fades
+
+/// Bar opacity 0..1 `idle_ms` after the last mouse move: fully shown for `SHOW_MS`, then fades out over `FADE_MS`.
+pub const BAR_SHOW_MS: u128 = 2600;
+pub const BAR_FADE_MS: u128 = 400;
+
+pub fn bar_opacity(idle_ms: u128) -> f32 {
+    if idle_ms <= BAR_SHOW_MS {
+        1.0
+    } else if idle_ms >= BAR_SHOW_MS + BAR_FADE_MS {
+        0.0
+    } else {
+        1.0 - (idle_ms - BAR_SHOW_MS) as f32 / BAR_FADE_MS as f32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +357,73 @@ mod tests {
             let (t, h) = friendly_error(raw);
             assert!(!t.is_empty() && !h.is_empty());
         }
+    }
+
+    #[test]
+    fn look_defaults_and_parsing() {
+        assert_eq!(Look::from_ini(""), Look::default());
+        let l = Look::from_ini("theme=light\naccent=purple\nanim=0\nsounds=0\nglass=1\n");
+        assert_eq!(l, Look { light: true, accent: Accent::Purple, anim: false, sounds: false, glass: true });
+        let l = Look::from_ini("theme=weird\naccent=pink\nanim=maybe\n");
+        assert_eq!(l, Look::default());
+        for a in Accent::ALL {
+            assert_eq!(Accent::parse(Some(a.key())), a);
+        }
+    }
+
+    #[test]
+    fn easing_is_monotone_and_bounded() {
+        assert_eq!(ease_out(0.0), 0.0);
+        assert_eq!(ease_out(1.0), 1.0);
+        assert_eq!(ease_out(7.0), 1.0);
+        assert_eq!(ease_out(-1.0), 0.0);
+        let mut prev = 0.0;
+        for i in 0..=20 {
+            let v = ease_out(i as f32 / 20.0);
+            assert!(v >= prev);
+            prev = v;
+        }
+        assert_eq!(progress(10, 0), 1.0);
+        assert_eq!(progress(50, 100), 0.5);
+        assert_eq!(progress(500, 100), 1.0);
+    }
+
+    #[test]
+    fn graph_parse_and_ring() {
+        assert_eq!(parse_graph("12.5|34|0.5"), Some(GraphPoint { mbps: 12.5, rtt_ms: Some(34.0), loss_pct: 0.5 }));
+        assert_eq!(parse_graph("3|-|0"), Some(GraphPoint { mbps: 3.0, rtt_ms: None, loss_pct: 0.0 }));
+        assert_eq!(parse_graph("x|1|2"), None);
+        assert_eq!(parse_graph("1|2"), None);
+        assert_eq!(parse_graph("-1|2|3"), None);
+        assert_eq!(parse_graph("NaN|2|3"), None);
+        assert_eq!(parse_graph("1|2|500").unwrap().loss_pct, 100.0);
+        let mut g = Graph::default();
+        for i in 0..100 {
+            g.push(GraphPoint { mbps: i as f32, rtt_ms: None, loss_pct: 0.0 });
+        }
+        assert_eq!(g.pts.len(), GRAPH_LEN);
+        assert_eq!(g.pts.front().unwrap().mbps, 40.0);
+        assert_eq!(g.pts.back().unwrap().mbps, 99.0);
+    }
+
+    #[test]
+    fn nice_axis_values() {
+        assert_eq!(nice_max(0.0, 10.0), 10.0);
+        assert_eq!(nice_max(23.0, 10.0), 50.0);
+        assert_eq!(nice_max(61.0, 10.0), 100.0);
+        assert_eq!(nice_max(7.0, 5.0), 10.0);
+        assert_eq!(nice_max(0.3, 1.0), 1.0);
+        assert_eq!(nice_max(f32::NAN, 5.0), 5.0);
+        assert_eq!(nice_max(100.0, 10.0), 100.0);
+    }
+
+    #[test]
+    fn bar_fades_after_idle() {
+        assert_eq!(bar_opacity(0), 1.0);
+        assert_eq!(bar_opacity(BAR_SHOW_MS), 1.0);
+        let mid = bar_opacity(BAR_SHOW_MS + BAR_FADE_MS / 2);
+        assert!((mid - 0.5).abs() < 0.01);
+        assert_eq!(bar_opacity(BAR_SHOW_MS + BAR_FADE_MS), 0.0);
+        assert_eq!(bar_opacity(60_000), 0.0);
     }
 }

@@ -82,4 +82,8 @@ fn main() {
     std::fs::File::create(out.join("ffmpeg_bundle.bin")).unwrap().write_all(&bundle).unwrap();
     println!("cargo:rustc-env=SS_BUNDLE_ID={id:016x}");
     println!("cargo:rustc-link-lib=delayimp");
+    // The exe icon (Explorer, taskbar, Alt+Tab): Win32 resources made by tools/make-icon.py (lld-link takes .res directly).
+    let res = std::fs::canonicalize("assets/icon.res").expect("нет assets/icon.res: запусти tools/make-icon.py");
+    println!("cargo:rerun-if-changed=assets/icon.res");
+    println!("cargo:rustc-link-arg-bins={}", res.display());
 }
