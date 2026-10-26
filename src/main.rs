@@ -8,6 +8,7 @@ mod bar;
 mod cues;
 mod avsync;
 mod bundle;
+mod driverinst;
 mod capture;
 mod client;
 mod gpuconv;
@@ -231,6 +232,12 @@ fn run(mut a: Args) -> Result<()> {
             let (panel, on) = (a.flag("--panel"), a.flag("--on"));
             a.finish()?;
             client::overlay_preview(&out, panel, on)?;
+        }
+        // Hidden: unpack the bundled ViGEmBus setup and run it the way the GUI button does (UAC, silent switches).
+        "drvinstall" => {
+            a.finish()?;
+            let end = driverinst::install(inputhost::vigem_installed)?;
+            println!("{}", guilogic::driver_end_text(end));
         }
         "opustest" => {
             a.finish()?;

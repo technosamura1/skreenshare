@@ -292,6 +292,55 @@ pub fn bar_opacity(idle_ms: u128) -> f32 {
     }
 }
 
+/// How the ViGEmBus installer run ended, in terms the host page can show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriverEnd {
+    /// The driver answers, no restart needed.
+    Ready,
+    /// Installed (or half-installed): Windows wants a restart before the driver works.
+    NeedReboot,
+    /// The user said "No" to the UAC prompt or closed the installer.
+    Cancelled,
+    /// The installer failed with this exit code.
+    Failed(u32),
+}
+
+/// Exit codes of the (Advanced Installer / MSI) setup: 0 ok, 3010 restart required, 1641 restart started,
+/// 1602 and 1223 the user cancelled.
+pub const EXIT_REBOOT: u32 = 3010;
+pub const EXIT_REBOOT_STARTED: u32 = 1641;
+pub const EXIT_USER_CANCEL: u32 = 1602;
+pub const EXIT_UAC_CANCEL: u32 = 1223;
+
+/// After a silent run that failed for some reason other than a cancel, the installer is started once more with its
+/// normal window, so the user sees what is wrong.
+pub fn retry_with_window(exit: u32) -> bool {
+    !matches!(exit, 0 | EXIT_REBOOT | EXIT_REBOOT_STARTED | EXIT_USER_CANCEL | EXIT_UAC_CANCEL)
+}
+
+/// Final verdict from the installer's exit code and a fresh "does the driver answer" check.
+pub fn classify_driver_install(exit: u32, driver_answers: bool) -> DriverEnd {
+    match exit {
+        EXIT_UAC_CANCEL | EXIT_USER_CANCEL => DriverEnd::Cancelled,
+        EXIT_REBOOT | EXIT_REBOOT_STARTED => DriverEnd::NeedReboot,
+        0 if driver_answers => DriverEnd::Ready,
+        // Setup is happy but the device is not there yet: the usual sign of a pending restart.
+        0 => DriverEnd::NeedReboot,
+        // Some failures still leave a working driver (e.g. it was installed meanwhile).
+        _ if driver_answers => DriverEnd::Ready,
+        c => DriverEnd::Failed(c),
+    }
+}
+
+pub fn driver_end_text(e: DriverEnd) -> String {
+    match e {
+        DriverEnd::Ready => "Драйвер геймпада установлен. Перезагрузка не нужна.".into(),
+        DriverEnd::NeedReboot => "Драйвер установлен, но Windows просит перезагрузку. Перезагрузите компьютер, потом откройте программу снова.".into(),
+        DriverEnd::Cancelled => "Установка отменена: окно Windows с запросом разрешения закрыто или отклонено.".into(),
+        DriverEnd::Failed(c) => format!("Установщик драйвера завершился с ошибкой (код {c}). Попробуйте ещё раз или скачайте драйвер вручную."),
+    }
+}
+
 /// What the host's control thread reports (`@CTRL on=1 pad=1 kbm=1 vigem=1 pads=2 active=0 revoked=0`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct CtrlStatus {
@@ -482,5 +531,30 @@ mod tests {
     fn control_line_matches_what_the_host_reads() {
         assert_eq!(control_line(true, true, false), "CONTROL on=1 pad=1 kbm=0");
         assert_eq!(control_line(false, false, false), "CONTROL on=0 pad=0 kbm=0");
+    }
+
+    #[test]
+    fn driver_install_verdicts() {
+        assert_eq!(classify_driver_install(0, true), DriverEnd::Ready);
+        assert_eq!(classify_driver_install(0, false), DriverEnd::NeedReboot);
+        assert_eq!(classify_driver_install(3010, false), DriverEnd::NeedReboot);
+        assert_eq!(classify_driver_install(3010, true), DriverEnd::NeedReboot);
+        assert_eq!(classify_driver_install(1641, false), DriverEnd::NeedReboot);
+        assert_eq!(classify_driver_install(1223, false), DriverEnd::Cancelled);
+        assert_eq!(classify_driver_install(1602, true), DriverEnd::Cancelled);
+        assert_eq!(classify_driver_install(1603, false), DriverEnd::Failed(1603));
+        assert_eq!(classify_driver_install(1603, true), DriverEnd::Ready);
+    }
+
+    #[test]
+    fn driver_retry_only_on_real_failure() {
+        for ok in [0, 3010, 1641, 1602, 1223] {
+            assert!(!retry_with_window(ok), "{ok}");
+        }
+        for bad in [1, 2, 87, 1603, 1618, 1625] {
+            assert!(retry_with_window(bad), "{bad}");
+        }
+        assert!(driver_end_text(DriverEnd::NeedReboot).contains("перезагруз"));
+        assert!(!driver_end_text(DriverEnd::Failed(5)).contains("друг"));
     }
 }

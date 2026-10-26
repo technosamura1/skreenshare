@@ -943,10 +943,33 @@ struct GuiApp {
     ctl: CtlUi,
     /// Is the ViGEmBus driver installed (checked every few seconds on the host page).
     vigem: (bool, Instant),
+    /// The bundled driver installer: idle, running on a thread, or how the last run ended.
+    drv: DrvUi,
     /// XInput for the gamepad test page (loaded on the first visit; None inside = no XInput on this PC).
     xi: Option<Option<crate::xinput::XInput>>,
     /// Which pad is vibrating for the test button, and until when.
     rumble: Option<(usize, Instant)>,
+}
+
+/// State of "Установить драйвер геймпада".
+enum DrvUi {
+    Idle,
+    Running(Receiver<Result<lg::DriverEnd, String>>),
+    Done(lg::DriverEnd),
+    Error(String),
+}
+
+/// Runs the bundled driver installer on a thread (UAC prompt, silent setup, verdict).
+fn start_driver_install(drv: &mut DrvUi) {
+    if matches!(drv, DrvUi::Running(_)) {
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let r = crate::driverinst::install(crate::inputhost::vigem_installed).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(r);
+    });
+    *drv = DrvUi::Running(rx);
 }
 
 /// The owner's remote-control switches.
@@ -1016,6 +1039,7 @@ impl GuiApp {
             start_error: None,
             ctl: CtlUi { allow: false, pad: true, kbm: true },
             vigem: (vigem_now(), Instant::now()),
+            drv: DrvUi::Idle,
             xi: None,
             rumble: None,
         }
@@ -1214,6 +1238,17 @@ impl eframe::App for GuiApp {
         }
         if self.page == Page::Host && self.vigem.1.elapsed() > Duration::from_secs(3) {
             self.vigem = (vigem_now(), Instant::now());
+        }
+        if let DrvUi::Running(rx) = &self.drv {
+            match rx.try_recv() {
+                Ok(Ok(end)) => {
+                    self.vigem = (vigem_now(), Instant::now());
+                    self.drv = DrvUi::Done(end);
+                }
+                Ok(Err(e)) => self.drv = DrvUi::Error(e),
+                Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint_after(Duration::from_millis(250)),
+                Err(mpsc::TryRecvError::Disconnected) => self.drv = DrvUi::Error("установка прервана".into()),
+            }
         }
         if let Some((slot, t)) = self.rumble {
             if t.elapsed() > Duration::from_millis(450) || self.page != Page::Pads {
@@ -1724,7 +1759,7 @@ fn step(ui: &mut egui::Ui, n: u32, text: &str) {
 }
 
 /// The host's "Удалённое управление" card: consent switches, driver status, who is controlling.
-fn control_card(ui: &mut egui::Ui, ctl: &mut CtlUi, vigem: bool, live: Option<&mut Session>) {
+fn control_card(ui: &mut egui::Ui, ctl: &mut CtlUi, vigem: bool, drv: &DrvUi, live: Option<&mut Session>) -> bool {
     use crate::inputhost::{DRIVER_URL, HOTKEY_TEXT};
     let before = *ctl;
     let mut st = None;
@@ -1790,27 +1825,53 @@ fn control_card(ui: &mut egui::Ui, ctl: &mut CtlUi, vigem: bool, live: Option<&m
                     ui.label(RichText::new("Драйвер геймпада не найден").color(c_yellow()));
                 }
             });
+            let running = matches!(drv, DrvUi::Running(_));
             if !vigem {
                 ui.label(
-                    RichText::new("Без драйвера ViGEmBus геймпад зрителя в игру не попадёт — мышь и клавиатура работают. После установки, если попросит установщик, перезагрузите компьютер.")
+                    RichText::new("Без драйвера ViGEmBus геймпад зрителя в игру не попадёт — мышь и клавиатура работают. Установщик драйвера уже внутри программы, скачивать ничего не нужно: Windows спросит разрешение, установка займёт около минуты.")
                         .color(c_muted())
                         .size(12.5),
                 );
-                if ui.button("Установить драйвер").on_hover_text(DRIVER_URL).clicked() {
-                    install = true;
+                if !running {
+                    ui.horizontal(|ui| {
+                        if ui.button("Установить драйвер геймпада").clicked() {
+                            install = true;
+                        }
+                        if ui.small_button("Страница драйвера").on_hover_text(DRIVER_URL).clicked() {
+                            open_link(DRIVER_URL);
+                        }
+                    });
                 }
+            }
+            match drv {
+                DrvUi::Running(_) => spinner_line(ui, "Устанавливаю драйвер… подтвердите запрос Windows и дождитесь окончания."),
+                DrvUi::Done(e) => {
+                    let text = lg::driver_end_text(*e);
+                    if matches!(e, lg::DriverEnd::Ready) {
+                        ui.label(RichText::new(text).color(c_green()).size(12.5));
+                    } else {
+                        warn_line(ui, &text);
+                    }
+                }
+                DrvUi::Error(e) => warn_line(ui, &format!("Не получилось установить драйвер: {e}")),
+                DrvUi::Idle => {}
+            }
+            if !vigem || !matches!(drv, DrvUi::Idle) {
+                ui.label(
+                    RichText::new("Драйвер: ViGEmBus 1.22.0, © Nefarius Software Solutions e.U., лицензия BSD-3-Clause (текст — в README и рядом с установщиком).")
+                        .color(c_muted())
+                        .size(11.5),
+                );
             }
         }
     });
-    if install {
-        open_link(DRIVER_URL);
-    }
     if *ctl != before || revoked_now {
         if let Some(s) = live {
             s.revoke_event = false;
             s.proc.send(&lg::control_line(ctl.allow, ctl.pad, ctl.kbm));
         }
     }
+    install
 }
 
 /// One controller drawn live: sticks, triggers, buttons.
@@ -2587,7 +2648,9 @@ impl GuiApp {
                 ui.label(RichText::new("Что показывать").font(bold(15.0)));
                 self.pick_source(ui);
             });
-            control_card(ui, &mut self.ctl, self.vigem.0, None);
+            if control_card(ui, &mut self.ctl, self.vigem.0, &self.drv, None) {
+                start_driver_install(&mut self.drv);
+            }
             if let Some(e) = &self.start_error {
                 error_text(ui, e);
             }
@@ -2636,7 +2699,9 @@ impl GuiApp {
                     graph_panel(ui, &s.graph, true);
                 });
             });
-            control_card(ui, &mut self.ctl, self.vigem.0, Some(&mut *s));
+            if control_card(ui, &mut self.ctl, self.vigem.0, &self.drv, Some(&mut *s)) {
+                start_driver_install(&mut self.drv);
+            }
             // Switching without stopping: the same cards as at the start.
             let mut picked = None;
             if !self.monitors.is_empty() {

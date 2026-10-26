@@ -133,6 +133,28 @@ Discord) — **ровно те кадры, что уходят зрителю**:
 - Команды проверки: `screenshare opustest` (кодек Opus работает), `screenshare convbench [--video-w --video-h --window-w --window-h]`
   (сколько мс занимает конвертация на этом компьютере).
 
+## 0.11.1: драйвер геймпада внутри программы
+
+Установщик драйвера **ViGEmBus 1.22.0** теперь встроен в `screenshare.exe` — скачивать ничего не нужно. Размер exe вырос
+примерно на 6,3 МБ (с 12,9 до 19,2 МБ). Больше ничего не менялось (видео, звук, подбор качества, протокол и логика управления прежние).
+
+- Страница «Показать», карточка «Удалённое управление», если включён геймпад и драйвер не найден: кнопка **«Установить драйвер геймпада»**.
+  Программа распаковывает установщик в `%LOCALAPPDATA%\screenshare\vigembus`, запускает его с запросом разрешения Windows (UAC) и без окна
+  (`/exenoui /qn /norestart`), ждёт окончания и сама перепроверяет, отвечает ли драйвер. Если тихая установка завершилась ошибкой —
+  установщик запускается ещё раз с обычным окном. Рядом осталась маленькая кнопка «Страница драйвера» (ссылка на релиз автора).
+- Итог показывается по-русски: «Драйвер геймпада установлен. Перезагрузка не нужна.» / «…Windows просит перезагрузку…» (код 3010 или
+  драйвер ещё не отвечает) / «Установка отменена…» (отказ в запросе Windows) / «…ошибкой (код N)…».
+- Скрытая команда `screenshare drvinstall` делает то же самое из консоли.
+- **Не проверено на настоящей Windows:** сама установка (UAC, тихие ключи, перезагрузка, появление устройства, подпись драйвера на вашей
+  версии Windows). Под wine проверено только то, что установщик распаковывается байт-в-байт (sha256 совпал); логика разбора кодов возврата
+  покрыта юнит-тестами. Как проверить: ПК без ViGEmBus → «Показать» → галочка «Разрешить управление зрителю» → «Установить драйвер геймпада» →
+  согласиться в окне Windows → дождаться сообщения; при просьбе перезагрузить — перезагрузиться и убедиться, что в карточке «Драйвер геймпада установлен»
+  (или `joy.cpl` показывает «Xbox 360 Controller» при подключённом зрителе).
+- Лицензия: ViGEmBus распространяется под BSD-3-Clause, разрешающей распространение в бинарном виде при сохранении текста лицензии —
+  см. «Сторонние лицензии» ниже. Проект ViGEmBus закрыт автором в 2023 году (обновлений не будет), последняя версия 1.22.0 работает.
+  Драйвер ставится в систему (Program Files) и остаётся после удаления screenshare; удалить его можно в «Приложения и возможности»
+  («Nefarius Virtual Gamepad Emulation Bus Driver»).
+
 ## 0.11.0: удалённое управление (как Steam Remote Play / Parsec)
 
 Зритель может играть на компьютере показывающего: свой геймпад (до 4), мышь и клавиатуру. Видео, звук, ratectl и кодировщик
@@ -141,7 +163,7 @@ Discord) — **ровно те кадры, что уходят зрителю**:
 
 **Как это включить (по шагам).**
 1. Показывающий ставит драйвер **ViGEmBus** (нужен только для геймпадов): на странице «Показать» кнопка «Установить драйвер»
-   открывает https://github.com/nefarius/ViGEmBus/releases/latest. Драйвер в программу не встроен (отдельная установка с
+   открывает https://github.com/nefarius/ViGEmBus/releases/latest. В 0.11.0 драйвер не был встроен (с 0.11.1 встроен, см. выше; установка с
    правами администратора, возможно, нужна перезагрузка). Без драйвера мышь и клавиатура работают, а геймпад — нет.
 2. Показывающий на странице «Показать» ставит галочку **«Разрешить управление зрителю»** (по умолчанию выключена,
    с каждым новым показом сбрасывается) и при желании снимает «Геймпад» или «Мышь и клавиатура».
@@ -522,5 +544,45 @@ RUSTFLAGS="-C target-feature=+crt-static" cargo build --release
 tools/check-dlls.sh      # Linux/WSL/git-bash: упадёт, если exe или DLL требуют чего-то, чего нет на чистой Windows
 ```
 
+Установщик драйвера ViGEmBus (`vendor/vigembus/*.exe`, 6,3 МБ) тоже лежит в репозитории и встраивается в exe (`include_bytes!`); `build.rs` сверяет его sha256.
 DLL FFmpeg встраиваются в exe (build.rs, zstd), грузятся отложенно и распаковываются при первом запуске
 (src/bundle.rs) — на выходе один `target\release\screenshare.exe`.
+
+## Сторонние лицензии
+
+- **ViGEmBus 1.22.0** (встроенный установщик драйвера, `vendor/vigembus/`) — © 2016–2020 Nefarius Software Solutions e.U., BSD-3-Clause.
+  Подробности и контрольная сумма: `vendor/vigembus/NOTICE.md`. Полный текст лицензии:
+
+```
+BSD 3-Clause License
+
+Copyright (c) 2016-2020, Nefarius Software Solutions e.U.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+Остальные зависимости (FFmpeg, libopus, Rust-крейты и т. д.) — под своими лицензиями, как и раньше.

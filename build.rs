@@ -30,7 +30,21 @@ fn build_opus() {
     println!("cargo:rerun-if-changed=vendor/opus");
 }
 
+/// The ViGEmBus installer is embedded as-is (src/driverinst.rs): refuse to build with any other file than the official
+/// ViGEmBus 1.22.0 setup from github.com/nefarius/ViGEmBus/releases/tag/v1.22.0.
+const VIGEM_SHA256: &str = "89220a7865076b342892f98865f3499fb7c4cfd673159e89d352c360fd014c6a";
+
+fn check_vigem() {
+    use sha2::{Digest, Sha256};
+    let p = "vendor/vigembus/ViGEmBus_1.22.0_x64_x86_arm64.exe";
+    let data = std::fs::read(p).expect("нет vendor/vigembus/ViGEmBus_1.22.0_x64_x86_arm64.exe");
+    let h: String = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(h, VIGEM_SHA256, "{p}: не тот файл (sha256)");
+    println!("cargo:rerun-if-changed=vendor/vigembus");
+}
+
 fn main() {
+    check_vigem();
     build_opus();
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     println!("cargo:rerun-if-changed=build.rs");
