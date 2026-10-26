@@ -277,9 +277,9 @@ impl Code {
         let body = s.get(1..).context("пустой код")?;
         let b = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(body)
-            .context("код повреждён — скопируй его целиком")?;
+            .context("код повреждён — скопируйте его целиком")?;
         if b.len() < 6 || (b.len() - 6) % 6 != 0 {
-            bail!("код повреждён — скопируй его целиком");
+            bail!("код повреждён — скопируйте его целиком");
         }
         if b[0] != CODE_VERSION {
             bail!("код от другой версии программы — обновитесь оба");

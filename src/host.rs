@@ -191,7 +191,7 @@ fn start_audio(make_sink: &dyn Fn() -> AudioSink, want: AudioPlan, fallback: Aud
         }
         Err(e) if voice.is_some() => {
             ui::audio_status(&format!(
-                "Звук выключен: эта Windows не умеет исключать {} из захвата, а иначе друг слышал бы себя ({e:#})",
+                "Звук выключен: эта Windows не умеет исключать {} из захвата, а иначе зритель слышал бы себя ({e:#})",
                 voice.unwrap().1
             ));
             AudioSource::Off
@@ -385,13 +385,13 @@ pub fn run(o: HostOpts) -> Result<()> {
     ui::report_nat(&nat);
     let token = net::random_token();
     let me = Code::for_socket(net::ROLE_HOST, token, &sock, &nat);
-    ui::show_code(&o.exchange, &me.encode(), "host.code", "Твой код — отправь его другу:")?;
+    ui::show_code(&o.exchange, &me.encode(), "host.code", "Ваш код — передайте его зрителю:")?;
     let peer_code = ui::read_code(
         &o.exchange,
         net::ROLE_CLIENT,
         Some(token),
         "client.code",
-        "Вставь сюда код ответа от друга и нажми Enter:",
+        "Вставьте сюда код ответа от зрителя и нажмите Enter:",
         &sock,
         nat.keepalive_server,
     )?;
@@ -435,7 +435,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             let mut tracker = ReportTracker::default();
             while sh.running.load(Ordering::Relaxed) {
                 if sh.now_ms().saturating_sub(sh.last_seen_ms.load(Ordering::Relaxed)) > 10_000 {
-                    println!("Связь с другом потеряна.");
+                    println!("Соединение потеряно.");
                     sh.running.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -484,7 +484,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                         }
                     }
                     net::PT_BYE => {
-                        println!("Друг отключился.");
+                        println!("Зритель отключился.");
                         sh.running.store(false, Ordering::Relaxed);
                     }
                     _ => {}

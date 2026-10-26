@@ -52,7 +52,7 @@ pub fn pick_batch(last: &[Option<u64>], now: u64, interval: u64, max: usize) -> 
 /// The steps of a connection, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Step {
-    /// Preparing and waiting for the friend's code / the short code's answer.
+    /// Preparing and waiting for the peer's code / the short code's answer.
     Find = 0,
     /// Exchanging addresses and punching through NAT.
     Connect = 1,
@@ -67,7 +67,7 @@ pub const STEPS: [Step; 4] = [Step::Find, Step::Connect, Step::Check, Step::Pict
 impl Step {
     pub fn label(self) -> &'static str {
         match self {
-            Step::Find => "Ищем друга",
+            Step::Find => "Подготовка",
             Step::Connect => "Соединяемся",
             Step::Check => "Проверяем канал",
             Step::Picture => "Идёт картинка",
@@ -76,10 +76,10 @@ impl Step {
 
     pub fn hint(self, host: bool, room: bool) -> &'static str {
         match (self, host, room) {
-            (Step::Find, true, true) => "Ждём, пока друг введёт короткий код",
-            (Step::Find, true, false) => "Отправь другу код и вставь его ответ",
-            (Step::Find, false, true) => "Ищем друга по короткому коду",
-            (Step::Find, false, false) => "Проверяем код друга",
+            (Step::Find, true, true) => "Ждём, пока зритель введёт короткий код",
+            (Step::Find, true, false) => "Передайте код зрителю и вставьте его ответ",
+            (Step::Find, false, true) => "Ищем трансляцию по короткому коду",
+            (Step::Find, false, false) => "Проверяем код трансляции",
             (Step::Connect, ..) => "Пробиваем прямой путь между компьютерами",
             (Step::Check, ..) => "Связь есть, смотрим, как идёт сеть",
             (Step::Picture, ..) => "Всё работает",
@@ -90,12 +90,12 @@ impl Step {
 /// Which step a session is at. Derived from what the child process already reports (its status lines,
 /// `@CODE`, `@CONNECTED`, the first `@STATS`): nothing new is needed on the wire.
 /// `host`: the side that shows the screen. `have_code`: a `@CODE` came (for the host it is its own code, for
-/// the viewer it is the answer code, which it produces only after it has taken the friend's code).
+/// the viewer it is the answer code, which it produces only after it has taken the host's code).
 pub fn conn_step(host: bool, status: &str, have_code: bool, connected: bool, has_stats: bool) -> Step {
     if connected {
         return if has_stats { Step::Picture } else { Step::Check };
     }
-    if status.starts_with("Соединяюсь") || status.starts_with("Жду, пока друг вставит") {
+    if status.starts_with("Соединяюсь") || status.starts_with("Жду, пока код ответа") {
         return Step::Connect;
     }
     if !host && have_code {
@@ -110,28 +110,28 @@ pub fn friendly_error(raw: &str) -> (&'static str, &'static str) {
     let has = |s: &str| r.contains(s);
     if has("не удалось соединиться") {
         (
-            "Не получилось соединиться с другом",
-            "Проверь, что друг не закрыл свою программу, коды свежие (из этого запуска) и файрвол не блокирует screenshare. Потом нажми «Повторить».",
+            "Не получилось соединиться",
+            "Проверьте, что на другой стороне программа не закрыта, коды свежие (из этого запуска) и файрвол не блокирует screenshare. Потом нажмите «Повторить».",
         )
     } else if has("сервер подключения недоступен") || has("нет связи с сервером") || has("не удалось запустить curl") {
         (
             "Нет связи с сервером подключения",
-            "Проверь интернет и нажми «Повторить». Если не поможет — открой «Дополнительно» и используй обычные длинные коды.",
+            "Проверьте интернет и нажмите «Повторить». Если не поможет — откройте «Дополнительно» и используйте обычные длинные коды.",
         )
     } else if has("устарел") {
-        ("Код устарел", "Короткий код живёт 15 минут. Нажми «Повторить» — будет новый.")
+        ("Код устарел", "Короткий код живёт 15 минут. Нажмите «Повторить» — будет новый.")
     } else if has("повреждён") || has("в коде нет адресов") {
-        ("Код не подошёл", "Скопируй его целиком, без пробелов и лишних символов, и попробуй снова.")
+        ("Код не подошёл", "Скопируйте его целиком, без пробелов и лишних символов, и попробуйте снова.")
     } else if has("другой версии") {
-        ("У вас разные версии программы", "Скачай свежую версию и у себя, и у друга.")
+        ("У вас разные версии программы", "Установите свежую версию на обоих компьютерах.")
     } else if has("ffmpeg") {
-        ("Не удалось подготовить видеокомпоненты", "Закрой программу и запусти снова. Если повторится — проверь, что диск не заполнен.")
+        ("Не удалось подготовить видеокомпоненты", "Закройте программу и запустите снова. Если повторится — проверьте, что диск не заполнен.")
     } else if has("захват") || has("монитор") || has("duplicat") {
-        ("Не получилось захватить экран", "Выбери другой монитор или окно. Игры в «настоящем» полноэкранном режиме иногда не захватываются.")
+        ("Не получилось захватить экран", "Выберите другой монитор или окно. Игры в «настоящем» полноэкранном режиме иногда не захватываются.")
     } else if has("остановлено") || has("интерфейс закрыт") || has("ввод закрыт") {
-        ("Подключение остановлено", "Нажми «Повторить», когда будешь готов.")
+        ("Подключение остановлено", "Нажмите «Повторить», когда будете готовы.")
     } else {
-        ("Что-то пошло не так", "Нажми «Повторить». Если повторится — открой «Подробности» и пришли текст ошибки разработчику.")
+        ("Что-то пошло не так", "Нажмите «Повторить». Если повторится — откройте «Подробности» и пришлите текст ошибки разработчику.")
     }
 }
 
@@ -328,14 +328,14 @@ mod tests {
     fn steps_follow_the_real_status_lines() {
         // host
         assert_eq!(conn_step(true, "Запускаю...", false, false, false), Step::Find);
-        assert_eq!(conn_step(true, "Короткий код опубликован — жду друга...", true, false, false), Step::Find);
+        assert_eq!(conn_step(true, "Короткий код опубликован — жду зрителя...", true, false, false), Step::Find);
         assert_eq!(conn_step(true, "Соединяюсь...", true, false, false), Step::Connect);
         assert_eq!(conn_step(true, "Подключено! Идёт трансляция.", true, true, false), Step::Check);
         assert_eq!(conn_step(true, "Подключено! Идёт трансляция.", true, true, true), Step::Picture);
         // viewer
         assert_eq!(conn_step(false, "Определяю адрес в интернете...", false, false, false), Step::Find);
-        assert_eq!(conn_step(false, "Ищу друга по короткому коду...", false, false, false), Step::Find);
-        assert_eq!(conn_step(false, "Жду, пока друг вставит код ответа...", true, false, false), Step::Connect);
+        assert_eq!(conn_step(false, "Ищу трансляцию по короткому коду...", false, false, false), Step::Find);
+        assert_eq!(conn_step(false, "Жду, пока код ответа введут на стороне показа...", true, false, false), Step::Connect);
         assert_eq!(conn_step(false, "Подключено! Открываю окно просмотра.", true, true, false), Step::Check);
         assert!(Step::Find < Step::Connect && Step::Check < Step::Picture);
         assert_eq!(STEPS.len(), 4);
@@ -347,9 +347,9 @@ mod tests {
     #[test]
     fn real_errors_get_clear_texts() {
         let (t, _) = friendly_error("не удалось соединиться за 30 с. Проверьте, что коды свежие");
-        assert_eq!(t, "Не получилось соединиться с другом");
+        assert_eq!(t, "Не получилось соединиться");
         assert_eq!(friendly_error("сервер подключения недоступен: curl: (6)").0, "Нет связи с сервером подключения");
-        assert_eq!(friendly_error("короткий код устарел (15 минут) — создай новый").0, "Код устарел");
+        assert_eq!(friendly_error("короткий код устарел (15 минут) — создайте новый").0, "Код устарел");
         assert_eq!(friendly_error("код от другой версии программы — обновитесь оба").0, "У вас разные версии программы");
         assert_eq!(friendly_error("не удалось подготовить FFmpeg: x").0, "Не удалось подготовить видеокомпоненты");
         assert_eq!(friendly_error("что-то совсем новое").0, "Что-то пошло не так");

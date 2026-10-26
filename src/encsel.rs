@@ -159,7 +159,7 @@ pub fn explain_nvenc(err: &str, log: &str, min_driver_built: &str) -> String {
         );
     }
     if nv.no_cuda {
-        return format!("Драйвер NVIDIA не отвечает (CUDA недоступна) или видеокарты NVIDIA нет.{gpu} Установи драйвер {min} или новее.");
+        return format!("Драйвер NVIDIA не отвечает (CUDA недоступна) или видеокарты NVIDIA нет.{gpu} Установите драйвер {min} или новее.");
     }
     format!("NVENC не запустился: {err}.{gpu} Чаще всего помогает обновление драйвера NVIDIA (минимум {min}).")
 }

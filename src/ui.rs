@@ -250,7 +250,7 @@ pub fn show_code(ex: &Exchange, code: &str, file: &str, title: &str) -> Result<(
             println!("    {code}");
             println!();
             if copied {
-                println!("(уже скопирован в буфер обмена — просто вставь его в Telegram/Discord)");
+                println!("(уже скопирован в буфер обмена — просто вставьте его в Telegram/Discord)");
             }
         }
         Exchange::Ipc => println!("@CODE {code}"),
@@ -275,8 +275,8 @@ pub fn show_code(ex: &Exchange, code: &str, file: &str, title: &str) -> Result<(
                 }
             }
             match last {
-                None => println!("Короткий код опубликован — жду друга..."),
-                Some(e) => println!("Простое подключение не сработало ({e:#}). Используй обычные длинные коды."),
+                None => println!("Короткий код опубликован — жду зрителя..."),
+                Some(e) => println!("Простое подключение не сработало ({e:#}). Используйте обычные длинные коды."),
             }
         }
         Exchange::Dir(d) => {
@@ -304,13 +304,13 @@ pub fn read_code(
         let c = Code::decode(s)?;
         if c.role != want_role {
             if want_role == net::ROLE_CLIENT {
-                bail!("это твой собственный код — нужен код ОТВЕТА от друга (начинается с C)");
+                bail!("это ваш собственный код — нужен код ОТВЕТА от зрителя (начинается с C)");
             }
             bail!("это код ответа (начинается с C) — нужен код того, кто показывает экран (начинается с H)");
         }
         if let Some(t) = want_token {
             if c.token != t {
-                bail!("этот код ответа сделан для другого запуска — пусть друг вставит твой новый код и пришлёт ответ заново");
+                bail!("этот код ответа сделан для другого запуска — пусть зритель вставит ваш новый код и пришлёт ответ заново");
             }
         }
         if c.cands.is_empty() {
@@ -366,7 +366,7 @@ pub fn read_code(
             let mut next_poll = std::time::Instant::now();
             loop {
                 if started.elapsed() > Duration::from_secs(crate::easy::ROOM_LIFETIME_SECS) {
-                    bail!("короткий код устарел (15 минут) — создай новый");
+                    bail!("короткий код устарел (15 минут) — создайте новый");
                 }
                 if std::time::Instant::now() >= next_poll {
                     match crate::ntfy::poll(&room.topic) {
@@ -448,6 +448,6 @@ pub fn report_nat(nat: &net::NatInfo) {
         ),
     }
     if nat.symmetric {
-        println!("Внимание: у тебя «симметричный» NAT (часто у мобильного интернета) — прямое соединение может не получиться.");
+        println!("Внимание: у вас «симметричный» NAT (часто у мобильного интернета) — прямое соединение может не получиться.");
     }
 }

@@ -922,7 +922,7 @@ impl GuiApp {
             Ok(mut s) => {
                 if room.is_some() {
                     s.room = room;
-                    s.status = "Ищу друга по короткому коду...".into();
+                    s.status = "Ищу трансляцию по короткому коду...".into();
                 } else {
                     s.proc.send(&code);
                 }
@@ -1419,7 +1419,7 @@ fn code_box(ui: &mut egui::Ui, code: &str, copied_at: &mut Option<Instant>) {
 /// The old two-code flow on the host page: my code, then the friend's answer.
 fn classic_host_codes(ui: &mut egui::Ui, s: &mut Session, input: &mut String, copied_at: &mut Option<Instant>) {
     section(ui, |ui| {
-        step(ui, 1, "Отправь другу этот код");
+        step(ui, 1, "Передайте зрителю этот код");
         match &s.code {
             Some(c) => code_box(ui, c, copied_at),
             None => spinner_line(ui, &s.status),
@@ -1427,7 +1427,7 @@ fn classic_host_codes(ui: &mut egui::Ui, s: &mut Session, input: &mut String, co
     });
     if s.code.is_some() {
         section(ui, |ui| {
-            step(ui, 2, "Вставь код ответа от друга");
+            step(ui, 2, "Вставьте код ответа от зрителя");
             code_input(ui, input, "C...");
             if let Some(e) = &s.bad_code {
                 error_text(ui, e);
@@ -1529,7 +1529,7 @@ fn connect_card(ui: &mut egui::Ui, s: &Session) {
         }
         if !s.connected && s.started.elapsed() > Duration::from_secs(45) {
             ui.label(
-                RichText::new("Идёт долго. Друг должен держать свою программу открытой; файрвол может мешать.")
+                RichText::new("Идёт долго. Программа на другой стороне должна оставаться открытой; файрвол может мешать.")
                     .color(c_yellow())
                     .size(13.0),
             );
@@ -1718,7 +1718,7 @@ impl GuiApp {
         }
         if matches!(self.choice, Choice::Window(_)) {
             ui.label(
-                RichText::new("Друг увидит только это окно. Если окно закроется — покажу весь экран.").color(c_muted()).size(13.0),
+                RichText::new("Зрители увидят только это окно. Если окно закроется — будет показан весь экран.").color(c_muted()).size(13.0),
             );
         }
     }
@@ -1750,7 +1750,7 @@ impl GuiApp {
                 if matches!(self.choice, Choice::Window(_)) {
                     ui.checkbox(&mut self.audio_prefs.window_only, "Звук только из этого окна");
                 }
-                ui.checkbox(&mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе друг услышит сам себя эхом");
+                ui.checkbox(&mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе зритель услышит себя с эхом");
             }
         }
         if with_easy {
@@ -1774,17 +1774,17 @@ impl GuiApp {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.label(RichText::new("screenshare").font(bold(32.0)));
-                ui.label(RichText::new("Экран другу — напрямую, без серверов").color(c_muted()).size(15.0));
+                ui.label(RichText::new("Показ экрана напрямую, без серверов").color(c_muted()).size(15.0));
             });
         });
         ui.add_space(26.0);
-        if tile_button(ui, Ico::Monitor, "Показать экран", "Друг увидит экран и услышит звук", c_accent()) {
+        if tile_button(ui, Ico::Monitor, "Показать экран", "Зритель увидит экран и услышит звук", c_accent()) {
             self.windows = wincap::list_windows();
             self.thumbs.last_list = Instant::now();
             self.page = Page::Host;
         }
         ui.add_space(4.0);
-        if tile_button(ui, Ico::Eye, "Смотреть", "Понадобится код друга", c_tile2()) {
+        if tile_button(ui, Ico::Eye, "Смотреть", "Понадобится код трансляции", c_tile2()) {
             self.page = Page::Join;
         }
         ui.add_space(18.0);
@@ -1794,7 +1794,7 @@ impl GuiApp {
                 self.thumbs.last_list = Instant::now();
                 self.page = Page::Test;
             }
-            ui.label(RichText::new("Увидишь то же самое, что увидит друг. Качество, звук и порт настраиваются на странице показа.").color(c_muted()).size(13.0));
+            ui.label(RichText::new("Вы увидите то же, что увидит зритель. Качество, звук и порт настраиваются на странице показа.").color(c_muted()).size(13.0));
             ui.add_space(8.0);
             self.look_settings(ui);
             ui.add_space(6.0);
@@ -1826,7 +1826,7 @@ impl GuiApp {
         });
         ui.checkbox(&mut look.anim, "Плавные анимации");
         ui.checkbox(&mut look.sounds, "Звуковые сигналы: подключение, отключение, ошибка").on_hover_text(
-            "Тихие короткие звуки. Пока идёт показ экрана, они молчат (звук компьютера уходит другу) — отключение и ошибки звучат уже после остановки.",
+            "Тихие короткие звуки. Пока идёт показ экрана, они молчат (звук компьютера уходит в трансляцию) — отключение и ошибки звучат уже после остановки.",
         );
         let r = ui.add_enabled(self.glass_ok, egui::Checkbox::new(
                 &mut look.glass,
@@ -1854,9 +1854,9 @@ impl GuiApp {
         });
         ui.add_space(14.0);
         let tips = [
-            (Ico::Monitor, "Покажи экран", "Нажми «Показать экран», выбери окно или весь экран и отправь другу код."),
-            (Ico::Eye, "Смотри у друга", "Другу нужно нажать «Смотреть» и вставить твой код. Видео и звук идут напрямую, без серверов."),
-            (Ico::Wifi, "Следи за лампочкой", "Зелёная — всё хорошо, жёлтая — сеть слабая, красная — картинка будет терять качество. В окне просмотра: F11 — полный экран, колесо мыши — громкость."),
+            (Ico::Monitor, "Покажите экран", "Нажмите «Показать экран», выберите окно или весь экран и передайте зрителю код."),
+            (Ico::Eye, "Смотрите трансляцию", "Зрителю нужно нажать «Смотреть» и вставить ваш код. Видео и звук идут напрямую, без серверов."),
+            (Ico::Wifi, "Следите за лампочкой", "Зелёная — всё хорошо, жёлтая — сеть слабая, красная — картинка будет терять качество. В окне просмотра: F11 — полный экран, колесо мыши — громкость."),
         ];
         for (ico, head, text) in tips {
             section(ui, |ui| {
@@ -1889,7 +1889,7 @@ impl GuiApp {
         title(
             ui,
             "Показать экран",
-            if live { "Друг видит твой экран" } else { "Выбери, что показать другу, и нажми «Начать»" },
+            if live { "Ваш экран транслируется" } else { "Выберите, что показать, и нажмите «Начать»" },
         );
 
         let Some(s) = &mut self.host else {
@@ -1982,7 +1982,7 @@ impl GuiApp {
                     if matches!(self.choice, Choice::Window(_)) {
                         ui.checkbox(&mut self.audio_prefs.window_only, "Звук только из этого окна");
                     }
-                    ui.checkbox(&mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе друг услышит сам себя эхом");
+                    ui.checkbox(&mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе зритель услышит себя с эхом");
                 });
                 if self.audio_prefs != before {
                     s.proc.send(&self.audio_prefs.line());
@@ -2036,10 +2036,10 @@ impl GuiApp {
 
         if let Some(room) = s.room.clone() {
             section(ui, |ui| {
-                step(ui, 1, "Назови другу этот код");
+                step(ui, 1, "Передайте зрителю этот код");
                 code_box_big(ui, &room, &mut self.copied_at);
                 ui.label(
-                    RichText::new("Друг вводит его в «Смотреть» — больше ничего пересылать не нужно. Код живёт 15 минут.")
+                    RichText::new("Зритель вводит его в «Смотреть» — больше ничего пересылать не нужно. Код живёт 15 минут.")
                         .color(c_muted())
                         .size(13.0),
                 );
@@ -2066,7 +2066,7 @@ impl GuiApp {
             return;
         }
         let live = self.join.as_ref().is_some_and(|s| s.connected && s.active());
-        title(ui, "Смотреть", if live { "Ты смотришь экран друга" } else { "Попроси друга нажать «Показать экран» и прислать код" });
+        title(ui, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Нужен код от показывающего: он нажимает «Показать экран» и присылает код" });
 
         if let Some(s) = &mut self.join {
             if s.connected && !s.ended {
@@ -2123,7 +2123,7 @@ impl GuiApp {
             section(ui, |ui| {
                 step(ui, 1, &format!("Код {}", s.room.as_deref().unwrap_or("")));
                 ui.label(
-                    RichText::new("Друг должен держать окно «Показать экран» открытым. Если не выходит дольше минуты — отмени и используй обычный длинный код.")
+                    RichText::new("Окно «Показать экран» на другой стороне должно оставаться открытым. Если не выходит дольше минуты — отмените и используйте обычный длинный код.")
                         .color(c_muted())
                         .size(13.0),
                 );
@@ -2137,7 +2137,7 @@ impl GuiApp {
         let have_reply = self.join.as_ref().is_some_and(|s| s.code.is_some());
         if !have_reply {
             section(ui, |ui| {
-                step(ui, 1, "Введи код друга");
+                step(ui, 1, "Введите код трансляции");
                 code_input(ui, &mut self.input, "короткий код (K7QM-X2PD, beta) или длинный H...");
                 if let Some(e) = self.join.as_ref().and_then(|s| s.bad_code.as_ref()) {
                     error_text(ui, e);
@@ -2166,7 +2166,7 @@ impl GuiApp {
         } else {
             let s = self.join.as_mut().unwrap();
             section(ui, |ui| {
-                step(ui, 2, "Отправь другу код ответа");
+                step(ui, 2, "Передайте показывающему код ответа");
                 code_box(ui, s.code.as_ref().unwrap(), &mut self.copied_at);
             });
         }
@@ -2186,7 +2186,7 @@ impl GuiApp {
             self.go_home();
             return;
         }
-        title(ui, "Проверить на этом ПК", "Трансляция и просмотр на одном компьютере — как увидит друг");
+        title(ui, "Проверить на этом ПК", "Показ и просмотр на одном ПК — как увидит зритель");
 
         if let Some((h, _, _, _)) = &mut self.test {
             drive_preview(ui.ctx(), self.show_preview, h); // the streaming side makes the pictures

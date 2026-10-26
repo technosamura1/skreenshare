@@ -46,7 +46,7 @@ use std::path::PathBuf;
 use ui::Exchange;
 
 const HELP: &str = "\
-screenshare — показ экрана другу напрямую, без серверов.
+screenshare — показ экрана напрямую, без серверов.
 
 Без параметров — окно программы. Параметры (для продвинутых):
   screenshare host   [--monitor N] [--window HWND] [--bitrate МБИТ] [--fps N] [--preset p1..p7]

@@ -233,13 +233,13 @@ pub fn run(o: ClientOpts) -> Result<()> {
         net::ROLE_HOST,
         None,
         "host.code",
-        "Вставь сюда код друга (начинается с H) и нажми Enter:",
+        "Вставьте сюда код трансляции (начинается с H) и нажмите Enter:",
         &sock,
         nat.keepalive_server,
     )?;
     let me = Code::for_socket(net::ROLE_CLIENT, host.token, &sock, &nat);
-    ui::show_code(&o.exchange, &me.encode(), "client.code", "Твой код ответа — отправь его другу:")?;
-    println!("Жду, пока друг вставит код ответа...");
+    ui::show_code(&o.exchange, &me.encode(), "client.code", "Ваш код ответа — передайте его тому, кто показывает экран:")?;
+    println!("Жду, пока код ответа введут на стороне показа...");
     let peer = net::punch(&sock, net::ROLE_CLIENT, host.token, &host.cands, Duration::from_secs(300))?;
     println!("Подключено! Открываю окно просмотра.");
     ui::connected();
@@ -375,7 +375,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                                 }
                                 net::PT_PUNCH => net::answer_punch(&sock, token, net::ROLE_CLIENT, body, from),
                                 net::PT_BYE => {
-                                    println!("Друг остановил трансляцию.");
+                                    println!("Показ остановлен на другой стороне.");
                                     sh.running.store(false, Ordering::Relaxed);
                                 }
                                 _ => {}
