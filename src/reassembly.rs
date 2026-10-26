@@ -1,7 +1,7 @@
 // Video reassembly on the viewer side: fragments -> frames in order, with NACK-based recovery.
 // Pure logic with an injected clock (no sockets, no Windows APIs), so tools/lossim can run it in a simulator.
 use crate::net::MAX_PAYLOAD;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// A hole is only requested after it has stayed open this long: packets that merely arrive out of order
@@ -67,11 +67,16 @@ pub struct Stats {
 /// since later frames reference the lost one.
 pub struct Reassembler {
     partial: BTreeMap<u32, Partial>,
-    done: BTreeMap<u32, (Vec<u8>, bool)>,
+    /// Finished frames waiting for their turn: data, keyframe, when their first fragment arrived.
+    done: BTreeMap<u32, (Vec<u8>, bool, Instant)>,
     next: Option<u32>,
     newest: Option<u32>,
     pub waiting_key: bool,
     pub stats: Stats,
+    /// When the first fragment of each frame handed out arrived, in the same order as the frames
+    /// (see `take_first_seen`). That is the frame's real arrival time: a frame completed late by a
+    /// retransmission still arrived on time as far as playback timing is concerned.
+    first_seen: VecDeque<Instant>,
 }
 
 impl Default for Reassembler {
@@ -89,7 +94,14 @@ impl Reassembler {
             newest: None,
             waiting_key: true,
             stats: Stats::default(),
+            first_seen: VecDeque::new(),
         }
+    }
+
+    /// Arrival time (first fragment) of the oldest frame handed out and not yet asked about.
+    /// Callers that want timing call this once per frame they got from `on_fragment`/`check_timeout`.
+    pub fn take_first_seen(&mut self) -> Option<Instant> {
+        self.first_seen.pop_front()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -132,7 +144,7 @@ impl Reassembler {
             for f in p.frags {
                 buf.extend_from_slice(&f.unwrap());
             }
-            self.done.insert(fid, (buf, p.key));
+            self.done.insert(fid, (buf, p.key, p.first));
         }
         // Bound memory if the stream is badly broken.
         while self.partial.len() > 120 {
@@ -250,7 +262,7 @@ impl Reassembler {
     fn drain(&mut self, out: &mut Vec<(Vec<u8>, bool)>) {
         loop {
             if self.waiting_key {
-                let Some(k) = self.done.iter().find(|(_, (_, key))| *key).map(|(f, _)| *f) else {
+                let Some(k) = self.done.iter().find(|(_, (_, key, _))| *key).map(|(f, _)| *f) else {
                     // Keep only what could follow a keyframe that is still arriving.
                     match self.partial.iter().find(|(_, p)| p.key).map(|(f, _)| *f) {
                         Some(kp) => self.done.retain(|&f, _| f > kp),
@@ -264,8 +276,13 @@ impl Reassembler {
                 self.waiting_key = false;
             }
             let n = self.next.unwrap();
-            if let Some(f) = self.done.remove(&n) {
-                out.push(f);
+            if let Some((data, key, first)) = self.done.remove(&n) {
+                out.push((data, key));
+                self.first_seen.push_back(first);
+                // Users that never ask (the loss simulator) must not grow this forever.
+                if self.first_seen.len() > 256 {
+                    self.first_seen.pop_front();
+                }
                 self.next = Some(n + 1);
                 self.partial = self.partial.split_off(&(n + 1));
                 continue;
@@ -347,6 +364,21 @@ mod tests {
     }
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    #[test]
+    fn frame_finished_by_a_retransmit_keeps_its_first_arrival_time() {
+        let t0 = Instant::now();
+        let mut r = Reassembler::new();
+        let mut out = Vec::new();
+        feed(&mut r, t0, 0, true, 1, &mut out);
+        assert_eq!(r.take_first_seen(), Some(t0));
+        // Frame 1: fragment 0 on time, fragment 1 lost and resent 40 ms later.
+        r.on_fragment(t0 + ms(16), 1, 0, 2, false, &[1], &mut out);
+        r.on_fragment(t0 + ms(56), 1, 1, 2, false, &[1], &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(r.take_first_seen(), Some(t0 + ms(16)), "timed by the first fragment, not the repair");
+        assert_eq!(r.take_first_seen(), None);
     }
 
     #[test]

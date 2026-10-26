@@ -2,6 +2,7 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod audiolab;
 mod audiopkt;
 mod audiosel;
 mod bar;
@@ -253,6 +254,34 @@ fn run(mut a: Args) -> Result<()> {
             let secs = a.num::<u64>("--seconds", 20)?;
             a.finish()?;
             avsync::run_beacon(secs)?;
+        }
+        "audiolab" => {
+            // Test tooling: tone / record --pid / analyze FILE.wav (see audiolab.rs).
+            let mode = if a.0.is_empty() { String::new() } else { a.0.remove(0) };
+            let freq = a.num::<f64>("--freq", 440.0)?;
+            match mode.as_str() {
+                "tone" => {
+                    let secs = a.num::<u64>("--seconds", 30)?;
+                    let amp = a.num::<f32>("--amp", 0.05)?;
+                    a.finish()?;
+                    audiolab::tone(secs, freq, amp)?;
+                }
+                "record" => {
+                    let pid = a.num::<u32>("--pid", 0)?;
+                    let secs = a.num::<u64>("--seconds", 20)?;
+                    let out = PathBuf::from(a.value("--out")?.unwrap_or_else(|| "audiolab.wav".into()));
+                    a.finish()?;
+                    audiolab::record(pid, secs, &out)?;
+                }
+                "analyze" => {
+                    let skip = a.num::<f64>("--skip", 2.0)?;
+                    let file = if a.0.is_empty() { bail!("нужен файл .wav") } else { a.0.remove(0) };
+                    a.finish()?;
+                    let r = audiolab::analyze(std::path::Path::new(&file), freq, skip)?;
+                    audiolab::print_report(&file, &r);
+                }
+                _ => bail!("audiolab tone | record --pid N | analyze ФАЙЛ.wav"),
+            }
         }
         "audiotest" => {
             a.finish()?;

@@ -79,6 +79,29 @@ fn receive_legacy_audio(body: &[u8], q: &crate::audio::AudioQueue, next: &mut Op
     *next = Some(seq + 1);
 }
 
+/// The loss report as its own datagram. (0.7.7–0.11.4 appended these numbers to the ping without a header:
+/// the host saw only a ping, and bitrate control never learned about any loss.)
+fn report_datagram(out: &mut Vec<u8>, token: u32, st: &Stats, rtt_us: u64) {
+    net::write_header(out, net::PT_REPORT, token);
+    ratectl::encode_report_rtt(st, rtt_us, out);
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    #[test]
+    fn loss_report_reaches_the_hosts_tracker() {
+        let st = Stats { received: 970, missed: 30, recovered: 28, residual: 2, gave_up: 0, requested: 0 };
+        let mut out = vec![0xEE; 7]; // leftovers from a previous packet must not leak in
+        report_datagram(&mut out, 0xABCD, &st, 16_000);
+        let (ty, body) = net::parse_header(&out, 0xABCD).expect("our packet");
+        assert_eq!(ty, net::PT_REPORT);
+        let d = ratectl::ReportTracker::default().on_report(body).expect("a report");
+        assert_eq!((d.received, d.missed, d.residual, d.rtt_us), (970, 30, 2, 16_000));
+    }
+}
+
 fn send_ping(sock: &UdpSocket, peer: SocketAddr, token: u32, sh: &Shared, out: &mut Vec<u8>) {
     net::write_header(out, net::PT_PING, token);
     out.extend_from_slice(&(sh.start.elapsed().as_micros() as u64).to_le_bytes());
@@ -172,6 +195,8 @@ struct Diag {
     present: Acc,
     queue: Acc,
     jitter: JitterMeter,
+    /// The same, but measured where it matters: when a new picture actually reaches the screen.
+    shown: JitterMeter,
 }
 
 const DEC_NAMES: [&str; 4] = [
@@ -426,10 +451,13 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     re.force_resync();
                 }
                 for (data, key) in ready.drain(..) {
+                    // Timed from its first packet: a frame finished late by a retransmission keeps its place in
+                    // the playback timeline (the lip-sync hold covers the repair) instead of showing up late.
+                    let arrived = re.take_first_seen().unwrap_or_else(Instant::now);
                     sh.frames_complete.fetch_add(1, Ordering::Relaxed);
                     sh.diag.lock().unwrap().jitter.feed(sh.start.elapsed().as_micros() as u64);
                     sh.qdepth.fetch_add(1, Ordering::Relaxed);
-                    if frame_tx.try_send((data, key, Instant::now())).is_err() {
+                    if frame_tx.try_send((data, key, arrived)).is_err() {
                         // Decoder fell far behind: skip ahead to a fresh keyframe.
                         sh.qdepth.fetch_sub(1, Ordering::Relaxed);
                         sh.dropped_full.fetch_add(1, Ordering::Relaxed);
@@ -503,7 +531,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         gave_up: sh.rx_gave_up.load(Ordering::Relaxed),
                         requested: 0,
                     };
-                    ratectl::encode_report_rtt(&st, sh.rtt_us.load(Ordering::Relaxed), &mut out);
+                    report_datagram(&mut out, token, &st, sh.rtt_us.load(Ordering::Relaxed));
                     let _ = sock.send_to(&out, peer);
                 }
                 if tick % 10 == 0 {
@@ -577,10 +605,11 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     let (pres_ms, pres_max, _) = d.present.take();
                     let (q_avg, q_max, _) = d.queue.take();
                     let (jit, gap, stalls) = d.jitter.take();
+                    let (sjit, sgap, _) = d.shown.take();
                     drop(d);
                     let mode = sh.dec_mode.load(Ordering::Relaxed) as usize;
                     let diag = format!(
-                        "Декодер: {} · цвет+масштаб на: {} · картинка {} → {} · декод {:.1}/{:.0} мс · цвет+масштаб {:.1}/{:.0} мс · показ {:.1}/{:.0} мс · очередь {:.1}/{:.0} кадр. · пропущено: догоняя {}, переполнение {}, конвертер занят {} · разброс кадров {:.1} мс, макс. пауза {:.0} мс, пауз >0,1 с: {}",
+                        "Декодер: {} · цвет+масштаб на: {} · картинка {} → {} · декод {:.1}/{:.0} мс · цвет+масштаб {:.1}/{:.0} мс · показ {:.1}/{:.0} мс · очередь {:.1}/{:.0} кадр. · пропущено: догоняя {}, переполнение {}, конвертер занят {} · разброс кадров {:.1} мс, макс. пауза {:.0} мс, пауз >0,1 с: {} · на экране: разброс {:.1} мс, макс. пауза {:.0} мс",
                         DEC_NAMES[mode.min(3)],
                         ConvPath::from_code(sh.conv_mode.load(Ordering::Relaxed)).name(),
                         size_str(sh.video_size.load(Ordering::Relaxed)),
@@ -590,6 +619,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         sh.dropped_full.load(Ordering::Relaxed),
                         sh.dropped_busy.load(Ordering::Relaxed),
                         jit, gap, stalls,
+                        sjit, sgap,
                     );
                     ui::diag(&diag);
                     log_line(&format!("[{}] {:.0} к/с · {}", sh.now_ms() / 1000, fps, diag));
@@ -858,6 +888,10 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         p.w = dw;
                         p.h = dh;
                         std::mem::swap(&mut p.px, &mut px);
+                        // Same counter as the converter threads' jobs, so the window can tell new pictures
+                        // from redraws on this path too.
+                        seq += 1;
+                        p.seq = seq;
                     }
                     let _ = proxy.send_event(UserEv::Frame);
                     let n = sh.frames_decoded.fetch_add(1, Ordering::Relaxed) + 1;
@@ -940,6 +974,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         hover: Hit::Outside,
         bar_drawn: true,
         cursor_shown: true,
+        shown_seq: 0,
         started: Instant::now(),
         control,
         input: input.clone(),
@@ -984,6 +1019,8 @@ struct App {
     /// The last picture had the bar on it (so one more redraw is needed to wipe it off when it has faded out).
     bar_drawn: bool,
     cursor_shown: bool,
+    /// `Picture::seq` last put on screen (tells a new frame from a redraw of the bar).
+    shown_seq: u64,
     started: Instant,
     /// Remote control is enabled (no `--no-control`).
     control: bool,
@@ -1452,6 +1489,8 @@ impl App {
         let (ww, wh) = (size.width as usize, size.height as usize);
         let mut p = self.sh.picture.lock().unwrap();
         let flash = std::mem::take(&mut p.flash);
+        let new_picture = p.seq != self.shown_seq;
+        self.shown_seq = p.seq;
         let (pw, ph) = (p.w as usize, p.h as usize);
         if pw == 0 || p.px.len() < pw * ph {
             buf.fill(0);
@@ -1533,6 +1572,9 @@ impl App {
         let hide = opacity <= 0.0 && w.fullscreen().is_some();
         let want_cursor = !hide;
         let _ = buf.present();
+        if new_picture {
+            self.sh.diag.lock().unwrap().shown.feed(self.sh.start.elapsed().as_micros() as u64);
+        }
         if self.cursor_shown != want_cursor {
             self.cursor_shown = want_cursor;
             w.set_cursor_visible(want_cursor);
