@@ -17,6 +17,20 @@ use std::collections::VecDeque;
 pub const MIN_TARGET: f64 = 0.080;
 pub const START_TARGET: f64 = 0.090;
 pub const MAX_TARGET: f64 = 0.120;
+
+/// How much sound to keep buffered (seconds): the trade between latency and gaps on a jittery network.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Profile {
+    pub min: f64,
+    pub start: f64,
+    pub max: f64,
+}
+
+/// «Кино»: the picture waits for the sound (lip sync), so a deep cushion costs nothing but delay.
+pub const MOVIE: Profile = Profile { min: MIN_TARGET, start: START_TARGET, max: MAX_TARGET };
+/// «Игра»: the picture is shown at once; the sound keeps just enough to ride out network jitter.
+pub const GAME: Profile = Profile { min: 0.020, start: 0.025, max: 0.080 };
+
 const TARGET_UP: f64 = 0.020;
 const TARGET_DOWN: f64 = 0.005;
 /// This long without an underrun lets the target shrink one step.
@@ -96,6 +110,8 @@ pub struct Playout {
     kernel_for: (u32, u32),
     last_out: [f32; 2],
     target: f64,
+    /// Bounds of `target` («Кино» or «Игра»).
+    profile: Profile,
     calm: f64,
     ctl: RateCtl,
     gain: f32,
@@ -166,6 +182,7 @@ impl Playout {
             kernel_for: (0, 0),
             last_out: [0.0; 2],
             target: START_TARGET,
+            profile: MOVIE,
             calm: 0.0,
             ctl: RateCtl::default(),
             gain: 0.0,
@@ -174,6 +191,23 @@ impl Playout {
             started: false,
             stats: PlayStats { target_ms: START_TARGET * 1000.0, ..Default::default() },
         }
+    }
+
+    /// Switches between «Кино» and «Игра» on the fly. Going to a smaller cushion skips the surplus at once
+    /// (faded out and in, no click) instead of slowly speeding it away.
+    pub fn set_profile(&mut self, p: Profile) {
+        if self.profile == p {
+            return;
+        }
+        self.profile = p;
+        // Start over from the new style's own level (clamping the old target would leave «Игра» at its maximum).
+        self.target = p.start;
+        self.calm = 0.0;
+        self.ctl.reset_level();
+        if self.state == State::Playing && self.level_sec() > self.target + 0.030 {
+            self.trim = true;
+        }
+        self.stats.target_ms = self.target * 1000.0;
     }
 
     /// Interleaved stereo samples from the network.
@@ -220,7 +254,7 @@ impl Playout {
             self.calm += dt;
             if self.calm >= CALM_SEC {
                 self.calm = 0.0;
-                self.target = (self.target - TARGET_DOWN).max(MIN_TARGET);
+                self.target = (self.target - TARGET_DOWN).max(self.profile.min);
             }
         }
         let step = src / dst_rate * (1.0 + fix);
@@ -249,7 +283,7 @@ impl Playout {
                     self.state = State::Buffering;
                     self.gain_dir = -1.0;
                     self.stats.underruns += 1;
-                    self.target = (self.target + TARGET_UP).min(MAX_TARGET);
+                    self.target = (self.target + TARGET_UP).min(self.profile.max);
                     self.calm = 0.0;
                     self.pos = 0.0;
                 }
@@ -461,6 +495,35 @@ mod tests {
         let natural = (0.5 * TAU * 440.0 / 48000.0) as f32;
         assert!(max_step(&s.out, 0) < natural + 0.012, "max step {}", max_step(&s.out, 0));
         assert_eq!(s.p.stats.underruns, 0);
+    }
+
+    #[test]
+    fn switching_to_game_drops_the_cushion_without_a_click() {
+        let mut s = Sim::new(48000.0, 0.0, 440.0);
+        s.feed(100.0);
+        for _ in 0..300 {
+            s.feed(10.0);
+            s.play(10.0);
+        }
+        assert!(s.p.stats.level_ms > 60.0, "movie cushion first: {:?}", s.p.stats);
+        let before = s.out.len();
+        s.p.set_profile(GAME);
+        for _ in 0..300 {
+            s.feed(10.0);
+            s.play(10.0);
+        }
+        let st = s.p.stats;
+        assert_eq!(st.underruns, 0, "{st:?}");
+        assert!(st.level_ms + 10.0 <= GAME.max * 1000.0 && st.target_ms <= GAME.max * 1000.0, "{st:?}");
+        let natural = (0.5 * TAU * 440.0 / 48000.0) as f32;
+        assert!(max_step(&s.out, before) < natural + 0.012, "the skip is faded, not a click");
+        // and back: the cushion grows again, still without underruns
+        s.p.set_profile(MOVIE);
+        for _ in 0..300 {
+            s.feed(10.0);
+            s.play(10.0);
+        }
+        assert!(s.p.stats.target_ms >= MOVIE.min * 1000.0 && s.p.stats.underruns == 0, "{:?}", s.p.stats);
     }
 
     #[test]

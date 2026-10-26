@@ -944,7 +944,11 @@ struct GuiApp {
     /// "Звук только из этого окна" and "Не передавать звук Discord".
     audio_prefs: audiosel::AudioPrefs,
     fullscreen: bool,
+    /// Viewer mode «Игра» (low latency) instead of «Кино» (lip sync). Remembered.
+    game: bool,
     host: Option<Session>,
+    /// The red "showing the screen" dot on our taskbar button.
+    badge: crate::taskbar::Badge,
     join: Option<Session>,
     test: Option<(Session, Session, bool, bool)>,
     show_preview: bool,
@@ -1048,7 +1052,9 @@ impl GuiApp {
             audio: true,
             audio_prefs: audiosel::AudioPrefs::default(),
             fullscreen: true,
+            game: crate::volume::ini_get(&crate::volume::read_settings(), "viewer_mode") == Some("game"),
             host: None,
+            badge: Default::default(),
             join: None,
             test: None,
             show_preview: load_show_preview(),
@@ -1143,6 +1149,9 @@ impl GuiApp {
         let mut args = vec!["client".to_string()];
         if !self.fullscreen {
             args.push("--windowed".into());
+        }
+        if self.game {
+            args.push("--game".into());
         }
         // A short room code needs no pasting at all: the client fetches the offer itself.
         let room = easy::normalize(&code);
@@ -1246,9 +1255,20 @@ impl eframe::App for GuiApp {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         for s in [&mut self.host, &mut self.join].into_iter().flatten() {
             s.poll();
+        }
+        // Red dot on our taskbar button while the screen is being shown to someone.
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let showing = |s: &Session| s.connected && !s.ended;
+            let live = self.host.as_ref().is_some_and(showing) || self.test.as_ref().is_some_and(|t| showing(&t.0));
+            if let Ok(h) = frame.window_handle() {
+                if let RawWindowHandle::Win32(w) = h.as_raw() {
+                    self.badge.set(w.hwnd.get(), live);
+                }
+            }
         }
         if let Some((h, c, sent_h, sent_c)) = &mut self.test {
             h.poll();
@@ -3240,6 +3260,24 @@ impl GuiApp {
                 }
             });
             if self.join.is_none() {
+                section_pad(ui, 14, |ui| {
+                    ui.label(RichText::new("Режим").font(bold(15.0)));
+                    let items = [("Кино", "звук и губы совпадают", 0), ("Игра", "минимальная задержка", 1)];
+                    if let Some(v) = segmented(ui, &items, self.game as u32) {
+                        self.game = v == 1;
+                        crate::volume::write_setting("viewer_mode", if self.game { "game" } else { "movie" });
+                    }
+                    ui.label(
+                        RichText::new(if self.game {
+                            "Картинка показывается сразу (задержка ~0,01 с вместо ~0,12 с), звук отстаёт примерно на 0,06 с. Для игр."
+                        } else {
+                            "Картинка ждёт звук — идеально для фильмов. Задержка около 0,1 с."
+                        })
+                        .color(c_muted())
+                        .size(12.5),
+                    );
+                    ui.label(RichText::new("Переключить во время просмотра: F3").color(c_muted()).size(12.5));
+                });
                 fold(ui, "Дополнительно", |ui| {
                     ui.checkbox(&mut self.fullscreen, "Открыть на весь экран");
                 });

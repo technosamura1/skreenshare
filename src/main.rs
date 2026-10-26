@@ -15,6 +15,7 @@ mod client;
 mod gpuconv;
 mod gpulogic;
 mod hdr;
+mod hdrcheck;
 mod hdrmath;
 mod guilogic;
 mod glass;
@@ -44,6 +45,7 @@ mod scale;
 mod retx;
 mod selftest;
 mod source;
+mod taskbar;
 mod thumbs;
 mod ui;
 mod video;
@@ -71,7 +73,8 @@ screenshare — показ экрана напрямую, без серверо�
                      разрешения на лету. Аварийное отключение — Ctrl+Alt+Shift+F12 на компьютере показывающего.
                      Во время показа окно программы может сменить источник: строка «SOURCE monitor N» / «SOURCE window HWND» в stdin.
   screenshare client [--no-audio] [--no-control] [--cpu-decode] [--cpu-convert] [--windowed] [--exchange-dir ПАПКА]
-                     [--frames N --screenshot ФАЙЛ.bmp]
+                     [--game] [--frames N --screenshot ФАЙЛ.bmp]
+  --game — режим «Игра»: картинка сразу, маленький запас звука (F3 переключает во время просмотра)
                      --cpu-convert (или переменная SS_CPU_CONVERT=1) — цвет и масштаб на процессоре, не на видеокарте
   screenshare gputest        проверка видеокарты для цвета и масштаба у зрителя (без сети)
   screenshare monitors
@@ -171,6 +174,7 @@ fn client_opts(a: &mut Args) -> Result<client::ClientOpts> {
         hw_decode: !a.flag("--cpu-decode"),
         cpu_convert: a.flag("--cpu-convert"),
         windowed: a.flag("--windowed"),
+        game: a.flag("--game"),
         screenshot: a.value("--screenshot")?.map(PathBuf::from),
         frames: a.value("--frames")?.map(|v| v.parse()).transpose().context("--frames")?,
         exchange: exchange(a)?,
@@ -254,6 +258,25 @@ fn run(mut a: Args) -> Result<()> {
             let secs = a.num::<u64>("--seconds", 20)?;
             a.finish()?;
             avsync::run_beacon(secs)?;
+        }
+        "badgetest" => {
+            let secs = a.num::<u64>("--seconds", 8)?;
+            a.finish()?;
+            taskbar::demo(secs)?;
+        }
+        "hdrcheck" => {
+            // Known colour stripes on the monitor, measured through the stream's capture path.
+            let mon = a.num::<usize>("--monitor", 0)?;
+            a.finish()?;
+            let m = host::pick_monitor(Some(mon), false)?;
+            let rows = hdrcheck::run(m)?;
+            let mut worst = 0;
+            for r in &rows {
+                let err = (0..3).map(|k| (r.want[k] as i32 - r.got[k] as i32).abs()).max().unwrap();
+                worst = worst.max(err);
+                println!("  {:<10} было {:>3?} → в трансляции {:>3?}  ошибка {err}", r.name, r.want, r.got);
+            }
+            println!("Максимальная ошибка: {worst} из 255 {}", if worst <= 6 { "— OK" } else { "— ПЛОХО" });
         }
         "abstest" => {
             // Remote control by position: does the cursor land exactly where computed? (moves the cursor)

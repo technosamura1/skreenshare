@@ -38,6 +38,8 @@ pub struct ClientOpts {
     pub cpu_convert: bool,
     /// Start in a normal window instead of borderless fullscreen.
     pub windowed: bool,
+    /// «Игра»: show frames at once and keep only a small sound cushion (F3 switches while watching).
+    pub game: bool,
     /// Test mode: save a decoded frame as BMP and quit after this many frames.
     pub screenshot: Option<PathBuf>,
     pub frames: Option<u64>,
@@ -186,6 +188,8 @@ struct Shared {
     dropped_busy: AtomicU64,
     /// Per-interval timings for the diagnostics line.
     diag: Mutex<Diag>,
+    /// «Игра»: frames are not held back for lip sync (F3 toggles).
+    game: AtomicBool,
 }
 
 #[derive(Default)]
@@ -314,6 +318,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         dropped_catchup: AtomicU64::new(0),
         dropped_busy: AtomicU64::new(0),
         diag: Mutex::new(Diag::default()),
+        game: AtomicBool::new(o.game),
     });
     {
         let sh = sh.clone();
@@ -339,12 +344,16 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         None
     };
     let audio_q = player.as_ref().map(|p| p.queue.clone());
+    if let Some(q) = &audio_q {
+        q.set_game(o.game);
+    }
 
     // (If the decoder falls behind, it catches up by decoding without showing, see viewperf::should_show; this
     // bound is only the last resort and costs a keyframe resync: 0.5 s of video at 144 fps, 1.2 s at 60.)
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, bool, Instant)>(72);
     let sync_q = audio_q.clone();
     let diag_q = audio_q.clone();
+    let window_q = audio_q.clone();
     let audio_on = audio_q.is_some();
     {
         let (r, s) = net::socket_buffers(&sock);
@@ -646,7 +655,8 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         _ => "CPU (GPU не работает)",
                     };
                     let _ = proxy.send_event(UserEv::Title(format!(
-                        "screenshare — {short} · {fps:.0} к/с · декод {dec_ms:.1} мс · пинг {:.0} мс · {} — F11: полный экран",
+                        "screenshare — {} · {short} · {fps:.0} к/с · декод {dec_ms:.1} мс · пинг {:.0} мс · {} — F3: режим, F11: полный экран",
+                        if sh.game.load(Ordering::Relaxed) { "Игра" } else { "Кино" },
                         sh.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0,
                         nq.text()
                     )));
@@ -779,7 +789,12 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 // Lip sync: sound sits in its jitter buffer for a while, so every frame is held just as long
                 // after its arrival. That keeps several frames queued, which is normal and not "behind": a frame
                 // counts as late only when it is already past its own due time.
-                let hold = sync_q.as_ref().map_or(Duration::ZERO, |q| q.delay().saturating_sub(DECODE_TIME).min(MAX_SYNC_HOLD));
+                // «Игра»: shown at once (sound may trail by its small cushion); «Кино»: held for lip sync.
+                let hold = if sh.game.load(Ordering::Relaxed) {
+                    Duration::ZERO
+                } else {
+                    sync_q.as_ref().map_or(Duration::ZERO, |q| q.delay().saturating_sub(DECODE_TIME).min(MAX_SYNC_HOLD))
+                };
                 let due = arrived + hold;
                 let now = Instant::now();
                 // How deep the queue normally is depends on the frame rate (30 / 60 / 144): measure it.
@@ -984,6 +999,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         cursor_shown: true,
         shown_seq: 0,
         relative_mode: false,
+        audio_q: window_q,
         started: Instant::now(),
         control,
         input: input.clone(),
@@ -1032,6 +1048,8 @@ struct App {
     shown_seq: u64,
     /// Controlling with raw motion (the host's cursor is hidden) rather than by the pointer's position.
     relative_mode: bool,
+    /// The sound queue, for switching «Кино» / «Игра» (F3).
+    audio_q: Option<crate::audio::AudioQueue>,
     started: Instant,
     /// Remote control is enabled (no `--no-control`).
     control: bool,
@@ -1362,6 +1380,24 @@ impl ApplicationHandler<UserEv> for App {
                 if self.control {
                     self.pad_panel = !self.pad_panel;
                     self.redraw();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat && matches!(event.logical_key, Key::Named(NamedKey::F3)) =>
+            {
+                // «Кино» <-> «Игра» while watching (remembered for next time).
+                let game = !self.sh.game.load(Ordering::Relaxed);
+                self.sh.game.store(game, Ordering::Relaxed);
+                if let Some(q) = &self.audio_q {
+                    q.set_game(game);
+                }
+                crate::volume::write_setting("viewer_mode", if game { "game" } else { "movie" });
+                if let Some(w) = &self.window {
+                    w.set_title(if game {
+                        "screenshare — режим «Игра»: минимальная задержка (F3 — вернуть «Кино»)"
+                    } else {
+                        "screenshare — режим «Кино»: звук и картинка вместе (F3 — «Игра»)"
+                    });
                 }
             }
             WindowEvent::Resized(s) => {

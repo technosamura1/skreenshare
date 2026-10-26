@@ -91,6 +91,11 @@ impl AudioQueue {
     pub fn stats(&self) -> PlayStats {
         self.buf.lock().unwrap().stats
     }
+
+    /// «Игра» (small sound cushion) or «Кино» (lip-sync cushion), switchable while playing.
+    pub fn set_game(&self, game: bool) {
+        self.buf.lock().unwrap().set_profile(if game { crate::playout::GAME } else { crate::playout::MOVIE });
+    }
 }
 
 pub struct Player {
@@ -133,7 +138,7 @@ pub fn start_playback() -> Result<Player> {
                 q2.delay_us.store((b.level_sec() * 1e6) as i64 + device_us, Ordering::Relaxed);
                 b.render(out, ch, dst_rate);
             }
-            crate::volume::apply_gain(out, ch, &mut gain_now, vol2.gain());
+            // Sync probe before the volume: timing doesn't depend on how loud the viewer listens (or mute).
             if probe {
                 for (k, f) in out.chunks(ch).enumerate() {
                     if beep.feed(f[0]) {
@@ -141,6 +146,7 @@ pub fn start_playback() -> Result<Player> {
                     }
                 }
             }
+            crate::volume::apply_gain(out, ch, &mut gain_now, vol2.gain());
         },
         |e| eprintln!("звук (вывод): {e}"),
         None,

@@ -16,8 +16,10 @@ pub const DEFAULT_SDR_WHITE_NITS: f32 = 80.0;
 pub const MIN_SDR_WHITE_NITS: f32 = 40.0;
 pub const MAX_SDR_WHITE_NITS: f32 = 1000.0;
 /// Up to this value (SDR-relative linear light) the picture is passed through unchanged; above it highlights roll
-/// off towards 1.0. 0.92 keeps ordinary white at 250/255 while giving HDR highlights some room.
-pub const KNEE: f32 = 0.92;
+/// off towards 1.0. 0.98 keeps ordinary white at 254/255 (measured with `hdrcheck` on a real HDR monitor: 0.92 gave
+/// 250, a visibly grey "white" on pages and documents, which are most of what is streamed); HDR highlights still
+/// fade into white smoothly instead of clipping with a hard edge.
+pub const KNEE: f32 = 0.98;
 /// Larger values are clamped first (HDR peaks are ~12.5 in these units; this only guards against garbage / inf).
 pub const MAX_INPUT: f32 = 10_000.0;
 
