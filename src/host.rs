@@ -377,13 +377,13 @@ pub fn run(o: HostOpts) -> Result<()> {
     let monitor = pick_monitor(o.monitor, interactive)?;
     println!("Показываю монитор {}x{} ({})", monitor.width, monitor.height, monitor.adapter);
 
-    let sock = Arc::new(net::bind_socket()?);
+    println!("Определяю адрес в интернете...");
+    let (sock, nat) = net::open_and_discover()?;
+    let sock = Arc::new(sock);
     {
         let (r, s) = net::socket_buffers(&sock);
         println!("Буферы сокета: приём {} КБ, отправка {} КБ", r / 1024, s / 1024);
     }
-    println!("Определяю адрес в интернете...");
-    let nat = net::stun_discover(&sock);
     ui::report_nat(&nat);
     let token = net::random_token();
     let me = Code::for_socket(net::ROLE_HOST, token, &sock, &nat);

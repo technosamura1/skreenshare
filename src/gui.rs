@@ -636,6 +636,30 @@ fn save_show_preview(on: bool) {
     crate::volume::write_setting("preview", if on { "1" } else { "0" });
 }
 
+/// The frame rates offered; anything else in the settings file falls back to 60.
+const FPS_CHOICES: [u32; 3] = [30, 60, 144];
+
+fn load_fps() -> u32 {
+    crate::volume::ini_get(&crate::volume::read_settings(), "fps")
+        .and_then(|v| v.parse().ok())
+        .filter(|v| FPS_CHOICES.contains(v))
+        .unwrap_or(60)
+}
+
+fn save_fps(fps: u32) {
+    crate::volume::write_setting("fps", &fps.to_string());
+}
+
+/// One line under the frame-rate choice: what it is for and what it costs.
+fn fps_note(fps: u32) -> &'static str {
+    match fps {
+        30 => "Экономит интернет: для спокойной картинки — текст, презентации.",
+        144 => "Для игр. Чтобы было так же чётко, нужно примерно вдвое больше интернета на отдачу, \
+                а у зрителя — монитор 144 Гц (иначе лишние кадры он не увидит).",
+        _ => "Подходит почти всему: фильмы, сериалы, большинство игр.",
+    }
+}
+
 /// Keeps the preview of `s` (the process that streams) alive. Only while the switch is on and this window is
 /// visible does anything happen: the heartbeat is what makes the host produce pictures at all, so with the
 /// switch off (or minimized) the host does no scaling, no compression and writes nothing to the pipe.
@@ -914,6 +938,8 @@ struct GuiApp {
     thumbs: ThumbStore,
     /// Mbit/s ceiling of the chosen preset; 0 = Авто (the default).
     bitrate: u32,
+    /// Frames per second to stream: 30, 60 (the default) or 144. Remembered between runs.
+    fps: u32,
     audio: bool,
     /// "Звук только из этого окна" and "Не передавать звук Discord".
     audio_prefs: audiosel::AudioPrefs,
@@ -1018,6 +1044,7 @@ impl GuiApp {
             windows: wincap::list_windows(),
             thumbs: ThumbStore::new(),
             bitrate: 0,
+            fps: load_fps(),
             audio: true,
             audio_prefs: audiosel::AudioPrefs::default(),
             fullscreen: true,
@@ -1070,6 +1097,7 @@ impl GuiApp {
         } else {
             a.extend(["--bitrate".to_string(), self.bitrate.to_string()]);
         }
+        a.extend(["--fps".to_string(), self.fps.to_string()]);
         if !self.audio {
             a.push("--no-audio".into());
         }
@@ -2225,7 +2253,7 @@ fn code_input(ui: &mut egui::Ui, input: &mut String, hint: &str) {
 
 fn fps_hint(ui: &mut egui::Ui) {
     ui.label(
-        RichText::new("Кадр отправляется только когда картинка меняется, поэтому на спокойном экране кадров/с меньше 60 — это нормально.")
+        RichText::new("Кадр отправляется только когда картинка меняется, поэтому на спокойном экране кадров/с меньше выбранной плавности — это нормально.")
             .color(c_muted())
             .size(12.5),
     );
@@ -2524,6 +2552,19 @@ impl GuiApp {
                 .color(c_muted())
                 .size(12.5),
             );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Плавность").font(bold(15.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(format!("до {} кадров/с", self.fps)).color(c_muted()).size(13.0));
+                });
+            });
+            let items = [("30 к/с", "экономно", 30), ("60 к/с", "фильмы и игры", 60), ("144 к/с", "для игр", 144)];
+            if let Some(v) = segmented(ui, &items, self.fps) {
+                self.fps = v;
+                save_fps(v);
+            }
+            ui.label(RichText::new(fps_note(self.fps)).color(c_muted()).size(12.5));
         });
     }
 
@@ -2571,6 +2612,17 @@ impl GuiApp {
             .color(c_muted())
             .size(13.0),
         );
+        ui.add_space(6.0);
+        ui.label(RichText::new("Плавность").font(bold(15.0)));
+        ui.horizontal_wrapped(|ui| {
+            for v in FPS_CHOICES {
+                if chip(ui, &format!("{v} кадров/с"), self.fps == v, None) {
+                    self.fps = v;
+                    save_fps(v);
+                }
+            }
+        });
+        ui.label(RichText::new(fps_note(self.fps)).color(c_muted()).size(13.0));
         }
         if with_audio {
             ui.add_space(6.0);

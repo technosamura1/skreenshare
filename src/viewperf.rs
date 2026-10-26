@@ -27,8 +27,16 @@ impl Acc {
 
 /// A frame that is later than this past its due time (arrival + the lip-sync hold) is "behind".
 pub const LATE_LIMIT: std::time::Duration = std::time::Duration::from_millis(50);
-/// Whatever the clocks say, a backlog this deep is always caught up on.
+/// Whatever the clocks say, a backlog this many frames deeper than normal is always caught up on.
 pub const HARD_BACKLOG: usize = 12;
+
+/// The backlog limit for `should_show`: the frames the lip-sync hold keeps queued anyway at the current frame
+/// rate, plus `HARD_BACKLOG`. A fixed 12 was right for 60 fps (the hold keeps 5-7 queued) but at 144 fps the
+/// hold alone keeps 12-17 queued, and every frame would have been skipped as "behind".
+pub fn backlog_limit(hold: std::time::Duration, frame_interval: std::time::Duration) -> usize {
+    let normal = if frame_interval.is_zero() { 0.0 } else { (hold.as_secs_f64() / frame_interval.as_secs_f64()).ceil() };
+    (normal as usize).min(64) + HARD_BACKLOG
+}
 
 /// Whether a frame should be converted and shown. `waiting` frames are queued behind it, `late` is how long
 /// past its due time it is. A frame is always decoded (P-frames depend on each other); only the expensive
@@ -37,8 +45,8 @@ pub const HARD_BACKLOG: usize = 12;
 /// The old rule looked at the queue depth alone. But holding every frame back for lip sync (sound sits ~80-120 ms
 /// in its jitter buffer) legitimately keeps 5-7 frames queued at 60 fps, so that rule dropped 2 of 3 frames in
 /// steady state: "host sends 50, viewer shows 25-30" with a 2 ms decode.
-pub fn should_show(waiting: usize, late: std::time::Duration) -> bool {
-    waiting < 2 || (late <= LATE_LIMIT && waiting < HARD_BACKLOG)
+pub fn should_show(waiting: usize, late: std::time::Duration, backlog_limit: usize) -> bool {
+    waiting < 2 || (late <= LATE_LIMIT && waiting < backlog_limit)
 }
 
 /// Arrival jitter of completed frames: smoothed mean absolute deviation of the frame interval, the longest gap
@@ -154,13 +162,26 @@ mod tests {
     #[test]
     fn catch_up_skips_only_when_really_late() {
         use std::time::Duration as D;
+        let lim = backlog_limit(D::from_millis(100), D::from_micros(16_667)); // 60 fps
+        assert_eq!(lim, 6 + HARD_BACKLOG);
         // lip-sync hold keeps a deep queue, but every frame is on time: show all of them
-        assert!(should_show(6, D::ZERO) && should_show(11, D::from_millis(10)));
+        assert!(should_show(6, D::ZERO, lim) && should_show(11, D::from_millis(10), lim));
         // late and with a backlog: skip the expensive part
-        assert!(!should_show(3, D::from_millis(80)) && !should_show(2, D::from_millis(51)));
+        assert!(!should_show(3, D::from_millis(80), lim) && !should_show(2, D::from_millis(51), lim));
         // late but alone in the queue: show it (nothing newer to jump to)
-        assert!(should_show(0, D::from_millis(200)) && should_show(1, D::from_millis(200)));
-        assert!(!should_show(HARD_BACKLOG, D::ZERO));
+        assert!(should_show(0, D::from_millis(200), lim) && should_show(1, D::from_millis(200), lim));
+        assert!(!should_show(lim, D::ZERO, lim));
+    }
+
+    #[test]
+    fn at_144_fps_the_lip_sync_queue_is_not_a_backlog() {
+        use std::time::Duration as D;
+        // 120 ms of hold at 144 fps keeps ~17 frames queued: all on time, all shown.
+        let lim = backlog_limit(D::from_millis(120), D::from_micros(6_944));
+        assert!(should_show(17, D::ZERO, lim), "limit {lim}");
+        assert!(!should_show(lim, D::ZERO, lim));
+        // A static screen (no frames for a while) must not make the limit silly.
+        assert_eq!(backlog_limit(D::from_millis(120), D::ZERO), HARD_BACKLOG);
     }
 
     #[test]

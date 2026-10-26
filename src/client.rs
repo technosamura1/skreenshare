@@ -253,9 +253,9 @@ enum UserEv {
 }
 
 pub fn run(o: ClientOpts) -> Result<()> {
-    let sock = Arc::new(net::bind_socket()?);
     println!("Определяю адрес в интернете...");
-    let nat = net::stun_discover(&sock);
+    let (sock, nat) = net::open_and_discover()?;
+    let sock = Arc::new(sock);
     ui::report_nat(&nat);
     let host = ui::read_code(
         &o.exchange,
@@ -341,8 +341,8 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
     let audio_q = player.as_ref().map(|p| p.queue.clone());
 
     // (If the decoder falls behind, it catches up by decoding without showing, see viewperf::should_show; this
-    // bound is only the last resort and costs a keyframe resync, so it is shorter than before: 0.5 s of video.)
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, bool, Instant)>(30);
+    // bound is only the last resort and costs a keyframe resync: 0.5 s of video at 144 fps, 1.2 s at 60.)
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<(Vec<u8>, bool, Instant)>(72);
     let sync_q = audio_q.clone();
     let diag_q = audio_q.clone();
     let audio_on = audio_q.is_some();
@@ -751,6 +751,8 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             let mut px: Vec<u32> = Vec::new();
             let mut done = false;
             let mut flash = crate::avsync::FlashEdge::default();
+            let mut last_arrived: Option<Instant> = None;
+            let mut interval = 0.0f64; // smoothed seconds between frames
             for (data, key, arrived) in frame_rx {
                 let waiting = sh.qdepth.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
                 // The host fell back from the video card (HEVC) to the processor (H.264) or back: the keyframe's
@@ -780,7 +782,13 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 let hold = sync_q.as_ref().map_or(Duration::ZERO, |q| q.delay().saturating_sub(DECODE_TIME).min(MAX_SYNC_HOLD));
                 let due = arrived + hold;
                 let now = Instant::now();
-                let show = viewperf::should_show(waiting, now.saturating_duration_since(due));
+                // How deep the queue normally is depends on the frame rate (30 / 60 / 144): measure it.
+                if let Some(prev) = last_arrived.replace(arrived) {
+                    let dt = arrived.saturating_duration_since(prev).as_secs_f64().clamp(1.0 / 240.0, 1.0 / 24.0);
+                    interval = if interval == 0.0 { dt } else { interval + (dt - interval) * 0.05 };
+                }
+                let limit = viewperf::backlog_limit(hold, Duration::from_secs_f64(interval));
+                let show = viewperf::should_show(waiting, now.saturating_duration_since(due), limit);
                 if !show {
                     sh.dropped_catchup.fetch_add(1, Ordering::Relaxed);
                 }
