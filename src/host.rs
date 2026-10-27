@@ -831,6 +831,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             ui::encoder(&e.label, note.as_deref());
             enc_short = match e.backend {
                 crate::video::Backend::Nvenc => "NVENC".to_string(),
+                crate::video::Backend::Mf => "видеоядро (Media Foundation)".to_string(),
                 crate::video::Backend::X264 => "x264 (процессор)".to_string(),
             };
             // Software encoding: its own frame rate and a bitrate the CPU can really produce.

@@ -84,6 +84,8 @@ pub struct EncoderConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     Nvenc,
+    /// Windows Media Foundation hardware MFT (Intel Quick Sync, AMD, ...).
+    Mf,
     X264,
 }
 
@@ -146,7 +148,7 @@ impl Encoder {
         let forced = std::env::var("SS_ENCODER").unwrap_or_default().to_lowercase();
         let mut note = None;
         let mut nv_err = String::new();
-        if forced != "x264" && !NVENC_BAD.load(Ordering::Relaxed) {
+        if forced != "x264" && forced != "mf" && !NVENC_BAD.load(Ordering::Relaxed) {
             match Self::new_nvenc(cfg) {
                 Ok(e) => return Ok((e, None)),
                 Err(why) => {
@@ -157,8 +159,8 @@ impl Encoder {
                     nv_err = why;
                 }
             }
-        } else if forced == "x264" {
-            nv_err = "кодирование на видеокарте отключено (SS_ENCODER=x264)".into();
+        } else if forced == "x264" || forced == "mf" {
+            nv_err = format!("NVENC отключён (SS_ENCODER={forced})");
         } else if let Ok(n) = NVENC_NOTE.lock() {
             nv_err = n.clone();
         }
@@ -167,6 +169,14 @@ impl Encoder {
         }
         if !nv_err.is_empty() {
             note = Some(nv_err.clone());
+        }
+        // No NVIDIA (or its driver refused): the graphics chip's own encoder through Media Foundation.
+        if forced != "x264" {
+            match Self::new_mf(cfg) {
+                Ok(e) => return Ok((e, None)), // works: the missing NVIDIA is no news,
+                Err(e) if forced == "mf" => bail!("Media Foundation: {e:#}"),
+                Err(e) => eprintln!("Media Foundation: {e:#}"),
+            }
         }
         let plan = encsel::soft_plan(cores, cfg.width, cfg.height, cfg.fps);
         match Self::new_x264(cfg, plan) {
@@ -255,38 +265,67 @@ impl Encoder {
     }
 
     fn new_x264(cfg: &EncoderConfig, plan: SoftPlan) -> Result<Encoder> {
+        let bitrate = ((cfg.bitrate as f64 / 1e6).min(plan.max_mbps) * 1e6) as u64;
+        let opts = [
+            (c"preset", c"ultrafast"),
+            (c"tune", c"zerolatency"),
+            (c"forced-idr", c"1"),
+            (c"x264-params", c"scenecut=0:repeat-headers=1:aud=0"),
+        ];
+        let label = format!("Кодирование: процессор x264 (H.264) · {}x{} · {} кадров/с", plan.width, plan.height, plan.fps);
+        Self::new_converted(cfg, plan, c"libx264", AVPixelFormat::AV_PIX_FMT_YUV420P, bitrate, &opts, 0, Backend::X264, label)
+    }
+
+    /// The video block of any graphics chip through Windows Media Foundation (Intel Quick Sync on laptops
+    /// without NVIDIA, AMD, or NVIDIA's own MFT): hardware H.264, the processor only converts colours.
+    fn new_mf(cfg: &EncoderConfig) -> Result<Encoder> {
+        let plan = encsel::mf_plan(cfg.width, cfg.height, cfg.fps);
+        let bitrate = cfg.bitrate.min((plan.max_mbps * 1e6) as u64);
+        let opts = [(c"hw_encoding", c"1"), (c"rate_control", c"cbr"), (c"scenario", c"display_remoting")];
+        let label = format!("Кодирование: видеоядро через Media Foundation (H.264) · {}x{} · {} кадров/с", plan.width, plan.height, plan.fps);
+        Self::new_converted(cfg, plan, c"h264_mf", AVPixelFormat::AV_PIX_FMT_NV12, bitrate, &opts, AV_CODEC_FLAG_LOW_DELAY as i32, Backend::Mf, label)
+    }
+
+    /// An H.264 encoder fed from the BGRA input through swscale (colour conversion + scaling to `plan`).
+    #[allow(clippy::too_many_arguments)]
+    fn new_converted(
+        cfg: &EncoderConfig,
+        plan: SoftPlan,
+        name: &std::ffi::CStr,
+        pix: AVPixelFormat,
+        bitrate: u64,
+        options: &[(&std::ffi::CStr, &std::ffi::CStr)],
+        flags: i32,
+        backend: Backend,
+        label: String,
+    ) -> Result<Encoder> {
         unsafe {
-            let codec = avcodec_find_encoder_by_name(c"libx264".as_ptr());
+            let codec = avcodec_find_encoder_by_name(name.as_ptr());
             if codec.is_null() {
-                bail!("в FFmpeg нет libx264");
+                bail!("в FFmpeg нет {}", name.to_string_lossy());
             }
             let ctx = avcodec_alloc_context3(codec);
             let c = &mut *ctx;
             c.width = plan.width as i32;
             c.height = plan.height as i32;
-            c.pix_fmt = AVPixelFormat::AV_PIX_FMT_YUV420P;
-            let mbps = (cfg.bitrate as f64 / 1e6).min(plan.max_mbps);
-            let bitrate = (mbps * 1e6) as u64;
+            c.pix_fmt = pix;
+            c.flags |= flags;
             set_common(c, cfg, plan.fps, bitrate);
             let mut opts: *mut AVDictionary = ptr::null_mut();
-            for (k, v) in [
-                (c"preset", c"ultrafast"),
-                (c"tune", c"zerolatency"),
-                (c"forced-idr", c"1"),
-                (c"x264-params", c"scenecut=0:repeat-headers=1:aud=0"),
-            ] {
+            for (k, v) in options {
                 av_dict_set(&mut opts, k.as_ptr(), v.as_ptr(), 0);
             }
-            let r = avcodec_open2(ctx, codec, &mut opts);
+            let (r, log) = with_log(|| avcodec_open2(ctx, codec, &mut opts));
             av_dict_free(&mut opts);
             if r < 0 {
                 let mut ctx = ctx;
                 avcodec_free_context(&mut ctx);
-                bail!("{}", av_err(r));
+                let tail: Vec<&str> = log.lines().rev().take(3).collect();
+                bail!("{} ({})", av_err(r), tail.join(" | "));
             }
             let frame = Self::alloc_input(cfg)?;
             let yuv = av_frame_alloc();
-            (*yuv).format = AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+            (*yuv).format = pix as i32;
             (*yuv).width = plan.width as i32;
             (*yuv).height = plan.height as i32;
             check(av_frame_get_buffer(yuv, 32), "av_frame_get_buffer")?;
@@ -296,7 +335,7 @@ impl Encoder {
                 AVPixelFormat::AV_PIX_FMT_BGRA,
                 plan.width as i32,
                 plan.height as i32,
-                AVPixelFormat::AV_PIX_FMT_YUV420P,
+                pix,
                 2, // SWS_BILINEAR: cheap, no ringing on text when scaling down
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -317,14 +356,11 @@ impl Encoder {
                 fps: plan.fps,
                 width: cfg.width,
                 height: cfg.height,
-                backend: Backend::X264,
+                backend,
                 codec: Codec::H264,
                 out_w: plan.width,
                 out_h: plan.height,
-                label: format!(
-                    "Кодирование: процессор x264 (H.264) · {}x{} · {} кадров/с",
-                    plan.width, plan.height, plan.fps
-                ),
+                label,
                 max_mbps: Some(plan.max_mbps),
             })
         }
@@ -362,7 +398,7 @@ impl Encoder {
 
     pub fn encode(&mut self, force_key: bool, mut out: impl FnMut(&[u8], bool)) -> Result<()> {
         unsafe {
-            let send = if self.backend == Backend::X264 {
+            let send = if !self.yuv.is_null() {
                 check(av_frame_make_writable(self.yuv), "av_frame_make_writable")?;
                 let s = [(*self.frame).data[0] as *const u8, ptr::null(), ptr::null(), ptr::null()];
                 let ss = [(*self.frame).linesize[0], 0, 0, 0];

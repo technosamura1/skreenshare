@@ -87,6 +87,15 @@ pub fn soft_plan(cores: usize, src_w: u32, src_h: u32, want_fps: u32) -> SoftPla
     SoftPlan { width: w, height: h, fps: f, max_mbps: (rate / 1e6 * 0.18).clamp(2.0, 12.0) }
 }
 
+/// Hardware encoding through Windows Media Foundation (Intel Quick Sync, AMD, NVIDIA's MFT; v0.12.2): the
+/// encoder itself costs the processor nothing, only the colour conversion before it does. So up to 1080p (the
+/// source is never enlarged) and up to 60 frames/s even on a 2-core laptop.
+pub fn mf_plan(src_w: u32, src_h: u32, want_fps: u32) -> SoftPlan {
+    let (src_w, src_h) = (src_w.max(2), src_h.max(2));
+    let (w, h) = if src_h > 1080 { (even((src_w as f64 * 1080.0 / src_h as f64).round() as u32), 1080) } else { (src_w, src_h) };
+    SoftPlan { width: even(w), height: even(h), fps: want_fps.clamp(1, 60), max_mbps: 20.0 }
+}
+
 /// Facts pulled out of FFmpeg's log while NVENC was being opened.
 #[derive(Debug, Default, PartialEq)]
 pub struct NvLog {
@@ -198,6 +207,15 @@ mod tests {
         assert_eq!(p.fps, 24);
         assert!(soft_plan(1, 3840, 2160, 60).max_mbps >= 2.0);
         assert!(soft_plan(32, 3840, 2160, 60).max_mbps <= 12.0);
+    }
+
+    #[test]
+    fn hardware_plan_is_1080p60_at_most_and_never_enlarges() {
+        assert_eq!(mf_plan(1920, 1080, 144), SoftPlan { width: 1920, height: 1080, fps: 60, max_mbps: 20.0 });
+        assert_eq!(mf_plan(1366, 768, 60), SoftPlan { width: 1366, height: 768, fps: 60, max_mbps: 20.0 });
+        let p = mf_plan(2560, 1440, 30);
+        assert_eq!((p.width, p.height, p.fps), (1920, 1080, 30));
+        assert_eq!(mf_plan(3840, 1600, 60).height, 1080);
     }
 
     #[test]
