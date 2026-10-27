@@ -110,6 +110,9 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
     let mut gfx: Option<Gfx> = None;
     let mut shown = false;
     let mut last_drawn: Option<(Option<(i32, i32)>, usize)> = None;
+    // The dot glides toward the newest spot (packets come unevenly over the internet); jumps far away snap.
+    let mut glide: Option<(f32, f32)> = None;
+    let mut last_frame = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         unsafe {
             let mut m = MSG::default();
@@ -133,7 +136,18 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
             std::thread::sleep(Duration::from_millis(15));
             continue;
         };
-        let laser = b.laser(now).and_then(|p| inputhost::region_point(reg, p));
+        let target = b.laser(now).and_then(|p| inputhost::region_point(reg, p));
+        let dt = now.saturating_duration_since(last_frame).as_secs_f32().min(0.1);
+        last_frame = now;
+        glide = match (target, glide) {
+            (None, _) => None,
+            (Some((x, y)), Some((gx, gy))) if (x as f32 - gx).hypot(y as f32 - gy) < 400.0 => {
+                let k = 1.0 - (-dt / 0.012).exp();
+                Some((gx + (x as f32 - gx) * k, gy + (y as f32 - gy) * k))
+            }
+            (Some((x, y)), _) => Some((x as f32, y as f32)),
+        };
+        let laser = glide.map(|(x, y)| (x.round() as i32, y.round() as i32));
         // (sticker, centre, scale, opacity)
         let items: Vec<(usize, (f32, f32), f32, f32, Duration)> = b
             .reactions(now)
@@ -149,7 +163,7 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
         // A still laser and nothing moving: nothing to redraw.
         let key = (laser, items.len());
         if items.is_empty() && last_drawn == Some(key) {
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(2));
             continue;
         }
         last_drawn = Some(key);
@@ -191,7 +205,10 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
             // Stay above windows that came to the top since.
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
-        std::thread::sleep(Duration::from_millis(14));
+        // Next frame with the screen's own refresh (60/144 Hz): a plain sleep is 15.6 ms steps on Windows.
+        if unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
+            std::thread::sleep(Duration::from_millis(4));
+        }
     }
     unsafe {
         let _ = DestroyWindow(hwnd);

@@ -145,14 +145,15 @@ impl Sender {
         self.pending.push((Sent { rseq: self.rseq, sticker, at }, SENDS));
     }
 
-    /// A packet to send now, if any: changes at most every 25 ms, the laser refreshed every 150 ms while on.
+    /// A packet to send now, if any: changes at most every 6 ms (smooth on 144 Hz screens; the packets are
+    /// ~10 bytes), the laser refreshed every 150 ms while on.
     pub fn poll(&mut self, now: Instant) -> Option<Frame> {
         let laser = self.laser_visible(now);
         let changed = laser != self.sent_laser || !self.pending.is_empty();
         let since = self.last_send.map(|t| now.saturating_duration_since(t));
         let due = match since {
             None => changed || laser.is_some(),
-            Some(d) => changed && d >= Duration::from_millis(25) || laser.is_some() && d >= Duration::from_millis(150),
+            Some(d) => changed && d >= Duration::from_millis(6) || laser.is_some() && d >= Duration::from_millis(150),
         };
         if !due {
             return None;

@@ -226,7 +226,12 @@ impl ViewInput {
                             let _ = sock.send_to(&out, host);
                         }
                     }
-                    let a = me.annot.lock().unwrap().poll(now);
+                    let (a, pointing) = {
+                        let mut s = me.annot.lock().unwrap();
+                        (s.poll(now), s.laser_visible(now).is_some())
+                    };
+                    // The laser moves: wake often, like for remote control (the idle pause is ~15 ms).
+                    busy |= pointing;
                     if let Some(a) = a {
                         net::write_header(&mut out, net::PT_ANNOT, token);
                         crate::annot::encode(&a, &mut out);
