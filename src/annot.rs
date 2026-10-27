@@ -1,9 +1,10 @@
-// Laser pointer and reactions (v0.11.8, stickers placed by click v0.12.1): the viewer points at things and
-// sends cybercats stickers (ДА, НЕТ, смех, сердечко); the host draws them on its own screen. Pure logic, no
-// Windows calls (the drawing is in annotview.rs).
+// Laser pointer and reactions (v0.11.8, stickers placed by click v0.12.1, any sticker of the pack v0.12.2): the
+// viewer points at things and sends animated cybercats stickers (stickers.rs); the host draws them on its own
+// screen. Pure logic, no Windows calls (the drawing is in annotview.rs).
 //
 // Viewer -> host, PT_ANNOT: ver u8 (=1) | seq u16 | flags u8 (bit 0: laser on) | [x u16 | y u16 if laser] |
-//   n u8 | n × [rseq u16 | kind u8 (bit 7: a spot follows) | [x u16 | y u16]]
+//   n u8 | n × [rseq u16 | kind u8 | [x u16 | y u16]]   kind: bit 7 = a spot follows, bit 6 = sticker number in
+//   bits 0-5 (0.12.2); without bit 6, 1..4 = the old laugh / heart / yes / no.
 // The laser is a snapshot (a lost packet is repaired by the next one; it goes out at least every 150 ms while on,
 // and disappears on the host after 500 ms of silence); it switches itself off after 3 s without the mouse
 // moving. Each reaction rides in 3 packets in a row and the host keeps the numbers it has seen, so a loss neither
@@ -24,48 +25,25 @@ const SENDS: u8 = 3;
 const PLACED: u8 = 0x80;
 const MAX_PER_PACKET: usize = 24;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reaction {
-    Laugh = 1,
-    Heart = 2,
-    Yes = 3,
-    No = 4,
-}
+const STICKER: u8 = 0x40;
 
-impl Reaction {
-    /// The bar's order and keys 1-4 (also the sticker order in stickers.rs).
-    pub const ORDER: [Reaction; 4] = [Reaction::Yes, Reaction::No, Reaction::Laugh, Reaction::Heart];
-
-    pub fn from_u8(v: u8) -> Option<Reaction> {
-        Some(match v {
-            1 => Reaction::Laugh,
-            2 => Reaction::Heart,
-            3 => Reaction::Yes,
-            4 => Reaction::No,
-            _ => return None,
-        })
-    }
-
-    /// Place in ORDER = sticker number.
-    pub fn index(self) -> usize {
-        Reaction::ORDER.iter().position(|&r| r == self).unwrap_or(0)
-    }
-
-    /// Words for the viewer's own lines.
-    pub fn name(self) -> &'static str {
-        match self {
-            Reaction::Laugh => "смех",
-            Reaction::Heart => "сердечко",
-            Reaction::Yes => "ДА",
-            Reaction::No => "НЕТ",
-        }
-    }
+/// The sticker an older viewer (0.12.0-0.12.1) meant by its reaction 1..4.
+fn legacy(k: u8) -> Option<u8> {
+    let f = crate::stickers::FAVORITES;
+    Some(match k {
+        1 => f[2], // laugh
+        2 => f[3], // heart
+        3 => f[0], // yes
+        4 => f[1], // no
+        _ => return None,
+    } as u8)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sent {
     pub rseq: u16,
-    pub kind: Reaction,
+    /// Sticker number (stickers.rs).
+    pub sticker: u8,
     /// Spot on the picture (0..=65535 both ways) where the viewer clicked; None = where the laser is / a corner.
     pub at: Option<(u16, u16)>,
 }
@@ -90,7 +68,7 @@ pub fn encode(f: &Frame, out: &mut Vec<u8>) {
     out.push(n as u8);
     for r in &f.reactions[..n] {
         out.extend_from_slice(&r.rseq.to_le_bytes());
-        out.push(r.kind as u8 | if r.at.is_some() { PLACED } else { 0 });
+        out.push(STICKER | (r.sticker & 0x3F) | if r.at.is_some() { PLACED } else { 0 });
         if let Some((x, y)) = r.at {
             out.extend_from_slice(&x.to_le_bytes());
             out.extend_from_slice(&y.to_le_bytes());
@@ -121,7 +99,8 @@ pub fn decode(b: &[u8]) -> Option<Frame> {
         let p = take(3)?;
         let (rseq, k) = (u16::from_le_bytes([p[0], p[1]]), p[2]);
         let at = if k & PLACED != 0 { Some(point(take(4)?)) } else { None };
-        reactions.push(Sent { rseq, kind: Reaction::from_u8(k & !PLACED)?, at });
+        let sticker = if k & STICKER != 0 { k & 0x3F } else { legacy(k & !PLACED)? };
+        reactions.push(Sent { rseq, sticker, at });
     }
     Some(Frame { seq, laser, reactions })
 }
@@ -161,9 +140,9 @@ impl Sender {
         self.laser.filter(|_| self.moved.is_some_and(|m| now.saturating_duration_since(m) < LASER_IDLE))
     }
 
-    pub fn react(&mut self, kind: Reaction, at: Option<(u16, u16)>) {
+    pub fn react(&mut self, sticker: u8, at: Option<(u16, u16)>) {
         self.rseq = self.rseq.wrapping_add(1);
-        self.pending.push((Sent { rseq: self.rseq, kind, at }, SENDS));
+        self.pending.push((Sent { rseq: self.rseq, sticker, at }, SENDS));
     }
 
     /// A packet to send now, if any: changes at most every 25 ms, the laser refreshed every 150 ms while on.
@@ -193,7 +172,7 @@ impl Sender {
 /// One reaction on screen.
 #[derive(Clone, Copy, Debug)]
 pub struct Shown {
-    pub kind: Reaction,
+    pub sticker: u8,
     pub born: Instant,
     /// Spot on the picture where it appears.
     pub at: (u16, u16),
@@ -231,12 +210,12 @@ impl Board {
             if self.seen.len() > 128 {
                 self.seen.pop_front();
             }
-            self.add(now, r.kind, r.at.or(self.laser.map(|l| l.0)));
+            self.add(now, r.sticker, r.at.or(self.laser.map(|l| l.0)));
         }
     }
 
     /// A reaction to show (`at` None: the corner, spread over lanes).
-    pub fn add(&mut self, now: Instant, kind: Reaction, at: Option<(u16, u16)>) {
+    pub fn add(&mut self, now: Instant, sticker: u8, at: Option<(u16, u16)>) {
         self.shown.retain(|s| now.saturating_duration_since(s.born) < REACTION_LIFE);
         if self.shown.len() >= MAX_ACTIVE {
             self.shown.remove(0);
@@ -247,7 +226,7 @@ impl Board {
             self.lane = if self.lane >= 2 { -2 } else { self.lane + 1 };
             self.lane
         };
-        self.shown.push(Shown { kind, born: now, at: at.unwrap_or(CORNER), lane });
+        self.shown.push(Shown { sticker, born: now, at: at.unwrap_or(CORNER), lane });
     }
 
     pub fn laser(&self, now: Instant) -> Option<(u16, u16)> {
@@ -293,9 +272,9 @@ mod tests {
 
     #[test]
     fn frames_round_trip_and_garbage_is_rejected() {
-        let s = |rseq, kind, at| Sent { rseq, kind, at };
+        let s = |rseq, sticker, at| Sent { rseq, sticker, at };
         for f in [
-            Frame { seq: 7, laser: Some((1, 65535)), reactions: vec![s(3, Reaction::Heart, None), s(4, Reaction::No, Some((5, 6)))] },
+            Frame { seq: 7, laser: Some((1, 65535)), reactions: vec![s(3, 7, None), s(4, 63, Some((5, 6)))] },
             Frame { seq: 65535, laser: None, reactions: vec![] },
         ] {
             let mut b = Vec::new();
@@ -307,16 +286,8 @@ mod tests {
         }
         assert_eq!(decode(&[1, 0, 0, 0, 1, 0, 0, 9]), None, "unknown reaction");
         assert_eq!(decode(&[2, 0, 0, 0, 0]), None, "other version");
-        // 0.12.0 viewers (no spots) still read fine
-        assert_eq!(decode(&[1, 1, 0, 0, 1, 2, 0, 1]).unwrap().reactions, vec![s(2, Reaction::Laugh, None)]);
-    }
-
-    #[test]
-    fn keys_and_bar_order() {
-        assert_eq!(Reaction::ORDER.map(|r| r.name()), ["ДА", "НЕТ", "смех", "сердечко"]);
-        for (i, r) in Reaction::ORDER.iter().enumerate() {
-            assert_eq!(r.index(), i);
-        }
+        // 0.12.0-0.12.1 viewers (reactions 1..4) still read fine
+        assert_eq!(decode(&[1, 1, 0, 0, 1, 2, 0, 2]).unwrap().reactions, vec![s(2, crate::stickers::FAVORITES[3] as u8, None)]);
     }
 
     #[test]
@@ -324,7 +295,7 @@ mod tests {
         let t = Instant::now();
         let mut s = Sender::new(10);
         let mut b = Board::default();
-        s.react(Reaction::Laugh, Some((100, 200)));
+        s.react(17, Some((100, 200)));
         let _lost = (s.poll(t).unwrap(), s.poll(t + ms(30)).unwrap());
         let p3 = s.poll(t + ms(60)).unwrap();
         assert!(s.poll(t + ms(90)).is_none(), "nothing more to say");
@@ -355,7 +326,7 @@ mod tests {
         assert_eq!(b.laser(t + ms(201)), None);
         // a reaction without a spot appears where the laser is
         s.set_laser(Some((9, 9)), t + ms(300));
-        s.react(Reaction::Yes, None);
+        s.react(15, None);
         b.on_frame(t + ms(300), &s.poll(t + ms(300)).unwrap());
         assert_eq!(b.reactions(t + ms(300))[0].at, (9, 9));
     }
@@ -389,7 +360,7 @@ mod tests {
         let mut s = Sender::new(0);
         let mut b = Board::default();
         for i in 0..60u64 {
-            s.react(Reaction::Heart, Some((i as u16, 0)));
+            s.react(7, Some((i as u16, 0)));
             if let Some(f) = s.poll(t + ms(30 * i)) {
                 b.on_frame(t + ms(30 * i), &f);
             }

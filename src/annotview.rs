@@ -1,8 +1,8 @@
 // Laser pointer and reactions on the host's screen (v0.11.8). A see-through, click-through, always-on-top window
 // over the streamed picture that the capture does not see (WDA_EXCLUDEFROMCAPTURE: the viewer draws their own
-// dot, and a captured copy would come back late and doubled). Drawn with Direct2D (stickers.rs bitmaps)
+// dot, and a captured copy would come back late and doubled). Drawn with Direct2D (stickers.rs frames)
 // into a bitmap handed to UpdateLayeredWindow; the window only covers what is drawn, and hides when idle.
-use crate::annot::{self, Board, Reaction};
+use crate::annot::{self, Board};
 use crate::inputhost::{self, Region};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,8 +67,6 @@ pub fn load_enabled() -> bool {
 
 struct Gfx {
     rt: ID2D1DCRenderTarget,
-    /// The stickers (stickers.rs order) as bitmaps of this render target.
-    stickers: Vec<ID2D1Bitmap>,
     dc: HDC,
     bmp: HBITMAP,
     cap: (i32, i32),
@@ -137,13 +135,14 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
         };
         let laser = b.laser(now).and_then(|p| inputhost::region_point(reg, p));
         // (sticker, centre, scale, opacity)
-        let items: Vec<(usize, (f32, f32), f32, f32)> = b
+        let items: Vec<(usize, (f32, f32), f32, f32, Duration)> = b
             .reactions(now)
             .iter()
             .filter_map(|s| {
                 let (x, y) = inputhost::region_point(reg, s.at)?;
-                let (rise, scale, alpha) = annot::motion(now.saturating_duration_since(s.born));
-                Some((s.kind.index(), (x as f32 + s.lane as f32 * STICKER * 0.7, y as f32 - rise * STICKER), scale, alpha))
+                let age = now.saturating_duration_since(s.born);
+                let (rise, scale, alpha) = annot::motion(age);
+                Some((s.sticker as usize, (x as f32 + s.lane as f32 * STICKER * 0.7, y as f32 - rise * STICKER), scale, alpha, age))
             })
             .collect();
         drop(b);
@@ -162,7 +161,7 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
         if let Some((x, y)) = laser {
             grow(x as f32, y as f32, LASER_R + 4.0);
         }
-        for (_, (x, y), _, _) in &items {
+        for (_, (x, y), _, _, _) in &items {
             grow(*x, *y, STICKER * 0.55);
         }
         let (l, t) = (bb.0.floor() as i32 - PAD, bb.1.floor() as i32 - PAD);
@@ -221,13 +220,6 @@ fn make_gfx(w: i32, h: i32) -> Result<Gfx> {
             minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
         };
         let rt = d2d.CreateDCRenderTarget(&props)?;
-        let mut stickers = Vec::new();
-        for i in 0..crate::stickers::COUNT {
-            let img = crate::stickers::get(i, STICKER as i32);
-            let bp = D2D1_BITMAP_PROPERTIES { pixelFormat: fmt, dpiX: 96.0, dpiY: 96.0 };
-            let size = D2D_SIZE_U { width: img.size as u32, height: img.size as u32 };
-            stickers.push(rt.CreateBitmap(size, Some(img.px.as_ptr() as *const core::ffi::c_void), img.size as u32 * 4, &bp)?);
-        }
         let dc = CreateCompatibleDC(None);
         let bi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -244,22 +236,31 @@ fn make_gfx(w: i32, h: i32) -> Result<Gfx> {
         let mut bits = std::ptr::null_mut();
         let bmp = CreateDIBSection(Some(dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0)?;
         SelectObject(dc, bmp.into());
-        Ok(Gfx { rt, stickers, dc, bmp, cap: (w, h) })
+        Ok(Gfx { rt, dc, bmp, cap: (w, h) })
     }
 }
 
-fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, items: &[(usize, (f32, f32), f32, f32)]) -> Result<()> {
+fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, items: &[(usize, (f32, f32), f32, f32, Duration)]) -> Result<()> {
     let rt = &g.rt;
     unsafe {
         rt.BindDC(g.dc, &RECT { left: 0, top: 0, right: w, bottom: h })?;
         rt.BeginDraw();
         rt.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
         let (ox, oy) = (l as f32, t as f32);
-        for (i, (x, y), scale, alpha) in items {
+        let bp = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        for (i, (x, y), scale, alpha, age) in items {
+            // The sticker moves: this moment's frame.
+            let img = crate::stickers::get(*i, STICKER as i32, *age);
+            let size = D2D_SIZE_U { width: img.size as u32, height: img.size as u32 };
+            let bmp = rt.CreateBitmap(size, Some(img.px.as_ptr() as *const core::ffi::c_void), img.size as u32 * 4, &bp)?;
             let (x, y) = (x - ox, y - oy);
             let r = STICKER * scale / 2.0;
             let dst = D2D_RECT_F { left: x - r, top: y - r, right: x + r, bottom: y + r };
-            rt.DrawBitmap(&g.stickers[*i], Some(&dst), *alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+            rt.DrawBitmap(&bmp, Some(&dst), *alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
         }
         if let Some((x, y)) = laser {
             let (x, y) = (x as f32 - ox, y as f32 - oy);
@@ -286,10 +287,10 @@ pub fn demo(region: Region) {
         let f = t0.elapsed().as_secs_f32() / 7.0;
         s.set_laser(Some(((8000.0 + f * 49000.0) as u16, (32768.0 + (f * 12.0).sin() * 12000.0) as u16)), now);
         if next_r < 4 && t0.elapsed() > Duration::from_millis(600 + 700 * next_r as u64) {
-            s.react(Reaction::ORDER[next_r], None);
+            s.react(crate::stickers::FAVORITES[next_r] as u8, None);
             next_r += 1;
         } else if next_r >= 4 && next_r < 14 && t0.elapsed() > Duration::from_millis(3600 + 120 * (next_r - 4) as u64) {
-            s.react(Reaction::Heart, Some((20000 + 1500 * (next_r - 4) as u16, 20000)));
+            s.react((next_r % crate::stickers::count()) as u8, Some((20000 + 1500 * (next_r - 4) as u16, 20000)));
             next_r += 1;
         }
         if let Some(fr) = s.poll(now) {

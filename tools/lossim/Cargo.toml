@@ -6,6 +6,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+zstd = "0.14"
 anyhow = "1"
 base64 = "0.22"
 chacha20poly1305 = "0.11.0"

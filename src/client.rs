@@ -336,15 +336,14 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
     if std::env::var("SS_ANNOT_SCRIPT").is_ok() {
         let (inp, sh) = (input.clone(), sh.clone());
         std::thread::spawn(move || {
-            use crate::annot::Reaction;
             let t0 = Instant::now();
-            let all = [Reaction::Laugh, Reaction::Heart, Reaction::Yes, Reaction::No];
+            let all = crate::stickers::FAVORITES;
             while sh.running.load(Ordering::Relaxed) && t0.elapsed() < Duration::from_secs(12) {
                 let a = t0.elapsed().as_secs_f64();
                 inp.laser(Some(((32768.0 + a.cos() * 16000.0) as u16, (32768.0 + a.sin() * 16000.0) as u16)));
                 let k = (a / 2.0) as usize;
                 if a > 1.0 && (a - 1.0) % 2.0 < 0.02 && k < 5 {
-                    inp.react(all[(k + 3) % 4], if k % 2 == 0 { Some((20000, 20000)) } else { None });
+                    inp.react(all[(k + 3) % 4] as u8, if k % 2 == 0 { Some((20000, 20000)) } else { None });
                 }
                 std::thread::sleep(Duration::from_millis(16));
             }
@@ -1032,6 +1031,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         laser: false,
         toast: None,
         armed: None,
+        picker: false,
         pops: Vec::new(),
     };
     event_loop.run_app(&mut app)?;
@@ -1094,6 +1094,8 @@ struct App {
     toast: Option<(String, Instant)>,
     /// The sticker picked in the bar: it rides on the pointer, each click on the picture sends it there.
     armed: Option<usize>,
+    /// The sticker picker above the bar is open.
+    picker: bool,
     /// Stickers sent with a click, flying up here as they do on the host's screen (when, where, which).
     pops: Vec<(Instant, (i32, i32), usize)>,
 }
@@ -1253,7 +1255,6 @@ impl App {
 
     /// L (laser) and 1-4 (reactions) by their place on the keyboard, whatever the layout. True: handled.
     fn annot_key(&mut self, ev: &winit::event::KeyEvent) -> bool {
-        use crate::annot::Reaction;
         use winit::keyboard::{KeyCode, PhysicalKey};
         let PhysicalKey::Code(k) = ev.physical_key else { return false };
         let r = match k {
@@ -1270,27 +1271,27 @@ impl App {
             KeyCode::Digit4 | KeyCode::Numpad4 => 3,
             _ => return false,
         };
-        self.send_sticker(Reaction::ORDER[r]);
+        self.send_sticker(crate::stickers::FAVORITES[r]);
         true
     }
 
     /// Sends a sticker to where the pointer is on the picture (the corner when it is off the window) and shows
     /// it flying here too: the host's copy is not in the stream.
-    fn send_sticker(&mut self, r: crate::annot::Reaction) {
+    fn send_sticker(&mut self, id: usize) {
         let inside = self.window.as_ref().is_some_and(|w| {
             let s = w.inner_size();
             self.cursor.0 >= 0 && self.cursor.1 >= 0 && self.cursor.0 < s.width as i32 && self.cursor.1 < s.height as i32
         });
         let at = inside.then(|| self.picture_spot(winit::dpi::PhysicalPosition::new(self.cursor.0 as f64, self.cursor.1 as f64))).flatten();
-        self.input.react(r, at);
+        self.input.react(id as u8, at);
         if at.is_some() {
             self.pops.retain(|p| p.0.elapsed() < crate::annot::REACTION_LIFE);
             if self.pops.len() >= crate::annot::MAX_ACTIVE {
                 self.pops.remove(0);
             }
-            self.pops.push((Instant::now(), self.cursor, r.index()));
+            self.pops.push((Instant::now(), self.cursor, id));
         } else {
-            self.toast = Some((format!("Отправлено: {}", r.name()), Instant::now()));
+            self.toast = Some((format!("Отправлено: {}", crate::stickers::name(id)), Instant::now()));
         }
         self.redraw();
     }
@@ -1304,7 +1305,7 @@ impl App {
             }
         }
         if let Some(i) = self.armed {
-            let name = crate::annot::Reaction::ORDER[i].name();
+            let name = crate::stickers::name(i);
             return Some((format!("Стикер «{name}»: кликайте по картинке — он появится у показывающего · ПКМ или Esc — убрать"), 0x00_3E_CF_8E, 0.9));
         }
         if self.laser && !self.captured {
@@ -1363,7 +1364,7 @@ impl App {
     }
 
     fn overlay_active(&self) -> bool {
-        self.pad_panel || self.captured || self.hint().is_some() || self.laser || self.pops.iter().any(|p| p.0.elapsed() < crate::annot::REACTION_LIFE)
+        self.pad_panel || self.captured || self.hint().is_some() || self.laser || self.picker || self.armed.is_some() || self.pops.iter().any(|p| p.0.elapsed() < crate::annot::REACTION_LIFE)
     }
 
     fn save_volume(&self) {
@@ -1386,7 +1387,7 @@ impl App {
             || self.hover != Hit::Outside
             || crate::guilogic::bar_opacity(self.last_move.elapsed().as_millis()) > 0.05;
         self.hover = match self.bar_geometry() {
-            Some(b) if visible => b.hit(self.cursor.0, self.cursor.1),
+            Some(b) if visible => b.hit_with(self.cursor.0, self.cursor.1, if self.picker { crate::stickers::count() } else { 0 }),
             _ => Hit::Outside,
         };
     }
@@ -1510,8 +1511,9 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
                 match event.logical_key {
                     Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
-                    Key::Named(NamedKey::Escape) if self.armed.is_some() => {
+                    Key::Named(NamedKey::Escape) if self.armed.is_some() || self.picker => {
                         self.armed = None;
+                        self.picker = false;
                         self.redraw();
                     }
                     Key::Named(NamedKey::Escape) => {
@@ -1558,7 +1560,7 @@ impl ApplicationHandler<UserEv> for App {
             }
             // Right click: show the bar (and keep it up a little longer).
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
-                if self.armed.take().is_some() {
+                if self.armed.take().is_some() | std::mem::take(&mut self.picker) {
                     self.redraw();
                     return;
                 }
@@ -1590,9 +1592,13 @@ impl ApplicationHandler<UserEv> for App {
                 // A click on the bar belongs to the bar (and does not count towards the double click).
                 self.set_hover();
                 match self.hover {
+                    Hit::Outside if self.picker => {
+                        // A click past the open picker just closes it.
+                        self.picker = false;
+                        self.redraw();
+                    }
                     Hit::Outside if self.armed.is_some() => {
-                        let r = crate::annot::Reaction::ORDER[self.armed.unwrap_or(0)];
-                        self.send_sticker(r);
+                        self.send_sticker(self.armed.unwrap_or(0));
                         self.last_click = None;
                     }
                     Hit::Outside if self.ctl_available() && self.input.kbm_active() => {
@@ -1629,8 +1635,18 @@ impl ApplicationHandler<UserEv> for App {
                             Hit::Fullscreen => self.toggle_fullscreen(),
                             Hit::Control => self.toggle_control(),
                             Hit::React(i) => {
-                                self.armed = if self.armed == Some(i) { None } else { Some(i) };
+                                let id = crate::stickers::FAVORITES[i];
+                                self.armed = if self.armed == Some(id) { None } else { Some(id) };
+                                self.picker = false;
                                 if self.armed.is_some() && self.captured {
+                                    self.set_capture(false);
+                                }
+                            }
+                            Hit::More => self.picker = !self.picker,
+                            Hit::Pick(id) => {
+                                self.armed = Some(id);
+                                self.picker = false;
+                                if self.captured {
                                     self.set_capture(false);
                                 }
                             }
@@ -1734,7 +1750,7 @@ impl App {
             buf[(oy + ph) * ww..].fill(0);
         }
         drop(p);
-        let opacity = if self.drag || self.hover != Hit::Outside {
+        let opacity = if self.drag || self.picker || self.hover != Hit::Outside {
             1.0
         } else {
             crate::guilogic::bar_opacity(self.last_move.elapsed().as_millis())
@@ -1753,6 +1769,7 @@ impl App {
                 time: self.started.elapsed().as_secs_f32(),
                 ctl: ctl.map(|(on, allowed, pads, pad_ok, kbm_ok)| bar::Ctl { on, allowed, pads: pads as u8, captured: self.captured, pad_ok, kbm_ok }),
                 armed: self.armed,
+                picker: self.picker,
             };
             let geom = Bar::with_control(ww as i32, wh as i32, sc, ctl.is_some());
             bar::draw(&mut buf, ww as i32, wh as i32, &geom, &st);
@@ -1782,13 +1799,13 @@ impl App {
             for (t, (x, y), i) in &self.pops {
                 let (rise, scale, alpha) = crate::annot::motion(t.elapsed());
                 let size = (big as f32 * scale) as i32;
-                let img = crate::stickers::get(*i, size);
+                let img = crate::stickers::get(*i, size, t.elapsed());
                 crate::stickers::blit(ob.px, ob.w, ob.h, *x, *y - (rise * big as f32) as i32, size, &img, alpha);
             }
             // The picked sticker rides on the pointer (over the picture; over the bar the arrow is back).
             if let (Some(i), false, Hit::Outside) = (self.armed, self.captured, self.hover) {
                 let size = 56 * sc;
-                let img = crate::stickers::get(i, size);
+                let img = crate::stickers::get(i, size, self.started.elapsed());
                 crate::stickers::blit(ob.px, ob.w, ob.h, self.cursor.0, self.cursor.1, size, &img, 1.0);
             }
             if let Some((text, dot, a)) = hint.as_ref() {
@@ -1858,7 +1875,8 @@ pub fn overlay_preview(out: &std::path::Path, panel: bool, on: bool) -> std::io:
         opacity: 1.0,
         time: 1.0,
         ctl: Some(bar::Ctl { on, allowed: true, pads: 2, captured: on && kbm_ok, pad_ok, kbm_ok }),
-        armed: Some(1),
+        armed: Some(crate::stickers::FAVORITES[1]),
+        picker: panel,
     };
     let geom = Bar::with_control(ww as i32, wh as i32, 1, true);
     bar::draw(&mut buf, ww as i32, wh as i32, &geom, &st);

@@ -16,8 +16,12 @@ pub enum Hit {
     Stop,
     /// The "Управление" switch (remote control).
     Control,
-    /// Reaction sticker i (stickers.rs order).
+    /// Quick sticker button i (stickers::FAVORITES[i]).
     React(usize),
+    /// The button that opens the sticker picker.
+    More,
+    /// A sticker in the open picker (its number in stickers.rs).
+    Pick(usize),
 }
 
 const PAD: i32 = 12;
@@ -33,10 +37,16 @@ const MIN_TRACK: i32 = 40;
 /// Remote-control button: icon + count + label, or icon + count only in a narrow window.
 const CTL_W: i32 = 150;
 const CTL_W_COMPACT: i32 = 76;
-/// Reaction stickers right of the volume: buttons and the space between them.
+/// Reaction stickers right of the volume: 4 quick ones + the picker button, and the space between them.
 const RBTN: i32 = 40;
 const RGAP: i32 = 2;
-const REACT_W: i32 = 4 * RBTN + 3 * RGAP;
+const RN: i32 = 5;
+const REACT_W: i32 = RN * RBTN + (RN - 1) * RGAP;
+/// The sticker picker above the bar: columns, cell size, sticker size, padding.
+const PICK_COLS: i32 = 6;
+const PICK_CELL: i32 = 52;
+const PICK_IMG: i32 = 44;
+const PICK_PAD: i32 = 10;
 
 /// Where the bar is and how big (integer UI scale `s`: 1 normal, 2 on 200% DPI).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -84,7 +94,7 @@ impl Bar {
         (x, self.btn_y(), self.ctl_w * self.s, BTN * self.s)
     }
 
-    /// Reaction sticker button i (0..4), between the percent and the control button / lamp.
+    /// Sticker button i (0..4 quick ones, 4 = the picker), between the percent and the control button / lamp.
     pub fn react_rect(&self, i: usize) -> (i32, i32, i32, i32) {
         if !self.react {
             return (0, 0, 0, 0);
@@ -141,6 +151,36 @@ impl Bar {
         }
         clamp_level(v)
     }
+    /// The sticker picker panel for `n` stickers: above the bar, right edge on the picker button's, inside the window.
+    pub fn picker_rect(&self, n: usize) -> (i32, i32, i32, i32) {
+        let s = self.s;
+        let rows = (n as i32 + PICK_COLS - 1) / PICK_COLS;
+        let (w, h) = ((PICK_COLS * PICK_CELL + 2 * PICK_PAD) * s, (rows * PICK_CELL + 2 * PICK_PAD) * s);
+        let m = self.react_rect(RN as usize - 1);
+        let x = (m.0 + m.2 - w).max(8 * s);
+        (x, self.y - h - 8 * s, w, h)
+    }
+
+    /// Cell of sticker i in the picker.
+    pub fn picker_cell(&self, n: usize, i: usize) -> (i32, i32, i32, i32) {
+        let (x, y, _, _) = self.picker_rect(n);
+        let s = self.s;
+        let (c, r) = (i as i32 % PICK_COLS, i as i32 / PICK_COLS);
+        (x + (PICK_PAD + c * PICK_CELL) * s, y + (PICK_PAD + r * PICK_CELL) * s, PICK_CELL * s, PICK_CELL * s)
+    }
+
+    /// Like `hit`, with the picker of `picker` stickers open (0: closed). Inside the panel but between cells
+    /// counts as the bar, so a click there does not fall through to the picture.
+    pub fn hit_with(&self, px: i32, py: i32, picker: usize) -> Hit {
+        if picker > 0 && self.react {
+            let inside = |r: (i32, i32, i32, i32)| px >= r.0 && px < r.0 + r.2 && py >= r.1 && py < r.1 + r.3;
+            if inside(self.picker_rect(picker)) {
+                return (0..picker).find(|&i| inside(self.picker_cell(picker, i))).map_or(Hit::Inside, Hit::Pick);
+            }
+        }
+        self.hit(px, py)
+    }
+
     pub fn hit(&self, px: i32, py: i32) -> Hit {
         if px < self.x || py < self.y || px >= self.x + self.w || py >= self.y + self.h {
             return Hit::Outside;
@@ -158,8 +198,8 @@ impl Bar {
         if self.ctl_w > 0 && inside(self.ctl_rect()) {
             return Hit::Control;
         }
-        if let Some(i) = (0..crate::stickers::COUNT).find(|&i| self.react && inside(self.react_rect(i))) {
-            return Hit::React(i);
+        if let Some(i) = (0..RN as usize).find(|&i| self.react && inside(self.react_rect(i))) {
+            return if i == RN as usize - 1 { Hit::More } else { Hit::React(i) };
         }
         let (x0, x1, yc) = self.track();
         let pad = 10 * self.s;
@@ -187,8 +227,10 @@ pub struct State {
     pub time: f32,
     /// Remote control (None: the host is older and has none).
     pub ctl: Option<Ctl>,
-    /// The sticker picked to be placed with a click (it rides on the pointer).
+    /// The sticker picked to be placed with a click (it rides on the pointer), its number in stickers.rs.
     pub armed: Option<usize>,
+    /// The sticker picker is open.
+    pub picker: bool,
 }
 
 /// The remote-control button's state.
@@ -447,18 +489,47 @@ pub fn draw(buf: &mut [u32], w: i32, h: i32, b: &Bar, st: &State) {
         c.digits(b.text_x(), b.y + (b.h - 15 * s) / 2, 3 * s, &pct, if dead { DIM } else { FG }, 1.0);
     }
 
-    // reaction stickers
+    // reaction stickers: the quick ones (they move) and the picker button (a 2x2 grid of little squares)
+    let t = std::time::Duration::from_secs_f32(st.time.max(0.0));
     if b.react {
-        for i in 0..crate::stickers::COUNT {
+        for (i, &id) in crate::stickers::FAVORITES.iter().enumerate() {
             let r = b.react_rect(i);
-            if st.armed == Some(i) {
+            if st.armed == Some(id) {
                 c.round(r.0, r.1, r.2, r.3, 12 * s, ACCENT, 0.55);
             } else {
                 hov(&mut c, r, st.hover == Hit::React(i));
             }
             let size = 34 * s;
-            let img = crate::stickers::get(i, size);
+            let img = crate::stickers::get(id, size, t);
             crate::stickers::blit(c.buf, c.w, c.h, r.0 + r.2 / 2, r.1 + r.3 / 2, size, &img, c.k);
+        }
+        let r = b.react_rect(RN as usize - 1);
+        if st.picker {
+            c.round(r.0, r.1, r.2, r.3, 12 * s, ACCENT, 0.55);
+        } else {
+            hov(&mut c, r, st.hover == Hit::More);
+        }
+        let q = 7 * s;
+        let (gx, gy) = (r.0 + r.2 / 2 - q - s, r.1 + r.3 / 2 - q - s);
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            c.round(gx + dx * (q + 2 * s), gy + dy * (q + 2 * s), q, q, 2 * s, FG, 0.9);
+        }
+        if st.picker {
+            let n = crate::stickers::count();
+            let pr = b.picker_rect(n);
+            c.round(pr.0, pr.1, pr.2, pr.3, 14 * s, BG, 0.94);
+            c.outline(pr.0, pr.1, pr.2, pr.3, 14 * s, s.max(1), 0x00_8F_A6_C8, 0.22);
+            for id in 0..n {
+                let r = b.picker_cell(n, id);
+                if st.armed == Some(id) {
+                    c.round(r.0 + s, r.1 + s, r.2 - 2 * s, r.3 - 2 * s, 10 * s, ACCENT, 0.55);
+                } else {
+                    hov(&mut c, (r.0 + s, r.1 + s, r.2 - 2 * s, r.3 - 2 * s), st.hover == Hit::Pick(id));
+                }
+                let size = PICK_IMG * s;
+                let img = crate::stickers::get(id, size, t);
+                crate::stickers::blit(c.buf, c.w, c.h, r.0 + r.2 / 2, r.1 + r.3 / 2, size, &img, c.k);
+            }
         }
     }
 
@@ -551,7 +622,7 @@ mod tests {
     use super::*;
 
     fn st() -> State {
-        State { level: 0.75, muted: false, has_audio: true, net: Some(0), fullscreen: false, hover: Hit::Outside, opacity: 1.0, time: 0.4, ctl: None, armed: None }
+        State { level: 0.75, muted: false, has_audio: true, net: Some(0), fullscreen: false, hover: Hit::Outside, opacity: 1.0, time: 0.4, ctl: None, armed: None, picker: false }
     }
 
     #[test]
@@ -607,15 +678,32 @@ mod tests {
     }
 
     #[test]
+    fn the_picker_sits_above_the_bar_inside_the_window_and_every_sticker_is_hit() {
+        for (ww, wh, s) in [(1280, 720, 1), (1000, 600, 1), (3840, 2160, 2)] {
+            let b = Bar::with_control(ww, wh, s, true);
+            assert!(b.react);
+            let n = 18;
+            let p = b.picker_rect(n);
+            assert!(p.0 >= 0 && p.0 + p.2 <= ww && p.1 >= 0 && p.1 + p.3 <= b.y, "{p:?}");
+            for i in 0..n {
+                let r = b.picker_cell(n, i);
+                assert_eq!(b.hit_with(r.0 + r.2 / 2, r.1 + r.3 / 2, n), Hit::Pick(i));
+                assert_eq!(b.hit(r.0 + r.2 / 2, r.1 + r.3 / 2), Hit::Outside, "closed: the picture");
+            }
+            assert_eq!(b.hit_with(p.0 + 2, p.1 + 2, n), Hit::Inside, "the panel's edge is not the picture");
+        }
+    }
+
+    #[test]
     fn sticker_buttons_sit_between_the_percent_and_the_control_and_are_hit() {
         for (ww, ctl) in [(1280, true), (1280, false), (1920, true)] {
             let b = Bar::with_control(ww, 720, 1, ctl);
             assert!(b.react);
             let (_, x1, _) = b.track();
             assert!(b.text_x() > x1);
-            for i in 0..4 {
+            for i in 0..5 {
                 let r = b.react_rect(i);
-                assert_eq!(b.hit(r.0 + r.2 / 2, r.1 + r.3 / 2), Hit::React(i));
+                assert_eq!(b.hit(r.0 + r.2 / 2, r.1 + r.3 / 2), if i == 4 { Hit::More } else { Hit::React(i) });
                 assert!(r.0 >= b.text_x() + TEXT_W);
                 assert!(r.0 + r.2 <= if ctl { b.ctl_rect().0 } else { b.lamp_left() });
             }

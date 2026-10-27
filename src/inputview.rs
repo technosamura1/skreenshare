@@ -157,8 +157,8 @@ impl ViewInput {
     }
 
     /// A sticker for the host's screen, at a spot of the picture (None: where the laser is, or a corner).
-    pub fn react(&self, r: crate::annot::Reaction, at: Option<(u16, u16)>) {
-        self.annot.lock().unwrap().react(r, at);
+    pub fn react(&self, sticker: u8, at: Option<(u16, u16)>) {
+        self.annot.lock().unwrap().react(sticker, at);
     }
 
     pub fn spawn(self: &Arc<Self>, sock: Arc<UdpSocket>, host: SocketAddr, token: u32, alive: impl Fn() -> bool + Send + 'static) {
