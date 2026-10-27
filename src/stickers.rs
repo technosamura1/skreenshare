@@ -6,8 +6,30 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// ДА, НЕТ, смех, сердечко: the bar's quick buttons and keys 1-4.
+/// ДА, НЕТ, смех, сердечко: the bar's quick buttons and keys 1-4 until the viewer pins others.
 pub const FAVORITES: [usize; 4] = [15, 16, 17, 7];
+
+/// Pins sticker `id` as the first quick one: the others move one place right and the last one drops off
+/// (one already among them just moves to the front).
+pub fn pin(favs: [usize; 4], id: usize) -> [usize; 4] {
+    let mut rest = favs.into_iter().filter(|&f| f != id);
+    let mut out = [id; 4];
+    for o in out.iter_mut().skip(1) {
+        *o = rest.next().unwrap_or(id);
+    }
+    out
+}
+
+/// The quick stickers as saved in the settings ("15,16,17,7"); None when missing or not 4 known stickers.
+pub fn parse_favs(s: &str, count: usize) -> Option<[usize; 4]> {
+    let v: Vec<usize> = s.split(',').map(|x| x.trim().parse().ok()).collect::<Option<_>>()?;
+    let a: [usize; 4] = v.try_into().ok()?;
+    a.iter().all(|&i| i < count).then_some(a)
+}
+
+pub fn favs_text(f: [usize; 4]) -> String {
+    f.map(|i| i.to_string()).join(",")
+}
 const SIZES: [i32; 2] = [48, 128];
 
 pub struct Img {
@@ -157,6 +179,17 @@ mod tests {
         let see_through = (0..count()).filter(|&id| get(id, 128, Duration::ZERO).px.chunks(4).any(|p| p[3] == 0)).count();
         assert!(see_through >= count() - 3, "most stickers have a transparent background: {see_through}");
         assert_eq!([name(15), name(16), name(17), name(7), name(0)], ["ДА", "НЕТ", "смех", "сердечко", "стикер"]);
+    }
+
+    #[test]
+    fn pinning_pushes_the_others_right_and_drops_the_last() {
+        assert_eq!(pin([15, 16, 17, 7], 3), [3, 15, 16, 17]);
+        assert_eq!(pin([15, 16, 17, 7], 17), [17, 15, 16, 7], "already there: to the front, nothing lost");
+        assert_eq!(pin([15, 16, 17, 7], 15), [15, 16, 17, 7]);
+        assert_eq!(parse_favs(&favs_text([3, 15, 16, 17]), 18), Some([3, 15, 16, 17]));
+        assert_eq!(parse_favs("1,2,3", 18), None);
+        assert_eq!(parse_favs("1,2,3,99", 18), None);
+        assert_eq!(parse_favs("a,b,c,d", 18), None);
     }
 
     #[test]

@@ -1032,6 +1032,10 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         toast: None,
         armed: None,
         picker: false,
+        favs: crate::volume::read_settings()
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("fav_stickers=").and_then(|v| crate::stickers::parse_favs(v, crate::stickers::count())))
+            .unwrap_or(crate::stickers::FAVORITES),
         pops: Vec::new(),
     };
     event_loop.run_app(&mut app)?;
@@ -1096,6 +1100,8 @@ struct App {
     armed: Option<usize>,
     /// The sticker picker above the bar is open.
     picker: bool,
+    /// The quick stickers in the bar and on keys 1-4 (pinned with a right click in the picker, remembered).
+    favs: [usize; 4],
     /// Stickers sent with a click, flying up here as they do on the host's screen (when, where, which).
     pops: Vec<(Instant, (i32, i32), usize)>,
 }
@@ -1271,7 +1277,7 @@ impl App {
             KeyCode::Digit4 | KeyCode::Numpad4 => 3,
             _ => return false,
         };
-        self.send_sticker(crate::stickers::FAVORITES[r]);
+        self.send_sticker(self.favs[r]);
         true
     }
 
@@ -1303,6 +1309,9 @@ impl App {
             if at.elapsed() < Duration::from_millis(1500) {
                 return Some((t.clone(), 0x00_3E_CF_8E, 1.0));
             }
+        }
+        if self.picker {
+            return Some(("Стикеры: ЛКМ — выбрать · ПКМ — в избранное (встанет первым на панели)".into(), 0x00_3E_CF_8E, 0.9));
         }
         if let Some(i) = self.armed {
             let name = crate::stickers::name(i);
@@ -1560,6 +1569,17 @@ impl ApplicationHandler<UserEv> for App {
             }
             // Right click: show the bar (and keep it up a little longer).
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                // Right click on a sticker in the picker: it becomes the first quick one.
+                if self.picker {
+                    self.set_hover();
+                    if let Hit::Pick(id) = self.hover {
+                        self.favs = crate::stickers::pin(self.favs, id);
+                        crate::volume::write_setting("fav_stickers", &crate::stickers::favs_text(self.favs));
+                        self.toast = Some(("Стикер добавлен в избранное (первый на панели, клавиша 1)".into(), Instant::now()));
+                        self.redraw();
+                        return;
+                    }
+                }
                 if self.armed.take().is_some() | std::mem::take(&mut self.picker) {
                     self.redraw();
                     return;
@@ -1607,6 +1627,11 @@ impl ApplicationHandler<UserEv> for App {
                     }
                     Hit::Outside => {
                         let now = Instant::now();
+                        // A click on the picture puts the bar away at once (no waiting for it to fade).
+                        if self.bar_drawn {
+                            self.last_move = now - Duration::from_secs(60);
+                            self.redraw();
+                        }
                         if self.last_click.is_some_and(|t| now.duration_since(t) < Duration::from_millis(400)) {
                             self.toggle_fullscreen();
                             self.last_click = None;
@@ -1635,7 +1660,7 @@ impl ApplicationHandler<UserEv> for App {
                             Hit::Fullscreen => self.toggle_fullscreen(),
                             Hit::Control => self.toggle_control(),
                             Hit::React(i) => {
-                                let id = crate::stickers::FAVORITES[i];
+                                let id = self.favs[i];
                                 self.armed = if self.armed == Some(id) { None } else { Some(id) };
                                 self.picker = false;
                                 if self.armed.is_some() && self.captured {
@@ -1770,6 +1795,7 @@ impl App {
                 ctl: ctl.map(|(on, allowed, pads, pad_ok, kbm_ok)| bar::Ctl { on, allowed, pads: pads as u8, captured: self.captured, pad_ok, kbm_ok }),
                 armed: self.armed,
                 picker: self.picker,
+                favs: self.favs,
             };
             let geom = Bar::with_control(ww as i32, wh as i32, sc, ctl.is_some());
             bar::draw(&mut buf, ww as i32, wh as i32, &geom, &st);
@@ -1877,6 +1903,7 @@ pub fn overlay_preview(out: &std::path::Path, panel: bool, on: bool) -> std::io:
         ctl: Some(bar::Ctl { on, allowed: true, pads: 2, captured: on && kbm_ok, pad_ok, kbm_ok }),
         armed: Some(crate::stickers::FAVORITES[1]),
         picker: panel,
+        favs: crate::stickers::FAVORITES,
     };
     let geom = Bar::with_control(ww as i32, wh as i32, 1, true);
     bar::draw(&mut buf, ww as i32, wh as i32, &geom, &st);

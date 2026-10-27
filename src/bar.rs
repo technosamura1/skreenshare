@@ -231,6 +231,8 @@ pub struct State {
     pub armed: Option<usize>,
     /// The sticker picker is open.
     pub picker: bool,
+    /// The quick stickers (numbers in stickers.rs), left to right.
+    pub favs: [usize; 4],
 }
 
 /// The remote-control button's state.
@@ -492,7 +494,7 @@ pub fn draw(buf: &mut [u32], w: i32, h: i32, b: &Bar, st: &State) {
     // reaction stickers: the quick ones (they move) and the picker button (a 2x2 grid of little squares)
     let t = std::time::Duration::from_secs_f32(st.time.max(0.0));
     if b.react {
-        for (i, &id) in crate::stickers::FAVORITES.iter().enumerate() {
+        for (i, &id) in st.favs.iter().enumerate() {
             let r = b.react_rect(i);
             if st.armed == Some(id) {
                 c.round(r.0, r.1, r.2, r.3, 12 * s, ACCENT, 0.55);
@@ -622,7 +624,7 @@ mod tests {
     use super::*;
 
     fn st() -> State {
-        State { level: 0.75, muted: false, has_audio: true, net: Some(0), fullscreen: false, hover: Hit::Outside, opacity: 1.0, time: 0.4, ctl: None, armed: None, picker: false }
+        State { level: 0.75, muted: false, has_audio: true, net: Some(0), fullscreen: false, hover: Hit::Outside, opacity: 1.0, time: 0.4, ctl: None, armed: None, picker: false, favs: crate::stickers::FAVORITES }
     }
 
     #[test]
