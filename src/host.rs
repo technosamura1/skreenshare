@@ -220,14 +220,13 @@ enum Cap {
     Monitor(Box<WindowCapturer>),
 }
 
-/// The whole monitor: on Windows 10 through Windows Graphics Capture when the pointer/sticker overlay is on (so it
+/// The whole monitor: through Windows Graphics Capture when the pointer/sticker overlay is on (so it
 /// stays out of the stream), else (or when that fails) Desktop Duplication as always.
 fn open_screen(monitor: &MonitorInfo) -> Result<Cap> {
-    // Windows 11 leaves such windows out of Desktop Duplication too (checked here, build 26300); Windows 10 does
-    // not (a friend saw the stickers in his stream). SS_CAPTURE=wgc|dd forces one way.
+    // Desktop Duplication leaves such windows out only on some Windows builds (yes on 11 build 26300 here; a friend
+    // still saw the stickers in his stream with it), so it is never trusted with them. SS_CAPTURE=dd forces it.
     let forced = std::env::var("SS_CAPTURE").unwrap_or_default();
-    let win10 = crate::glass::build_number().is_some_and(|b| b < 22000);
-    if crate::annotview::load_enabled() && forced != "dd" && (win10 || forced == "wgc") {
+    if crate::annotview::load_enabled() && forced != "dd" {
         match WindowCapturer::new_monitor(monitor.left + monitor.width as i32 / 2, monitor.top + monitor.height as i32 / 2) {
             Ok(w) => {
                 crate::net::conn_log("захват экрана: Windows Graphics Capture (указка и стикеры не попадают в трансляцию)");
