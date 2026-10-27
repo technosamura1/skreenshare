@@ -60,6 +60,9 @@ mod sim;
 #[path = "../../../src/cues.rs"]
 #[allow(dead_code)]
 mod cues;
+#[path = "../../../src/stickers.rs"]
+#[allow(dead_code)]
+mod stickers;
 #[path = "../../../src/bar.rs"]
 #[allow(dead_code)]
 mod bar;

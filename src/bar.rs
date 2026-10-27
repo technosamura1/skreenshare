@@ -16,6 +16,8 @@ pub enum Hit {
     Stop,
     /// The "Управление" switch (remote control).
     Control,
+    /// Reaction sticker i (stickers.rs order).
+    React(usize),
 }
 
 const PAD: i32 = 12;
@@ -31,6 +33,10 @@ const MIN_TRACK: i32 = 40;
 /// Remote-control button: icon + count + label, or icon + count only in a narrow window.
 const CTL_W: i32 = 150;
 const CTL_W_COMPACT: i32 = 76;
+/// Reaction stickers right of the volume: buttons and the space between them.
+const RBTN: i32 = 40;
+const RGAP: i32 = 2;
+const REACT_W: i32 = 4 * RBTN + 3 * RGAP;
 
 /// Where the bar is and how big (integer UI scale `s`: 1 normal, 2 on 200% DPI).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -42,6 +48,8 @@ pub struct Bar {
     pub s: i32,
     /// Width of the remote-control button (0: no such button, an older host).
     pub ctl_w: i32,
+    /// The reaction stickers fit (left out in a narrow window; keys 1-4 still work).
+    pub react: bool,
 }
 
 impl Bar {
@@ -60,9 +68,11 @@ impl Bar {
         } else {
             (MAX_W + SEP + CTL_W_COMPACT, CTL_W_COMPACT)
         };
+        let react = ww >= (maxw + SEP + REACT_W + 16) * s;
+        let maxw = if react { maxw + SEP + REACT_W } else { maxw };
         let w = (maxw * s).min(ww - 16 * s).max(1);
         let h = H * s;
-        Bar { x: ((ww - w) / 2).max(0), y: (wh - h - BOTTOM_GAP * s).max(0), w, h, s, ctl_w }
+        Bar { x: ((ww - w) / 2).max(0), y: (wh - h - BOTTOM_GAP * s).max(0), w, h, s, ctl_w, react }
     }
 
     /// The remote-control button (zero-sized when there is none). Sits left of the lamp.
@@ -72,6 +82,16 @@ impl Bar {
         }
         let x = self.lamp_left() - (SEP + self.ctl_w) * self.s;
         (x, self.btn_y(), self.ctl_w * self.s, BTN * self.s)
+    }
+
+    /// Reaction sticker button i (0..4), between the percent and the control button / lamp.
+    pub fn react_rect(&self, i: usize) -> (i32, i32, i32, i32) {
+        if !self.react {
+            return (0, 0, 0, 0);
+        }
+        let right = if self.ctl_w > 0 { self.ctl_rect().0 } else { self.lamp_left() } - SEP * self.s;
+        let x = right - REACT_W * self.s + i as i32 * (RBTN + RGAP) * self.s;
+        (x, self.btn_y(), RBTN * self.s, BTN * self.s)
     }
 
     fn btn_y(&self) -> i32 {
@@ -96,7 +116,13 @@ impl Bar {
     }
     /// Percent text position (left edge).
     fn text_x(&self) -> i32 {
-        let left = if self.ctl_w > 0 { self.ctl_rect().0 - SEP * self.s } else { self.lamp_left() };
+        let left = if self.react {
+            self.react_rect(0).0 - SEP * self.s
+        } else if self.ctl_w > 0 {
+            self.ctl_rect().0 - SEP * self.s
+        } else {
+            self.lamp_left()
+        };
         left - (SEP + TEXT_W) * self.s
     }
     /// Track: x range and the y of its centre.
@@ -132,6 +158,9 @@ impl Bar {
         if self.ctl_w > 0 && inside(self.ctl_rect()) {
             return Hit::Control;
         }
+        if let Some(i) = (0..crate::stickers::COUNT).find(|&i| self.react && inside(self.react_rect(i))) {
+            return Hit::React(i);
+        }
         let (x0, x1, yc) = self.track();
         let pad = 10 * self.s;
         if px >= x0 - pad && px <= x1 + pad && (py - yc).abs() <= 16 * self.s {
@@ -158,6 +187,8 @@ pub struct State {
     pub time: f32,
     /// Remote control (None: the host is older and has none).
     pub ctl: Option<Ctl>,
+    /// The sticker picked to be placed with a click (it rides on the pointer).
+    pub armed: Option<usize>,
 }
 
 /// The remote-control button's state.
@@ -416,6 +447,21 @@ pub fn draw(buf: &mut [u32], w: i32, h: i32, b: &Bar, st: &State) {
         c.digits(b.text_x(), b.y + (b.h - 15 * s) / 2, 3 * s, &pct, if dead { DIM } else { FG }, 1.0);
     }
 
+    // reaction stickers
+    if b.react {
+        for i in 0..crate::stickers::COUNT {
+            let r = b.react_rect(i);
+            if st.armed == Some(i) {
+                c.round(r.0, r.1, r.2, r.3, 12 * s, ACCENT, 0.55);
+            } else {
+                hov(&mut c, r, st.hover == Hit::React(i));
+            }
+            let size = 34 * s;
+            let img = crate::stickers::get(i, size);
+            crate::stickers::blit(c.buf, c.w, c.h, r.0 + r.2 / 2, r.1 + r.3 / 2, size, &img, c.k);
+        }
+    }
+
     // remote control: [gamepad icon + count] and, in a wide bar, the label (the label itself is text, drawn by the
     // window code with the font; here only the shapes)
     if let Some(ct) = st.ctl {
@@ -505,7 +551,7 @@ mod tests {
     use super::*;
 
     fn st() -> State {
-        State { level: 0.75, muted: false, has_audio: true, net: Some(0), fullscreen: false, hover: Hit::Outside, opacity: 1.0, time: 0.4, ctl: None }
+        State { level: 0.75, muted: false, has_audio: true, net: Some(0), fullscreen: false, hover: Hit::Outside, opacity: 1.0, time: 0.4, ctl: None, armed: None }
     }
 
     #[test]
@@ -556,7 +602,24 @@ mod tests {
         // without the button nothing changes
         let a = Bar::new(1280, 720, 1);
         assert_eq!(a.ctl_w, 0);
-        assert_eq!(a.w, MAX_W);
+        assert_eq!(a.w, MAX_W + SEP + REACT_W, "wide window: the stickers are there");
+        assert!(!Bar::new(560, 400, 1).react, "narrow window: no stickers");
+    }
+
+    #[test]
+    fn sticker_buttons_sit_between_the_percent_and_the_control_and_are_hit() {
+        for (ww, ctl) in [(1280, true), (1280, false), (1920, true)] {
+            let b = Bar::with_control(ww, 720, 1, ctl);
+            assert!(b.react);
+            let (_, x1, _) = b.track();
+            assert!(b.text_x() > x1);
+            for i in 0..4 {
+                let r = b.react_rect(i);
+                assert_eq!(b.hit(r.0 + r.2 / 2, r.1 + r.3 / 2), Hit::React(i));
+                assert!(r.0 >= b.text_x() + TEXT_W);
+                assert!(r.0 + r.2 <= if ctl { b.ctl_rect().0 } else { b.lamp_left() });
+            }
+        }
     }
 
     #[test]
@@ -690,7 +753,7 @@ mod tests {
     #[test]
     fn scaled_bar_geometry() {
         let b = Bar::new(3840, 2160, 2);
-        assert_eq!(b.w, 1040);
+        assert_eq!(b.w, (MAX_W + SEP + REACT_W) * 2);
         assert_eq!(b.h, 112);
         assert!(matches!(b.hit((b.track().0 + b.track().1) / 2, b.track().2), Hit::Slider(_)));
     }

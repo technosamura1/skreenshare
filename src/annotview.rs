@@ -1,6 +1,6 @@
 // Laser pointer and reactions on the host's screen (v0.11.8). A see-through, click-through, always-on-top window
 // over the streamed picture that the capture does not see (WDA_EXCLUDEFROMCAPTURE: the viewer draws their own
-// dot, and a captured copy would come back late and doubled). Drawn with Direct2D + DirectWrite (colour emoji)
+// dot, and a captured copy would come back late and doubled). Drawn with Direct2D (stickers.rs bitmaps)
 // into a bitmap handed to UpdateLayeredWindow; the window only covers what is drawn, and hides when idle.
 use crate::annot::{self, Board, Reaction};
 use crate::inputhost::{self, Region};
@@ -9,9 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::{w, Result};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
-use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F};
+use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -68,8 +67,8 @@ pub fn load_enabled() -> bool {
 
 struct Gfx {
     rt: ID2D1DCRenderTarget,
-    emoji: IDWriteTextFormat,
-    label: IDWriteTextFormat,
+    /// The stickers (stickers.rs order) as bitmaps of this render target.
+    stickers: Vec<ID2D1Bitmap>,
     dc: HDC,
     bmp: HBITMAP,
     cap: (i32, i32),
@@ -77,8 +76,8 @@ struct Gfx {
 
 const PAD: i32 = 8;
 const LASER_R: f32 = 16.0;
-const EMOJI: f32 = 64.0;
-const PILL: (f32, f32) = (190.0, 72.0);
+/// Sticker size on the host's screen, px.
+const STICKER: f32 = 132.0;
 
 fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
@@ -137,13 +136,14 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
             continue;
         };
         let laser = b.laser(now).and_then(|p| inputhost::region_point(reg, p));
-        let items: Vec<(Reaction, (f32, f32), f32)> = b
+        // (sticker, centre, scale, opacity)
+        let items: Vec<(usize, (f32, f32), f32, f32)> = b
             .reactions(now)
             .iter()
             .filter_map(|s| {
                 let (x, y) = inputhost::region_point(reg, s.at)?;
-                let t = now.saturating_duration_since(s.born).as_secs_f32();
-                Some((s.kind, (x as f32 + s.lane as f32 * 46.0, y as f32 - 40.0 - t * 70.0), t))
+                let (rise, scale, alpha) = annot::motion(now.saturating_duration_since(s.born));
+                Some((s.kind.index(), (x as f32 + s.lane as f32 * STICKER * 0.7, y as f32 - rise * STICKER), scale, alpha))
             })
             .collect();
         drop(b);
@@ -156,17 +156,14 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
         last_drawn = Some(key);
         // What the window must cover.
         let mut bb = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        let mut grow = |x: f32, y: f32, rx: f32, ry: f32| {
-            bb = (bb.0.min(x - rx), bb.1.min(y - ry), bb.2.max(x + rx), bb.3.max(y + ry));
+        let mut grow = |x: f32, y: f32, r: f32| {
+            bb = (bb.0.min(x - r), bb.1.min(y - r), bb.2.max(x + r), bb.3.max(y + r));
         };
         if let Some((x, y)) = laser {
-            grow(x as f32, y as f32, LASER_R + 4.0, LASER_R + 4.0);
+            grow(x as f32, y as f32, LASER_R + 4.0);
         }
-        for (k, (x, y), _) in &items {
-            match k {
-                Reaction::Laugh | Reaction::Heart => grow(*x, *y, EMOJI * 0.8, EMOJI * 0.8),
-                _ => grow(*x, *y, PILL.0 * 0.6, PILL.1 * 0.6),
-            }
+        for (_, (x, y), _, _) in &items {
+            grow(*x, *y, STICKER * 0.55);
         }
         let (l, t) = (bb.0.floor() as i32 - PAD, bb.1.floor() as i32 - PAD);
         let (w, h) = ((bb.2.ceil() as i32 + PAD - l).max(1), (bb.3.ceil() as i32 + PAD - t).max(1));
@@ -214,22 +211,23 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRES
 fn make_gfx(w: i32, h: i32) -> Result<Gfx> {
     unsafe {
         let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+        let fmt = D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED };
         let props = D2D1_RENDER_TARGET_PROPERTIES {
             r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            pixelFormat: fmt,
             dpiX: 96.0,
             dpiY: 96.0,
             usage: D2D1_RENDER_TARGET_USAGE_NONE,
             minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
         };
         let rt = d2d.CreateDCRenderTarget(&props)?;
-        let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-        let fmt = |size: f32| -> Result<IDWriteTextFormat> {
-            let f = dw.CreateTextFormat(w!("Segoe UI Emoji"), None, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!("ru-ru"))?;
-            f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            Ok(f)
-        };
+        let mut stickers = Vec::new();
+        for i in 0..crate::stickers::COUNT {
+            let img = crate::stickers::get(i, STICKER as i32);
+            let bp = D2D1_BITMAP_PROPERTIES { pixelFormat: fmt, dpiX: 96.0, dpiY: 96.0 };
+            let size = D2D_SIZE_U { width: img.size as u32, height: img.size as u32 };
+            stickers.push(rt.CreateBitmap(size, Some(img.px.as_ptr() as *const core::ffi::c_void), img.size as u32 * 4, &bp)?);
+        }
         let dc = CreateCompatibleDC(None);
         let bi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -246,96 +244,55 @@ fn make_gfx(w: i32, h: i32) -> Result<Gfx> {
         let mut bits = std::ptr::null_mut();
         let bmp = CreateDIBSection(Some(dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0)?;
         SelectObject(dc, bmp.into());
-        Ok(Gfx { rt, emoji: fmt(EMOJI)?, label: fmt(34.0)?, dc, bmp, cap: (w, h) })
+        Ok(Gfx { rt, stickers, dc, bmp, cap: (w, h) })
     }
 }
 
-fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, items: &[(Reaction, (f32, f32), f32)]) -> Result<()> {
+fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, items: &[(usize, (f32, f32), f32, f32)]) -> Result<()> {
     let rt = &g.rt;
     unsafe {
         rt.BindDC(g.dc, &RECT { left: 0, top: 0, right: w, bottom: h })?;
         rt.BeginDraw();
         rt.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
         let (ox, oy) = (l as f32, t as f32);
-        let brush = rt.CreateSolidColorBrush(&color(1.0, 0.0, 0.0, 1.0), None)?;
-        let dot = |x: f32, y: f32, r: f32, c: D2D1_COLOR_F| {
-            brush.SetColor(&c);
-            rt.FillEllipse(&D2D1_ELLIPSE { point: windows_numerics::Vector2 { X: x, Y: y }, radiusX: r, radiusY: r }, &brush);
-        };
-        for (kind, (x, y), age) in items {
+        for (i, (x, y), scale, alpha) in items {
             let (x, y) = (x - ox, y - oy);
-            // Pops in over 0.15 s, fades in the last 0.4 s.
-            let life = annot::REACTION_LIFE.as_secs_f32();
-            let a = ((life - age) / 0.4).clamp(0.0, 1.0);
-            let s = (age / 0.15).clamp(0.3, 1.0);
-            rt.SetTransform(&windows_numerics::Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: x - s * x, M32: y - s * y });
-            match kind {
-                Reaction::Laugh | Reaction::Heart => {
-                    dot(x, y, EMOJI * 0.62, color(0.0, 0.0, 0.0, 0.35 * a));
-                    let r = EMOJI * 0.75;
-                    // Colour glyphs ignore the brush's alpha; a layer fades them.
-                    let layer = rt.CreateLayer(None)?;
-                    rt.PushLayer(&layer_params(a), &layer);
-                    brush.SetColor(&color(1.0, 1.0, 1.0, 1.0));
-                    let txt: Vec<u16> = kind.text().encode_utf16().collect();
-                    rt.DrawText(&txt, &g.emoji, &D2D_RECT_F { left: x - r, top: y - r, right: x + r, bottom: y + r }, &brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, DWRITE_MEASURING_MODE_NATURAL);
-                    rt.PopLayer();
-                }
-                _ => {
-                    let (pw, ph) = PILL;
-                    let bg = if *kind == Reaction::Yes { color(0.13, 0.62, 0.30, 0.95 * a) } else { color(0.82, 0.16, 0.16, 0.95 * a) };
-                    brush.SetColor(&bg);
-                    let rr = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: x - pw / 2.0, top: y - ph / 2.0, right: x + pw / 2.0, bottom: y + ph / 2.0 }, radiusX: ph / 2.0, radiusY: ph / 2.0 };
-                    rt.FillRoundedRectangle(&rr, &brush);
-                    let layer = rt.CreateLayer(None)?;
-                    rt.PushLayer(&layer_params(a), &layer);
-                    brush.SetColor(&color(1.0, 1.0, 1.0, 1.0));
-                    let txt: Vec<u16> = kind.text().encode_utf16().collect();
-                    rt.DrawText(&txt, &g.label, &rr.rect, &brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, DWRITE_MEASURING_MODE_NATURAL);
-                    rt.PopLayer();
-                }
-            }
-            rt.SetTransform(&windows_numerics::Matrix3x2::identity());
+            let r = STICKER * scale / 2.0;
+            let dst = D2D_RECT_F { left: x - r, top: y - r, right: x + r, bottom: y + r };
+            rt.DrawBitmap(&g.stickers[*i], Some(&dst), *alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
         }
         if let Some((x, y)) = laser {
             let (x, y) = (x as f32 - ox, y as f32 - oy);
-            dot(x, y, LASER_R, color(1.0, 0.1, 0.1, 0.22));
-            dot(x, y, LASER_R * 0.62, color(1.0, 0.1, 0.1, 0.5));
-            dot(x, y, LASER_R * 0.38, color(1.0, 0.15, 0.15, 1.0));
-            dot(x, y, LASER_R * 0.14, color(1.0, 0.85, 0.85, 1.0));
+            let brush = rt.CreateSolidColorBrush(&color(1.0, 0.0, 0.0, 1.0), None)?;
+            for (r, c) in [(1.0, color(1.0, 0.1, 0.1, 0.22)), (0.62, color(1.0, 0.1, 0.1, 0.5)), (0.38, color(1.0, 0.15, 0.15, 1.0)), (0.14, color(1.0, 0.85, 0.85, 1.0))] {
+                brush.SetColor(&c);
+                rt.FillEllipse(&D2D1_ELLIPSE { point: windows_numerics::Vector2 { X: x, Y: y }, radiusX: LASER_R * r, radiusY: LASER_R * r }, &brush);
+            }
         }
         rt.EndDraw(None, None)?;
     }
     Ok(())
 }
 
-fn layer_params(opacity: f32) -> D2D1_LAYER_PARAMETERS {
-    D2D1_LAYER_PARAMETERS {
-        contentBounds: D2D_RECT_F { left: -1e6, top: -1e6, right: 1e6, bottom: 1e6 },
-        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        maskTransform: windows_numerics::Matrix3x2::identity(),
-        opacity,
-        layerOptions: D2D1_LAYER_OPTIONS_NONE,
-        ..Default::default()
-    }
-}
-
-/// `annottest`: shows the laser walking across `region` and every reaction once (to look at, ~6 s).
+/// `annottest`: shows the laser walking across `region`, every sticker once, then a burst of clicks (~7 s).
 pub fn demo(region: Region) {
     let v = AnnotView::spawn(Arc::new(Mutex::new(Some(region))));
     v.enabled.store(true, Ordering::Relaxed);
     let mut s = annot::Sender::new(1);
     let t0 = Instant::now();
     let mut next_r = 0;
-    let all = [Reaction::Laugh, Reaction::Heart, Reaction::Yes, Reaction::No];
-    while t0.elapsed() < Duration::from_secs(6) {
-        let f = t0.elapsed().as_secs_f32() / 6.0;
-        s.set_laser(Some(((8000.0 + f * 49000.0) as u16, (32768.0 + (f * 12.0).sin() * 12000.0) as u16)));
-        if next_r < all.len() && t0.elapsed() > Duration::from_millis(800 + 900 * next_r as u64) {
-            s.react(all[next_r]);
+    while t0.elapsed() < Duration::from_secs(7) {
+        let now = Instant::now();
+        let f = t0.elapsed().as_secs_f32() / 7.0;
+        s.set_laser(Some(((8000.0 + f * 49000.0) as u16, (32768.0 + (f * 12.0).sin() * 12000.0) as u16)), now);
+        if next_r < 4 && t0.elapsed() > Duration::from_millis(600 + 700 * next_r as u64) {
+            s.react(Reaction::ORDER[next_r], None);
+            next_r += 1;
+        } else if next_r >= 4 && next_r < 14 && t0.elapsed() > Duration::from_millis(3600 + 120 * (next_r - 4) as u64) {
+            s.react(Reaction::Heart, Some((20000 + 1500 * (next_r - 4) as u16, 20000)));
             next_r += 1;
         }
-        if let Some(fr) = s.poll(Instant::now()) {
+        if let Some(fr) = s.poll(now) {
             let mut b = Vec::new();
             annot::encode(&fr, &mut b);
             v.on_packet(&b);

@@ -344,7 +344,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 inp.laser(Some(((32768.0 + a.cos() * 16000.0) as u16, (32768.0 + a.sin() * 16000.0) as u16)));
                 let k = (a / 2.0) as usize;
                 if a > 1.0 && (a - 1.0) % 2.0 < 0.02 && k < 5 {
-                    inp.react(all[(k + 3) % 4]);
+                    inp.react(all[(k + 3) % 4], if k % 2 == 0 { Some((20000, 20000)) } else { None });
                 }
                 std::thread::sleep(Duration::from_millis(16));
             }
@@ -1031,6 +1031,8 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         pad_panel: false,
         laser: false,
         toast: None,
+        armed: None,
+        pops: Vec::new(),
     };
     event_loop.run_app(&mut app)?;
 
@@ -1090,6 +1092,10 @@ struct App {
     laser: bool,
     /// A short confirmation (a reaction went out).
     toast: Option<(String, Instant)>,
+    /// The sticker picked in the bar: it rides on the pointer, each click on the picture sends it there.
+    armed: Option<usize>,
+    /// Stickers sent with a click, flying up here as they do on the host's screen (when, where, which).
+    pops: Vec<(Instant, (i32, i32), usize)>,
 }
 
 /// The bar fades 0.4 s after 2.6 s without mouse movement; ~30 fps of redraws only while it is visible.
@@ -1258,16 +1264,35 @@ impl App {
                 self.redraw();
                 return true;
             }
-            KeyCode::Digit1 | KeyCode::Numpad1 => Reaction::Laugh,
-            KeyCode::Digit2 | KeyCode::Numpad2 => Reaction::Heart,
-            KeyCode::Digit3 | KeyCode::Numpad3 => Reaction::Yes,
-            KeyCode::Digit4 | KeyCode::Numpad4 => Reaction::No,
+            KeyCode::Digit1 | KeyCode::Numpad1 => 0,
+            KeyCode::Digit2 | KeyCode::Numpad2 => 1,
+            KeyCode::Digit3 | KeyCode::Numpad3 => 2,
+            KeyCode::Digit4 | KeyCode::Numpad4 => 3,
             _ => return false,
         };
-        self.input.react(r);
-        self.toast = Some((format!("Отправлено: {}", r.name()), Instant::now()));
-        self.redraw();
+        self.send_sticker(Reaction::ORDER[r]);
         true
+    }
+
+    /// Sends a sticker to where the pointer is on the picture (the corner when it is off the window) and shows
+    /// it flying here too: the host's copy is not in the stream.
+    fn send_sticker(&mut self, r: crate::annot::Reaction) {
+        let inside = self.window.as_ref().is_some_and(|w| {
+            let s = w.inner_size();
+            self.cursor.0 >= 0 && self.cursor.1 >= 0 && self.cursor.0 < s.width as i32 && self.cursor.1 < s.height as i32
+        });
+        let at = inside.then(|| self.picture_spot(winit::dpi::PhysicalPosition::new(self.cursor.0 as f64, self.cursor.1 as f64))).flatten();
+        self.input.react(r, at);
+        if at.is_some() {
+            self.pops.retain(|p| p.0.elapsed() < crate::annot::REACTION_LIFE);
+            if self.pops.len() >= crate::annot::MAX_ACTIVE {
+                self.pops.remove(0);
+            }
+            self.pops.push((Instant::now(), self.cursor, r.index()));
+        } else {
+            self.toast = Some((format!("Отправлено: {}", r.name()), Instant::now()));
+        }
+        self.redraw();
     }
 
     /// The line at the top: a reaction just sent, the laser, remote control, or the first-minute tip.
@@ -1278,15 +1303,19 @@ impl App {
                 return Some((t.clone(), 0x00_3E_CF_8E, 1.0));
             }
         }
+        if let Some(i) = self.armed {
+            let name = crate::annot::Reaction::ORDER[i].name();
+            return Some((format!("Стикер «{name}»: кликайте по картинке — он появится у показывающего · ПКМ или Esc — убрать"), 0x00_3E_CF_8E, 0.9));
+        }
         if self.laser && !self.captured {
-            return Some(("Лазерная указка у показывающего на экране · L — выключить · 1 смех · 2 сердечко · 3 ДА · 4 НЕТ".into(), LASER, 0.85));
+            return Some(("Лазерная указка у показывающего · гаснет, если не двигать мышь 3 с · L — выключить".into(), LASER, 0.85));
         }
         if let Some(h) = self.ctl_hint() {
             return Some(h);
         }
         let t = self.started.elapsed();
         (t > Duration::from_secs(2) && t < Duration::from_secs(12))
-            .then(|| ("L — лазерная указка · 1–4 — реакции (смех, сердечко, ДА, НЕТ)".into(), LASER, 0.85))
+            .then(|| ("L — лазерная указка · стикеры — кнопки внизу или 1 ДА · 2 НЕТ · 3 смех · 4 сердечко".into(), LASER, 0.85))
     }
 
     /// What to tell the viewer about remote control right now (a short line, a dot colour).
@@ -1334,7 +1363,7 @@ impl App {
     }
 
     fn overlay_active(&self) -> bool {
-        self.pad_panel || self.captured || self.hint().is_some()
+        self.pad_panel || self.captured || self.hint().is_some() || self.laser || self.pops.iter().any(|p| p.0.elapsed() < crate::annot::REACTION_LIFE)
     }
 
     fn save_volume(&self) {
@@ -1481,6 +1510,10 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
                 match event.logical_key {
                     Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
+                    Key::Named(NamedKey::Escape) if self.armed.is_some() => {
+                        self.armed = None;
+                        self.redraw();
+                    }
                     Key::Named(NamedKey::Escape) => {
                         if self.window.as_ref().is_some_and(|w| w.fullscreen().is_some()) {
                             self.toggle_fullscreen();
@@ -1525,6 +1558,10 @@ impl ApplicationHandler<UserEv> for App {
             }
             // Right click: show the bar (and keep it up a little longer).
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                if self.armed.take().is_some() {
+                    self.redraw();
+                    return;
+                }
                 self.wake_bar();
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
@@ -1553,6 +1590,11 @@ impl ApplicationHandler<UserEv> for App {
                 // A click on the bar belongs to the bar (and does not count towards the double click).
                 self.set_hover();
                 match self.hover {
+                    Hit::Outside if self.armed.is_some() => {
+                        let r = crate::annot::Reaction::ORDER[self.armed.unwrap_or(0)];
+                        self.send_sticker(r);
+                        self.last_click = None;
+                    }
                     Hit::Outside if self.ctl_available() && self.input.kbm_active() => {
                         // A click on the picture takes the mouse for the host.
                         self.set_capture(true);
@@ -1586,6 +1628,12 @@ impl ApplicationHandler<UserEv> for App {
                             },
                             Hit::Fullscreen => self.toggle_fullscreen(),
                             Hit::Control => self.toggle_control(),
+                            Hit::React(i) => {
+                                self.armed = if self.armed == Some(i) { None } else { Some(i) };
+                                if self.armed.is_some() && self.captured {
+                                    self.set_capture(false);
+                                }
+                            }
                             Hit::Stop => {
                                 self.save_volume();
                                 el.exit();
@@ -1704,6 +1752,7 @@ impl App {
                 opacity,
                 time: self.started.elapsed().as_secs_f32(),
                 ctl: ctl.map(|(on, allowed, pads, pad_ok, kbm_ok)| bar::Ctl { on, allowed, pads: pads as u8, captured: self.captured, pad_ok, kbm_ok }),
+                armed: self.armed,
             };
             let geom = Bar::with_control(ww as i32, wh as i32, sc, ctl.is_some());
             bar::draw(&mut buf, ww as i32, wh as i32, &geom, &st);
@@ -1722,10 +1771,25 @@ impl App {
         // Remote-control overlays: the hint line and the F2 gamepad test.
         {
             let mut ob = crate::overlay::Buf { px: &mut buf, w: ww as i32, h: wh as i32 };
-            if self.laser && !self.captured {
-                // Our own dot right away (the host's comes back only with the picture).
+            if self.laser && !self.captured && self.input.laser_visible() {
+                // Our own dot right away (the host's is not in the stream).
                 ob.disc(self.cursor.0, self.cursor.1, 9.0 * sc as f32, 0x00_FF_30_30, 0.3);
                 ob.disc(self.cursor.0, self.cursor.1, 4.5 * sc as f32, 0x00_FF_30_30, 1.0);
+            }
+            // Stickers sent with a click, rising like on the host's screen.
+            let big = 96 * sc;
+            self.pops.retain(|p| p.0.elapsed() < crate::annot::REACTION_LIFE);
+            for (t, (x, y), i) in &self.pops {
+                let (rise, scale, alpha) = crate::annot::motion(t.elapsed());
+                let size = (big as f32 * scale) as i32;
+                let img = crate::stickers::get(*i, size);
+                crate::stickers::blit(ob.px, ob.w, ob.h, *x, *y - (rise * big as f32) as i32, size, &img, alpha);
+            }
+            // The picked sticker rides on the pointer (over the picture; over the bar the arrow is back).
+            if let (Some(i), false, Hit::Outside) = (self.armed, self.captured, self.hover) {
+                let size = 56 * sc;
+                let img = crate::stickers::get(i, size);
+                crate::stickers::blit(ob.px, ob.w, ob.h, self.cursor.0, self.cursor.1, size, &img, 1.0);
             }
             if let Some((text, dot, a)) = hint.as_ref() {
                 crate::overlay::hint(&mut ob, ww as i32 / 2, 20 * sc, sc, text, Some(*dot), *a);
@@ -1753,7 +1817,8 @@ impl App {
         // The mouse cursor goes away with the bar in full screen (the stream already shows the host's).
         let hide = opacity <= 0.0 && w.fullscreen().is_some();
         // While controlling, the pointer mode decides (it used to come back here and drift away from the host's).
-        let want_cursor = if self.captured { !self.relative_mode } else { !hide };
+        let sticker_on_pointer = self.armed.is_some() && self.hover == Hit::Outside;
+        let want_cursor = if self.captured { !self.relative_mode } else { !hide && !sticker_on_pointer };
         let _ = buf.present();
         if new_picture {
             self.sh.diag.lock().unwrap().shown.feed(self.sh.start.elapsed().as_micros() as u64);
@@ -1793,6 +1858,7 @@ pub fn overlay_preview(out: &std::path::Path, panel: bool, on: bool) -> std::io:
         opacity: 1.0,
         time: 1.0,
         ctl: Some(bar::Ctl { on, allowed: true, pads: 2, captured: on && kbm_ok, pad_ok, kbm_ok }),
+        armed: Some(1),
     };
     let geom = Bar::with_control(ww as i32, wh as i32, 1, true);
     bar::draw(&mut buf, ww as i32, wh as i32, &geom, &st);

@@ -148,11 +148,17 @@ impl ViewInput {
 
     /// Where the laser points on the picture (0..=65535 both ways); None = off.
     pub fn laser(&self, pos: Option<(u16, u16)>) {
-        self.annot.lock().unwrap().set_laser(pos);
+        self.annot.lock().unwrap().set_laser(pos, Instant::now());
     }
 
-    pub fn react(&self, r: crate::annot::Reaction) {
-        self.annot.lock().unwrap().react(r);
+    /// The laser is on and the mouse moved in the last 3 s (otherwise it is dark on both sides).
+    pub fn laser_visible(&self) -> bool {
+        self.annot.lock().unwrap().laser_visible(Instant::now()).is_some()
+    }
+
+    /// A sticker for the host's screen, at a spot of the picture (None: where the laser is, or a corner).
+    pub fn react(&self, r: crate::annot::Reaction, at: Option<(u16, u16)>) {
+        self.annot.lock().unwrap().react(r, at);
     }
 
     pub fn spawn(self: &Arc<Self>, sock: Arc<UdpSocket>, host: SocketAddr, token: u32, alive: impl Fn() -> bool + Send + 'static) {

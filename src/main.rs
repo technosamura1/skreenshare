@@ -47,6 +47,7 @@ mod scale;
 mod retx;
 mod selftest;
 mod source;
+mod stickers;
 mod taskbar;
 mod thumbs;
 mod ui;
