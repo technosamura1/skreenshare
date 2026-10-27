@@ -1548,7 +1548,10 @@ impl ApplicationHandler<UserEv> for App {
                 }
                 if moved {
                     self.last_move = Instant::now();
-                    self.set_cursor(true);
+                    // With the laser or a sticker on the pointer the drawing decides (no arrow flashing in).
+                    if !self.laser && self.armed.is_none() {
+                        self.set_cursor(true);
+                    }
                 }
                 let before = self.hover;
                 self.set_hover();
@@ -1860,8 +1863,12 @@ impl App {
         // The mouse cursor goes away with the bar in full screen (the stream already shows the host's).
         let hide = opacity <= 0.0 && w.fullscreen().is_some();
         // While controlling, the pointer mode decides (it used to come back here and drift away from the host's).
-        let sticker_on_pointer = self.armed.is_some() && self.hover == Hit::Outside;
-        let want_cursor = if self.captured { !self.relative_mode } else { !hide && !sticker_on_pointer };
+        // Over the picture the laser's red dot or the picked sticker is the pointer: the Windows arrow goes away
+        // (over the bar it is back, to press buttons).
+        let over_picture = self.hover == Hit::Outside;
+        let sticker_on_pointer = self.armed.is_some() && over_picture;
+        let laser_on_pointer = self.laser && over_picture && self.input.laser_visible();
+        let want_cursor = if self.captured { !self.relative_mode } else { !hide && !sticker_on_pointer && !laser_on_pointer };
         let _ = buf.present();
         if new_picture {
             self.sh.diag.lock().unwrap().shown.feed(self.sh.start.elapsed().as_micros() as u64);
