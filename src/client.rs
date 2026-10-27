@@ -190,6 +190,9 @@ struct Shared {
     diag: Mutex<Diag>,
     /// «Игра»: frames are not held back for lip sync (F3 toggles).
     game: AtomicBool,
+    /// Remote control is on: the picture is shown at once like in «Игра» (the lip-sync wait would add ~0.1 s to
+    /// every move of the mouse).
+    ctl_live: AtomicBool,
 }
 
 #[derive(Default)]
@@ -319,6 +322,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         dropped_busy: AtomicU64::new(0),
         diag: Mutex::new(Diag::default()),
         game: AtomicBool::new(o.game),
+        ctl_live: AtomicBool::new(false),
     });
     {
         let sh = sh.clone();
@@ -809,7 +813,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 // after its arrival. That keeps several frames queued, which is normal and not "behind": a frame
                 // counts as late only when it is already past its own due time.
                 // «Игра»: shown at once (sound may trail by its small cushion); «Кино»: held for lip sync.
-                let hold = if sh.game.load(Ordering::Relaxed) {
+                let hold = if sh.game.load(Ordering::Relaxed) || sh.ctl_live.load(Ordering::Relaxed) {
                     Duration::ZERO
                 } else {
                     sync_q.as_ref().map_or(Duration::ZERO, |q| q.delay().saturating_sub(DECODE_TIME).min(MAX_SYNC_HOLD))
@@ -1325,7 +1329,7 @@ impl App {
         }
         let t = self.started.elapsed();
         (t > Duration::from_secs(2) && t < Duration::from_secs(12))
-            .then(|| ("L — лазерная указка · стикеры — кнопки внизу или 1 ДА · 2 НЕТ · 3 смех · 4 сердечко".into(), LASER, 0.85))
+            .then(|| ("L — лазерная указка · стикеры — кнопки внизу или 1–4 · F4 — управление".into(), LASER, 0.85))
     }
 
     /// What to tell the viewer about remote control right now (a short line, a dot colour).
@@ -1351,7 +1355,7 @@ impl App {
         if self.captured {
             let fresh = self.capture_t.is_some_and(|t| t.elapsed() < Duration::from_secs(6));
             return Some(if fresh {
-                ("Управление включено · Ctrl+Alt+Shift (или держите Esc 1 с) — отпустить мышь".into(), GREEN, 1.0)
+                ("Управление включено · Ctrl+Alt+Shift (или держите Esc 1 с) — отпустить мышь · F4 — выключить".into(), GREEN, 1.0)
             } else {
                 ("Управление включено".into(), GREEN, 0.6)
             });
@@ -1457,6 +1461,22 @@ impl ApplicationHandler<UserEv> for App {
                 }
             }
             // While the mouse is captured everything goes to the host (the release chord is Ctrl+Alt+Shift).
+            // F4 (without Alt: Alt+F4 still reaches the host): «Управление» on/off, also while the mouse is captured.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && !self.mods.alt_key()
+                    && matches!(event.logical_key, Key::Named(NamedKey::F4)) =>
+            {
+                if self.ctl_available() {
+                    self.toggle_control();
+                    let on = self.input.want.load(Ordering::Relaxed);
+                    self.toast = Some((if on { "Управление включено (F4 — выключить)" } else { "Управление выключено (F4 — включить)" }.into(), Instant::now()));
+                } else {
+                    self.toast = Some(("Управление недоступно: показывающий его не включил".into(), Instant::now()));
+                }
+                self.redraw();
+            }
             WindowEvent::KeyboardInput { event, .. } if self.captured => self.forward_key(&event),
             WindowEvent::MouseInput { state, button, .. } if self.captured => {
                 let b = match button {
@@ -1714,6 +1734,13 @@ impl ApplicationHandler<UserEv> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // Control on: no lip-sync wait for the picture, and the small sound cushion (as F3 «Игра» does).
+        let live = self.input.kbm_active() || self.input.pad_active();
+        if self.sh.ctl_live.swap(live, Ordering::Relaxed) != live && !self.sh.game.load(Ordering::Relaxed) {
+            if let Some(q) = &self.audio_q {
+                q.set_game(live);
+            }
+        }
         // The host switched control off (or it was revoked): the mouse is let go at once.
         if self.captured && !self.input.kbm_active() {
             self.set_capture(false);

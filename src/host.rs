@@ -215,6 +215,28 @@ fn start_audio(make_sink: &dyn Fn() -> AudioSink, want: AudioPlan, fallback: Aud
 enum Cap {
     Screen(Capturer),
     Window(Box<WindowCapturer>),
+    /// The whole monitor through Windows Graphics Capture: used while the viewer's laser pointer and stickers are
+    /// shown here, because Desktop Duplication would put them into the stream (it ignores WDA_EXCLUDEFROMCAPTURE).
+    Monitor(Box<WindowCapturer>),
+}
+
+/// The whole monitor: on Windows 10 through Windows Graphics Capture when the pointer/sticker overlay is on (so it
+/// stays out of the stream), else (or when that fails) Desktop Duplication as always.
+fn open_screen(monitor: &MonitorInfo) -> Result<Cap> {
+    // Windows 11 leaves such windows out of Desktop Duplication too (checked here, build 26300); Windows 10 does
+    // not (a friend saw the stickers in his stream). SS_CAPTURE=wgc|dd forces one way.
+    let forced = std::env::var("SS_CAPTURE").unwrap_or_default();
+    let win10 = crate::glass::build_number().is_some_and(|b| b < 22000);
+    if crate::annotview::load_enabled() && forced != "dd" && (win10 || forced == "wgc") {
+        match WindowCapturer::new_monitor(monitor.left + monitor.width as i32 / 2, monitor.top + monitor.height as i32 / 2) {
+            Ok(w) => {
+                crate::net::conn_log("захват экрана: Windows Graphics Capture (указка и стикеры не попадают в трансляцию)");
+                return Ok(Cap::Monitor(Box::new(w)));
+            }
+            Err(e) => crate::net::conn_log(&format!("захват экрана через Windows Graphics Capture не вышел ({e:#}); Desktop Duplication")),
+        }
+    }
+    Ok(Cap::Screen(Capturer::new(monitor)?))
 }
 
 /// Opens window capture, or says why it can't be done (the caller then shows the full screen).
@@ -275,7 +297,7 @@ fn open_requested(req: crate::source::SourceReq, current: &MonitorInfo, showing_
             if showing_screen && m.same_output(current) {
                 return Ok(None); // already showing exactly this
             }
-            let c = Cap::Screen(Capturer::new(&m)?);
+            let c = open_screen(&m)?;
             let (status, label) = if m.primary || !multi {
                 ("Показываю весь экран".to_string(), crate::source::source_label(None))
             } else {
@@ -590,13 +612,13 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         None => {
             ui::source_status("Показываю весь экран", false);
             ui::source_label(&crate::source::source_label(None));
-            Cap::Screen(Capturer::new(&monitor)?)
+            open_screen(&monitor)?
         }
     };
     // The window whose process is the sound source (None while a whole screen is shown).
     let mut audio_window = match &cap {
         Cap::Window(_) => o.window,
-        Cap::Screen(_) => None,
+        Cap::Screen(_) | Cap::Monitor(_) => None,
     };
     let mut audio_want = plan_audio(prefs, audio_window);
     let mut audio = if o.audio {
@@ -714,7 +736,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         let timeout = if dirty { next_due.saturating_duration_since(now).as_millis() as u32 } else { 250 };
         let ev = match &mut cap {
             Cap::Screen(c) => c.next(timeout)?,
-            Cap::Window(w) => match w.next(timeout) {
+            Cap::Window(w) | Cap::Monitor(w) => match w.next(timeout) {
                 Ok(ev) => ev,
                 Err(e) => {
                     // Capture failure (device lost, ...): treated like a closed window.
@@ -749,7 +771,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 audio_dirty = true;
                 canvas = match &cap {
                     Cap::Screen(c) => (c.width, c.height),
-                    Cap::Window(_) => canvas,
+                    Cap::Window(_) | Cap::Monitor(_) => canvas,
                 };
                 if enc.as_ref().is_some_and(|e| (e.width, e.height) != canvas) {
                     enc = None;
@@ -766,7 +788,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 crate::source::SourceReq::Window(h) => Some(*h),
                 _ => None,
             };
-            match open_requested(req, &monitor, matches!(cap, Cap::Screen(_))) {
+            match open_requested(req, &monitor, matches!(cap, Cap::Screen(_) | Cap::Monitor(_))) {
                 Ok(Some(n)) => {
                     // The old capture is released only now, after the new one works.
                     cap = n.cap;
@@ -779,6 +801,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     canvas = match &cap {
                         // A different-size monitor changes the stream size: new encoder, the viewer follows the new SPS.
                         Cap::Screen(c) => (c.width & !1, c.height & !1),
+                        Cap::Monitor(_) => (monitor.width & !1, monitor.height & !1),
                         // A window is letterboxed into the canvas of the monitor, so the size stays.
                         Cap::Window(_) => (monitor.width & !1, monitor.height & !1),
                     };
@@ -855,9 +878,13 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 let size = (c.width, c.height);
                 input.set_region(crate::inputhost::Region::Screen { canvas: size, rect: (monitor.left, monitor.top, size.0 as i32, size.1 as i32) });
             }
-            Cap::Window(w) => {
+            Cap::Window(w) | Cap::Monitor(w) => {
                 let (src, size) = (w.pixels(), (w.width, w.height));
-                input.set_region(crate::inputhost::Region::Window { canvas, content: size, hwnd: w.hwnd() });
+                input.set_region(if w.hwnd() == 0 {
+                    crate::inputhost::Region::Screen { canvas, rect: (monitor.left, monitor.top, monitor.width as i32, monitor.height as i32) }
+                } else {
+                    crate::inputhost::Region::Window { canvas, content: size, hwnd: w.hwnd() }
+                });
                 crate::source::draw_letterboxed(src, size, buf, stride, canvas, &mut scratch, |s, sw, sh, d, dw, dh| {
                     scaler.scale(s, sw, sh, sw as usize * 4, d, dw, dh, dw as usize * 4).map_err(|e| format!("{e:#}"))
                 })
@@ -936,6 +963,6 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
 fn cap_window_gone(cap: &Cap) -> bool {
     match cap {
         Cap::Window(w) => !w.alive(),
-        Cap::Screen(_) => false,
+        Cap::Screen(_) | Cap::Monitor(_) => false,
     }
 }

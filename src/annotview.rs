@@ -103,7 +103,10 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
         // Not in the stream (Windows 10 2004+); on older systems the viewer just sees it a second time.
         // SS_ANNOT_VISIBLE=1: let screenshots see it (for checking the drawing).
         if std::env::var("SS_ANNOT_VISIBLE").is_err() {
-            let _ = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE);
+            let r = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE);
+            let mut got = 0u32;
+            let _ = GetWindowDisplayAffinity(h, &mut got);
+            crate::net::conn_log(&format!("указка: исключение из захвата: {r:?}, сейчас {got:#x}"));
         }
         h
     };

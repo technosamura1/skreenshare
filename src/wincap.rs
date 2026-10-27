@@ -167,6 +167,9 @@ pub fn list_windows() -> Vec<WinEntry> {
 
 pub struct WindowCapturer {
     hwnd: isize,
+    /// A whole monitor rather than a window (v0.12.6: unlike Desktop Duplication, this capture leaves out windows
+    /// marked WDA_EXCLUDEFROMCAPTURE, i.e. the laser pointer and stickers drawn on the host's screen).
+    monitor: bool,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     d3d_device: IDirect3DDevice,
@@ -245,10 +248,25 @@ impl WindowCapturer {
             bail!("окно уже закрыто");
         }
         unsafe {
-            let _ = RoInitialize(RO_INIT_MULTITHREADED); // already initialised on this thread is fine
             if IsIconic(hwnd(h)).as_bool() {
                 let _ = ShowWindow(hwnd(h), SW_RESTORE); // a minimized window has no picture to capture
             }
+        }
+        Self::open(Some(h), None)
+    }
+
+    /// The whole monitor that contains desktop point (x, y).
+    pub fn new_monitor(x: i32, y: i32) -> Result<WindowCapturer> {
+        if !supported() {
+            bail!("эта версия Windows не умеет захват Windows Graphics Capture (нужна Windows 10 1903 или новее)");
+        }
+        Self::open(None, Some((x, y)))
+    }
+
+    fn open(win: Option<isize>, point: Option<(i32, i32)>) -> Result<WindowCapturer> {
+        let h = win.unwrap_or(0);
+        unsafe {
+            let _ = RoInitialize(RO_INIT_MULTITHREADED); // already initialised on this thread is fine
             let mut device = None;
             let mut context = None;
             D3D11CreateDevice(
@@ -269,13 +287,21 @@ impl WindowCapturer {
             let d3d_device: IDirect3DDevice = CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?.cast()?;
 
             let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
-            let item: GraphicsCaptureItem =
-                interop.CreateForWindow(hwnd(h)).context("не удалось начать захват этого окна (оно защищено или недоступно)")?;
+            let item: GraphicsCaptureItem = match point {
+                Some((x, y)) => {
+                    let mon = windows::Win32::Graphics::Gdi::MonitorFromPoint(windows::Win32::Foundation::POINT { x, y }, windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
+                    interop.CreateForMonitor(mon).context("не удалось начать захват монитора")?
+                }
+                None => interop.CreateForWindow(hwnd(h)).context("не удалось начать захват этого окна (оно защищено или недоступно)")?,
+            };
             let size = item.Size()?;
             let size = SizeInt32 { Width: size.Width.max(2), Height: size.Height.max(2) };
             // With "Use HDR" on, ask for float16 (scRGB) and tone-map it to SDR ourselves; otherwise the 8-bit
             // format, exactly as before.
-            let hdr = hdr::Watcher::start(hdr::Target::Window(h));
+            let hdr = hdr::Watcher::start(match point {
+                Some((x, y)) => hdr::Target::Point(x, y),
+                None => hdr::Target::Window(h),
+            });
             let pool_hdr = hdr.get().active;
             if pool_hdr {
                 println!("HDR включён на мониторе окна: захват во float16, затем перевод в SDR (белый SDR {:.0} нит)", hdr.get().white_nits);
@@ -296,6 +322,7 @@ impl WindowCapturer {
             session.StartCapture()?;
             Ok(WindowCapturer {
                 hwnd: h,
+                monitor: point.is_some(),
                 device,
                 context,
                 d3d_device,
@@ -319,7 +346,7 @@ impl WindowCapturer {
 
     /// Waits up to `timeout_ms` for a new window picture.
     pub fn next(&mut self, timeout_ms: u32) -> Result<Event> {
-        if !is_alive(self.hwnd) {
+        if !self.alive() {
             return Ok(Event::Closed);
         }
         let mut got = self.take_latest()?;
@@ -429,7 +456,7 @@ impl WindowCapturer {
 
     /// Whether the captured window still exists.
     pub fn alive(&self) -> bool {
-        is_alive(self.hwnd)
+        self.monitor || is_alive(self.hwnd)
     }
 
     /// The current window picture, tightly packed BGRA (`width`x`height`).
