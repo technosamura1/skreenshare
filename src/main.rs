@@ -32,6 +32,7 @@ mod inputlogic;
 mod inputproto;
 mod loopback;
 mod easy;
+mod friends;
 mod encsel;
 mod net;
 mod netq;
