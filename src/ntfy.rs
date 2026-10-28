@@ -41,6 +41,12 @@ fn run(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// `since` for an ntfy poll: `all`, or a message id. Nothing else, so it cannot rewrite the URL.
+fn since_token(s: &str) -> String {
+    let t: String = s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(80).collect();
+    if t.is_empty() { "all".into() } else { t }
+}
+
 /// Publishes one sealed message (base64url text) to the topic.
 pub fn post(topic: &str, message: &str) -> Result<()> {
     run(&["--data-raw", message, &format!("{}/{topic}", base())]).map(|_| ())
@@ -50,4 +56,11 @@ pub fn post(topic: &str, message: &str) -> Result<()> {
 pub fn poll(topic: &str) -> Result<Vec<String>> {
     let body = run(&[&format!("{}/{topic}/json?poll=1&since=all", base())])?;
     Ok(crate::easy::parse_ntfy_lines(&body))
+}
+
+/// Raw ntfy ndjson for `topic` since `since` (`all` or a message id from the previous poll).
+/// Friends parse it with `friends::parse_relay` and keep the id as the next cursor.
+pub fn poll_since(topic: &str, since: &str) -> Result<String> {
+    let since = since_token(since);
+    run(&[&format!("{}/{topic}/json?poll=1&since={since}", base())])
 }
