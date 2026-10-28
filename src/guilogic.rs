@@ -620,7 +620,7 @@ mod tests {
         assert_eq!(l, Look { light: true, mono: false, accent: Accent::Purple, anim: false, sounds: false, glass: true });
         assert!(Look::from_ini("theme=mono\naccent=grey\n").mono);
         assert_eq!(Look::from_ini("theme=mono\naccent=grey\n").accent, Accent::Grey);
-        let l = Look::from_ini("theme=weird\naccent=pink\nanim=maybe\n");
+        let l = Look::from_ini("theme=weird\naccent=chartreuse\nanim=maybe\n");
         assert_eq!(l, Look::default());
         for a in Accent::ALL {
             assert_eq!(Accent::parse(Some(a.key())), a);
