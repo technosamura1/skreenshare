@@ -30,6 +30,9 @@ mod encsel;
 #[path = "../../../src/easy.rs"]
 #[allow(dead_code)]
 mod easy;
+#[path = "../../../src/friends.rs"]
+#[allow(dead_code)]
+mod friends;
 #[path = "../../../src/viewperf.rs"]
 #[allow(dead_code)]
 mod viewperf;
