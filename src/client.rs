@@ -274,7 +274,7 @@ pub fn run(o: ClientOpts) -> Result<()> {
         nat.keepalive_server,
     )?;
     let me = Code::for_socket(net::ROLE_CLIENT, host.token, &sock, &nat);
-    ui::show_code(&o.exchange, &me.encode(), "client.code", "Ваш код ответа — передайте его тому, кто показывает экран:")?;
+    ui::show_code(&o.exchange, &me.encode(), "client.code", "Ваш код ответа — передайте его тому, кто транслирует экран:")?;
     println!("Жду, пока код ответа введут на стороне показа...");
     let peer = net::punch(&sock, net::ROLE_CLIENT, host.token, &host.cands, Duration::from_secs(300))?;
     println!("Подключено! Открываю окно просмотра.");
@@ -447,7 +447,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                                 net::PT_CTRL if control && from == peer => input.on_ctrl(body),
                                 net::PT_RUMBLE if control && from == peer => input.on_rumble(body),
                                 net::PT_BYE => {
-                                    println!("Показ остановлен на другой стороне.");
+                                    println!("Трансляция остановлена на другой стороне.");
                                     sh.running.store(false, Ordering::Relaxed);
                                 }
                                 _ => {}
@@ -1319,10 +1319,10 @@ impl App {
         }
         if let Some(i) = self.armed {
             let name = crate::stickers::name(i);
-            return Some((format!("Стикер «{name}»: кликайте по картинке — он появится у показывающего · ПКМ или Esc — убрать"), 0x00_3E_CF_8E, 0.9));
+            return Some((format!("Стикер «{name}»: кликайте по картинке — он появится у транслирующего · ПКМ или Esc — убрать"), 0x00_3E_CF_8E, 0.9));
         }
         if self.laser && !self.captured {
-            return Some(("Лазерная указка у показывающего · гаснет, если не двигать мышь 3 с · L — выключить".into(), LASER, 0.85));
+            return Some(("Лазерная указка у транслирующего · гаснет, если не двигать мышь 3 с · L — выключить".into(), LASER, 0.85));
         }
         if let Some(h) = self.ctl_hint() {
             return Some(h);
@@ -1342,7 +1342,12 @@ impl App {
         }
         if let Some(t) = *self.input.revoked_at.lock().unwrap() {
             if t.elapsed() < Duration::from_secs(5) {
-                return Some(("Показывающий отключил управление".into(), RED, 1.0));
+                return Some(("Транслирующий отключил управление".into(), RED, 1.0));
+            }
+        }
+        if let Some(t) = *self.input.denied_at.lock().unwrap() {
+            if t.elapsed() < Duration::from_secs(5) {
+                return Some(("Транслирующий отклонил запрос управления".into(), RED, 1.0));
             }
         }
         if !self.ctl_available() || !self.input.want.load(Ordering::Relaxed) {
@@ -1350,7 +1355,7 @@ impl App {
         }
         let info = self.input.host_info()?;
         if !info.allowed {
-            return Some(("Ждём, пока показывающий разрешит управление".into(), YELLOW, 1.0));
+            return Some(("Запрос отправлен — ждём, пока транслирующий разрешит управление (F4 — отменить)".into(), YELLOW, 1.0));
         }
         if self.captured {
             let fresh = self.capture_t.is_some_and(|t| t.elapsed() < Duration::from_secs(6));
@@ -1371,9 +1376,9 @@ impl App {
             return Some((t.into(), GREEN, 1.0));
         }
         if info.pad {
-            return Some(("Геймпад передаётся показывающему (мышь и клавиатура не разрешены)".into(), GREEN, 1.0));
+            return Some(("Геймпад передаётся транслирующему (мышь и клавиатура не разрешены)".into(), GREEN, 1.0));
         }
-        Some(("Показывающий не разрешил ни геймпад, ни мышь с клавиатурой".into(), YELLOW, 1.0))
+        Some(("Транслирующий не разрешил ни геймпад, ни мышь с клавиатурой".into(), YELLOW, 1.0))
     }
 
     fn overlay_active(&self) -> bool {
@@ -1473,7 +1478,7 @@ impl ApplicationHandler<UserEv> for App {
                     let on = self.input.want.load(Ordering::Relaxed);
                     self.toast = Some((if on { "Управление включено (F4 — выключить)" } else { "Управление выключено (F4 — включить)" }.into(), Instant::now()));
                 } else {
-                    self.toast = Some(("Управление недоступно: показывающий его не включил".into(), Instant::now()));
+                    self.toast = Some(("Управление недоступно: транслирующий его не включил".into(), Instant::now()));
                 }
                 self.redraw();
             }
@@ -1878,11 +1883,11 @@ impl App {
                     }
                 }
                 let note = match self.input.host_info() {
-                    Some(i) if i.allowed && i.pad && self.input.want.load(Ordering::Relaxed) => "Управление включено: геймпад передаётся показывающему.",
-                    Some(i) if i.allowed && !i.pad => "Показывающий не разрешил геймпад.",
-                    Some(i) if !i.allowed => "Показывающий пока не разрешил управление.",
+                    Some(i) if i.allowed && i.pad && self.input.want.load(Ordering::Relaxed) => "Управление включено: геймпад передаётся транслирующему.",
+                    Some(i) if i.allowed && !i.pad => "Транслирующий не разрешил геймпад.",
+                    Some(i) if !i.allowed => "Транслирующий пока не разрешил управление.",
                     Some(_) => "Включите «Управление» в панели внизу, чтобы геймпад попал в игру.",
-                    None => "Показывающий не поддерживает удалённое управление (нужна версия 0.11.0).",
+                    None => "Транслирующий не поддерживает удалённое управление (нужна версия 0.11.0).",
                 };
                 crate::overlay::pad_panel(&mut ob, sc, &rows, note, 1.0);
             }
@@ -1961,7 +1966,7 @@ pub fn overlay_preview(out: &std::path::Path, panel: bool, on: bool) -> std::io:
                 }
             }
         }
-        crate::overlay::pad_panel(&mut ob, 1, &rows, "Управление включено: геймпад передаётся показывающему.", 1.0);
+        crate::overlay::pad_panel(&mut ob, 1, &rows, "Управление включено: геймпад передаётся транслирующему.", 1.0);
     }
     write_bmp(out, ww as u32, wh as u32, &buf)
 }

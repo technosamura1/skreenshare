@@ -257,7 +257,15 @@ pub struct InputHost {
     revoked: AtomicBool,
     vigem: AtomicBool,
     region: Arc<Mutex<Option<Region>>>,
+    /// The viewer asks for control (last PT_CTLREQ), and until when the owner's «no» holds.
+    asked_at: Mutex<Option<Instant>>,
+    denied_until: Mutex<Option<Instant>>,
 }
+
+/// A «no» to a control request holds this long (the viewer can't keep nagging).
+const DENY_HOLD: Duration = Duration::from_secs(15);
+/// The request shows while the viewer keeps repeating it (once a second) and a little longer.
+const ASK_TTL: Duration = Duration::from_secs(3);
 
 impl InputHost {
     pub fn new(perms: Perms) -> Arc<InputHost> {
@@ -273,7 +281,31 @@ impl InputHost {
             peer_input: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
             vigem: AtomicBool::new(vigem_installed()),
+            asked_at: Mutex::new(None),
+            denied_until: Mutex::new(None),
         })
+    }
+
+    /// PT_CTLREQ from the viewer: it wants control (want=1) or gave up asking (want=0).
+    pub fn on_ctl_request(&self, body: &[u8]) {
+        if body.len() < 2 || body[0] != 1 {
+            return;
+        }
+        let now = Instant::now();
+        if self.denied(now) {
+            return;
+        }
+        *self.asked_at.lock().unwrap() = (body[1] != 0).then_some(now);
+    }
+
+    fn denied(&self, now: Instant) -> bool {
+        self.denied_until.lock().unwrap().is_some_and(|t| now < t)
+    }
+
+    /// The viewer is asking for control right now and it is not allowed yet (the owner should be told).
+    pub fn asking(&self, now: Instant) -> bool {
+        let allowed = self.inner.lock().unwrap().rx.perms().allowed;
+        !allowed && !self.denied(now) && self.asked_at.lock().unwrap().is_some_and(|t| now.saturating_duration_since(t) < ASK_TTL)
     }
 
     /// What the stream shows right now (called for every frame: the window may have been resized or switched).
@@ -313,11 +345,17 @@ impl InputHost {
     fn ctrl_info(&self) -> CtrlInfo {
         let g = self.inner.lock().unwrap();
         let p = g.rx.perms();
-        CtrlInfo { allowed: p.allowed, pad: p.pad, kbm: p.kbm, vigem: self.vigem.load(Ordering::Relaxed), pads: g.rx.plugged_count() as u8, relative: cursor_hidden() }
+        let denied = self.denied(Instant::now());
+        CtrlInfo { allowed: p.allowed, pad: p.pad, kbm: p.kbm, vigem: self.vigem.load(Ordering::Relaxed), pads: g.rx.plugged_count() as u8, relative: cursor_hidden(), denied }
     }
 
-    /// `CONTROL on=1 pad=1 kbm=1`
+    /// `CONTROL on=1 pad=1 kbm=1`, or `CONTROL deny=1` (the owner said no to the viewer's request)
     fn apply_request(&self, line: &str) {
+        if line.split_whitespace().any(|w| w == "deny=1") {
+            *self.denied_until.lock().unwrap() = Some(Instant::now() + DENY_HOLD);
+            *self.asked_at.lock().unwrap() = None;
+            return;
+        }
         let flag = |k: &str, default: bool| {
             line.split_whitespace().find_map(|w| w.strip_prefix(k)).map(|v| v == "1").unwrap_or(default)
         };
@@ -325,6 +363,8 @@ impl InputHost {
         let p = Perms { allowed: flag("on=", cur.allowed), pad: flag("pad=", cur.pad), kbm: flag("kbm=", cur.kbm) };
         if p.allowed && !cur.allowed {
             self.revoked.store(false, Ordering::Relaxed);
+            *self.asked_at.lock().unwrap() = None;
+            *self.denied_until.lock().unwrap() = None;
         }
         self.set_perms(p);
     }
@@ -395,20 +435,21 @@ impl InputHost {
                         let g = me.inner.lock().unwrap();
                         let p = g.rx.perms();
                         (
-                            CtrlInfo { allowed: p.allowed, pad: p.pad, kbm: p.kbm, vigem: me.vigem.load(Ordering::Relaxed), pads: g.rx.plugged_count() as u8, relative: cursor_hidden() },
+                            CtrlInfo { allowed: p.allowed, pad: p.pad, kbm: p.kbm, vigem: me.vigem.load(Ordering::Relaxed), pads: g.rx.plugged_count() as u8, relative: cursor_hidden(), denied: false },
                             g.rx.controlling(now),
                             g.rx.holds_anything(),
                         )
                     };
                     let line = format!(
-                        "on={} pad={} kbm={} vigem={} pads={} active={} revoked={}",
+                        "on={} pad={} kbm={} vigem={} pads={} active={} revoked={} asked={}",
                         info.allowed as u8,
                         info.pad as u8,
                         info.kbm as u8,
                         info.vigem as u8,
                         info.pads,
                         active as u8,
-                        me.revoked.load(Ordering::Relaxed) as u8
+                        me.revoked.load(Ordering::Relaxed) as u8,
+                        me.asking(now) as u8
                     );
                     if line != last_ui || last_ui_t.elapsed() >= Duration::from_secs(1) {
                         crate::ui::ctrl_status(&line);

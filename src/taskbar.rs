@@ -92,7 +92,7 @@ impl Badge {
             let list = self.list.as_ref().unwrap();
             let h = HWND(hwnd as *mut core::ffi::c_void);
             let r = match (live, self.icon) {
-                (true, Some(icon)) => list.SetOverlayIcon(h, icon, w!("Идёт показ экрана")),
+                (true, Some(icon)) => list.SetOverlayIcon(h, icon, w!("Идёт трансляция экрана")),
                 _ => list.SetOverlayIcon(h, HICON::default(), PCWSTR::null()),
             };
             if r.is_ok() {

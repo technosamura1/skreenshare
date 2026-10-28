@@ -245,7 +245,7 @@ fn open_window(h: isize) -> Result<Cap> {
 
 /// Switch to the full screen after the window was lost: a visible message and a fresh keyframe.
 fn fall_back_to_screen(why: &str, monitor: &MonitorInfo) -> Result<Cap> {
-    ui::source_status(&format!("{why} — показываю весь экран"), true);
+    ui::source_status(&format!("{why} — транслирую весь экран"), true);
     ui::source_label(&crate::source::source_label(None));
     Ok(Cap::Screen(Capturer::new(monitor)?))
 }
@@ -275,7 +275,7 @@ fn open_requested(req: crate::source::SourceReq, current: &MonitorInfo, showing_
             };
             Ok(Some(Switched {
                 status: format!(
-                    "Показываю окно «{}» (в кадре {}×{}){note}",
+                    "Транслирую окно «{}» (в кадре {}×{}){note}",
                     crate::source::ellipsize(&title, 50),
                     current.width & !1,
                     current.height & !1
@@ -298,9 +298,9 @@ fn open_requested(req: crate::source::SourceReq, current: &MonitorInfo, showing_
             }
             let c = open_screen(&m)?;
             let (status, label) = if m.primary || !multi {
-                ("Показываю весь экран".to_string(), crate::source::source_label(None))
+                ("Транслирую весь экран".to_string(), crate::source::source_label(None))
             } else {
-                (format!("Показываю монитор {} ({}×{})", i + 1, m.width, m.height), format!("Монитор {}", i + 1))
+                (format!("Транслирую монитор {} ({}×{})", i + 1, m.width, m.height), format!("Монитор {}", i + 1))
             };
             Ok(Some(Switched { cap: c, monitor: Some(m), title: None, status, label }))
         }
@@ -451,7 +451,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         input.spawn(sock.clone(), peer, token, move || sh.running.load(Ordering::Relaxed));
     }
     // The viewer's laser pointer and reactions, drawn over the picture on this screen.
-    let annot_view = crate::annotview::AnnotView::spawn(input.region_handle());
+    let annot_view = crate::annotview::AnnotView::spawn(input.region_handle(), Some(input.clone()));
     let (nack_tx, nack_rx) = mpsc::channel::<(u32, Vec<u16>)>();
     let (rep_tx, rep_rx) = mpsc::channel::<crate::ratectl::ReportDelta>();
 
@@ -496,6 +496,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     // Remote control: only from the connected viewer's address, and only acted on if the owner allowed it.
                     net::PT_INPUT if from == peer => input.on_input(body),
                 net::PT_ANNOT if from == peer => annot_view.on_packet(body),
+                net::PT_CTLREQ if from == peer => input.on_ctl_request(body),
                     net::PT_ANACK => {
                         // Resend audio the viewer is still missing (a few per request: it only asks for what it needs).
                         let hist = sh.audio_hist.lock().unwrap().clone();
@@ -594,7 +595,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     };
                     ui::source_status(
                         &format!(
-                            "Показываю окно «{}» (в кадре {}×{}){note}",
+                            "Транслирую окно «{}» (в кадре {}×{}){note}",
                             crate::source::ellipsize(&title, 50),
                             canvas.0,
                             canvas.1
@@ -609,7 +610,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             }
         }
         None => {
-            ui::source_status("Показываю весь экран", false);
+            ui::source_status("Транслирую весь экран", false);
             ui::source_label(&crate::source::source_label(None));
             open_screen(&monitor)?
         }
@@ -813,8 +814,8 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     force_key = true; // the picture changes completely: a fresh reference for the viewer
                     pv.reset();
                 }
-                Ok(None) => ui::source_status("Этот экран уже показывается", false),
-                Err(e) => ui::source_status(&format!("Не удалось переключить ({e:#}) — продолжаю показывать прежнее"), true),
+                Ok(None) => ui::source_status("Этот экран уже транслируется", false),
+                Err(e) => ui::source_status(&format!("Не удалось переключить ({e:#}) — продолжаю транслировать прежнее"), true),
             }
         }
         // Keyframe requests are a last resort on the client now; still served at most every 500 ms.

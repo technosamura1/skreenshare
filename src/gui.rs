@@ -60,15 +60,40 @@ const fn rgb(c: u32) -> Color32 {
 impl Palette {
     fn make(look: lg::Look, glass: bool) -> Palette {
         use lg::Accent;
-        let accent = match (look.light, look.accent) {
-            (false, Accent::Blue) => rgb(0x2f86f6),
-            (false, Accent::Purple) => rgb(0x7f5cf0),
-            (false, Accent::Green) => rgb(0x17a06a),
-            (true, Accent::Blue) => rgb(0x1f66e0),
-            (true, Accent::Purple) => rgb(0x6a45e0),
-            (true, Accent::Green) => rgb(0x12855a),
+        // (on dark, on light)
+        let (dark, light) = match look.accent {
+            Accent::Blue => (0x2f86f6, 0x1f66e0),
+            Accent::Purple => (0x7f5cf0, 0x6a45e0),
+            Accent::Green => (0x17a06a, 0x12855a),
+            Accent::Teal => (0x14a3a8, 0x0e7f86),
+            Accent::Orange => (0xf0812a, 0xd0620c),
+            Accent::Pink => (0xe2559a, 0xc23a7d),
+            Accent::Grey => (0x8c939c, 0x5d646d),
         };
-        let mut p = if look.light {
+        let accent = rgb(if look.light { light } else { dark });
+        let mut p = if look.mono {
+            // Black, greys and white: no blue tint anywhere.
+            Palette {
+                light: false,
+                glass,
+                anim: look.anim,
+                accent,
+                bg: rgb(0x1a1a1a),
+                bg2: rgb(0x111111),
+                side: rgb(0x0c0c0c),
+                border: rgb(0x343434),
+                card: rgb(0x212121),
+                card_hover: rgb(0x2c2c2c),
+                field: rgb(0x161616),
+                text: rgb(0xf2f2f2),
+                muted: rgb(0x9c9c9c),
+                green: rgb(0x3ecf8e),
+                yellow: rgb(0xf0b43c),
+                red: rgb(0xf0605f),
+                tile2: rgb(0x2e2e2e),
+                widget_hover: rgb(0x3a3a3a),
+            }
+        } else if look.light {
             Palette {
                 light: true,
                 glass,
@@ -712,7 +737,7 @@ fn lamp(ui: &egui::Ui, c: egui::Pos2, r: f32, level: Option<netq::Level>, alpha:
 /// moves over it and fades out ~3 s after the last movement.
 fn preview_block(ui: &mut egui::Ui, on: &mut bool, s: &Session, can_change: bool) -> PvAction {
     let mut action = PvAction::None;
-    if ui.checkbox(on, "Показывать превью").changed() {
+    if ui.checkbox(on, "Превью трансляции").changed() {
         save_show_preview(*on);
     }
     if !*on || !s.connected || s.ended {
@@ -926,12 +951,16 @@ fn build_picks(monitors: &[String], rects: &[(i32, i32, u32, u32)], primary: usi
 
 struct GuiApp {
     page: Page,
+    /// The viewer's request for control was already flashed on the taskbar (once per request).
+    asked_seen: bool,
+    /// Settings tab: 0 quality of the stream, 1 look, 2 checks.
+    settings_tab: u32,
     monitors: Vec<String>,
     /// Position and size of every monitor on the desktop (for the picker's pictures).
     rects: Vec<(i32, i32, u32, u32)>,
     /// Index of the primary monitor ("Весь экран"; also the canvas size when one window is shown).
     primary: usize,
-    /// "Что показывать": the choice, its text (kept in case the window vanished from the list) and the windows.
+    /// "Что транслировать": the choice, its text (kept in case the window vanished from the list) and the windows.
     choice: Choice,
     choice_label: String,
     windows: Vec<WinEntry>,
@@ -1042,6 +1071,8 @@ impl GuiApp {
         );
         GuiApp {
             page: if first_run { Page::Welcome } else { Page::Host },
+            settings_tab: 0,
+            asked_seen: false,
             monitors,
             rects: mons.iter().map(|m| (m.left, m.top, m.width, m.height)).collect(),
             primary: monitor,
@@ -1120,7 +1151,7 @@ impl GuiApp {
         a
     }
 
-    /// "Начать показ" (also "Повторить" after a failure: a short code is made anew, the old one is spent).
+    /// "Начать трансляцию" (also "Повторить" after a failure: a short code is made anew, the old one is spent).
     fn start_host(&mut self, ctx: &egui::Context) {
         let mut args = self.host_args("host");
         if self.ctl.allow {
@@ -1201,11 +1232,11 @@ fn cue_for(s: &mut Session) -> Option<crate::cues::Cue> {
 
 impl GuiApp {
     fn set_look(&mut self, ctx: &egui::Context, look: lg::Look) {
-        let theme_changed = look.light != self.look.light;
+        let theme_changed = look.theme() != self.look.theme();
         self.look = look;
         apply_theme(ctx, look, self.glass);
         let b = |v: bool| if v { "1" } else { "0" };
-        crate::volume::write_setting("theme", if look.light { "light" } else { "dark" });
+        crate::volume::write_setting("theme", look.theme().key());
         crate::volume::write_setting("accent", look.accent.key());
         crate::volume::write_setting("anim", b(look.anim));
         crate::volume::write_setting("sounds", b(look.sounds));
@@ -1380,6 +1411,7 @@ impl eframe::App for GuiApp {
                             ui.add_space((1.0 - tr) * 16.0);
                             ui.ctx().request_repaint();
                         }
+                        self.control_ask(ui);
                         match self.page {
                             Page::Welcome => self.welcome(ui),
                             Page::Host => self.host_page(ui),
@@ -1395,6 +1427,75 @@ impl eframe::App for GuiApp {
                 });
             });
         });
+    }
+}
+
+impl GuiApp {
+    /// The viewer asks for control (v0.12.8): a card on top of every page with «Разрешить» / «Отклонить», and the
+    /// taskbar button flashes once per request (the banner on the screen itself is drawn by the host process).
+    fn control_ask(&mut self, ui: &mut egui::Ui) {
+        let asked = self.host.as_ref().is_some_and(|s| !s.ended && s.ctrl.is_some_and(|c| c.asked && !c.on));
+        if !asked {
+            self.asked_seen = false;
+            return;
+        }
+        if !self.asked_seen {
+            self.asked_seen = true;
+            use windows::Win32::UI::WindowsAndMessaging::{FlashWindowEx, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG};
+            let fi = FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd: windows::Win32::Foundation::HWND(self.hwnd as *mut core::ffi::c_void),
+                dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                uCount: 0,
+                dwTimeout: 0,
+            };
+            unsafe {
+                let _ = FlashWindowEx(&fi);
+            }
+        }
+        let mut answer = None;
+        egui::Frame::new()
+            .fill(c_card())
+            .stroke(Stroke::new(2.0, c_yellow()))
+            .corner_radius(14)
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("Зритель просит управление").font(bold(17.0)));
+                ui.label(
+                    RichText::new("Разрешите — и он сможет управлять вашим компьютером мышью, клавиатурой и геймпадом (что именно — на странице «Удалённое управление»). Забрать управление в любой момент: Ctrl+Alt+Shift+F12.")
+                        .color(c_muted())
+                        .size(13.0),
+                );
+                ui.add_space(6.0);
+                ui.columns(2, |c| {
+                    if big_button_i(&mut c[0], Some(Ico::Check), "Разрешить", c_green(), true) {
+                        answer = Some(true);
+                    }
+                    if big_button_i(&mut c[1], Some(Ico::Cross), "Отклонить", c_card_hover(), true) {
+                        answer = Some(false);
+                    }
+                });
+            });
+        ui.add_space(10.0);
+        if let (Some(yes), Some(s)) = (answer, self.host.as_mut()) {
+            if yes {
+                self.ctl.allow = true;
+                if !self.ctl.pad && !self.ctl.kbm {
+                    self.ctl.kbm = true;
+                    self.ctl.pad = true;
+                }
+                s.revoke_event = false;
+                s.proc.send(&lg::control_line(true, self.ctl.pad, self.ctl.kbm));
+            } else {
+                s.proc.send(lg::CONTROL_DENY);
+            }
+            // Until the host's next status line arrives, don't show the card again.
+            if let Some(c) = s.ctrl.as_mut() {
+                c.asked = false;
+            }
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
 }
 
@@ -1463,7 +1564,7 @@ impl GuiApp {
         let dot = |s: &Option<Session>| s.as_ref().filter(|s| s.active()).map(|s| if s.connected { c_green() } else { c_accent() });
         let host_live = dot(&self.host);
         let join_live = dot(&self.join);
-        if nav_item(ui, Ico::Monitor, "Показать", self.page == Page::Host, host_live) && self.page != Page::Host {
+        if nav_item(ui, Ico::Monitor, "Транслировать", self.page == Page::Host, host_live) && self.page != Page::Host {
             self.windows = wincap::list_windows();
             self.thumbs.last_list = Instant::now();
             self.page = Page::Host;
@@ -1575,7 +1676,7 @@ impl GuiApp {
 
     /// "Удалённое управление": the full card (devices, driver and its install button, the emergency hotkey).
     fn control_page(&mut self, ui: &mut egui::Ui) {
-        if crumb(ui, "Показать") {
+        if crumb(ui, "Транслировать") {
             self.page = Page::Host;
             return;
         }
@@ -1589,7 +1690,7 @@ impl GuiApp {
     /// The bottom strip: the network lamp and one line about the live session (the viewer's, the sharer's).
     fn status_bar(&self, ui: &mut egui::Ui) {
         let live = [
-            self.host.as_ref().map(|s| ("Показ", s)),
+            self.host.as_ref().map(|s| ("Трансляция", s)),
             self.join.as_ref().map(|s| ("Просмотр", s)),
             self.test.as_ref().map(|(h, _, _, _)| ("Проверка", h)),
         ]
@@ -1618,8 +1719,8 @@ impl GuiApp {
     }
 }
 
-/// Height taken on the host page by everything except the picker's cards (head, card margins, quality, button).
-const HOST_FIXED_H: f32 = 435.0;
+/// Height taken on the host page by everything except the picker's cards (head, card margins, settings line, button).
+const HOST_FIXED_H: f32 = 270.0;
 
 /// A row of equal segments (title + small line), one of them chosen. Returns the value that was clicked.
 fn segmented(ui: &mut egui::Ui, items: &[(&str, &str, u32)], cur: u32) -> Option<u32> {
@@ -2633,7 +2734,7 @@ impl GuiApp {
         });
     }
 
-    /// "Что показывать" before the start.
+    /// "Что транслировать" before the start.
     fn pick_source(&mut self, ui: &mut egui::Ui) {
         self.pick_source_h(ui, 352.0);
     }
@@ -2652,7 +2753,7 @@ impl GuiApp {
         }
         if matches!(self.choice, Choice::Window(_)) {
             ui.label(
-                RichText::new("Зрители увидят только это окно. Если окно закроется — будет показан весь экран.").color(c_muted()).size(13.0),
+                RichText::new("Зрители увидят только это окно. Если окно закроется — будет транслироваться весь экран.").color(c_muted()).size(13.0),
             );
         }
     }
@@ -2714,21 +2815,52 @@ impl GuiApp {
         }
     }
 
-    /// "Настройки": the look, and the entry to the self-test.
+    /// One quiet line under «Начать трансляцию»: what quality is set, and a way to the settings. True: clicked.
+    fn settings_line(&self, ui: &mut egui::Ui) -> bool {
+        let q = match self.bitrate {
+            0 => "Авто".to_string(),
+            v => format!("{v} Мбит/с"),
+        };
+        let snd = if self.audio { "со звуком" } else { "без звука" };
+        ui.add_space(4.0);
+        ui.vertical_centered(|ui| {
+            ui.add(egui::Button::new(RichText::new(format!("Качество: {q} · до {} к/с · {snd} — изменить в настройках", self.fps)).color(c_muted()).size(13.0)).frame(false))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+        })
+        .inner
+    }
+
+    /// "Настройки": three tabs in a row: quality of the stream, the look, checks.
     fn settings_page(&mut self, ui: &mut egui::Ui) {
-        page_head(ui, Ico::Gear, "Настройки", "Оформление и проверка на этом компьютере");
-        section(ui, |ui| self.look_settings(ui));
+        page_head(ui, Ico::Gear, "Настройки", "Качество трансляции, оформление и проверка");
+        let tabs = [("Качество трансляции", "скорость, плавность, звук", 0), ("Оформление", "тема и цвет", 1), ("Проверка", "этот ПК и геймпад", 2)];
+        if let Some(v) = segmented(ui, &tabs, self.settings_tab) {
+            self.settings_tab = v;
+        }
+        ui.add_space(4.0);
+        match self.settings_tab {
+            0 => {
+                self.quality_card(ui);
+                section(ui, |ui| self.advanced(ui, false, true, true));
+            }
+            1 => section(ui, |ui| self.look_settings(ui)),
+            _ => self.check_settings(ui),
+        }
+    }
+
+    fn check_settings(&mut self, ui: &mut egui::Ui) {
         section(ui, |ui| {
             ui.label(RichText::new("Проверка").font(bold(16.0)));
             ui.label(
-                RichText::new("Показ и просмотр на одном компьютере: вы увидите то же, что увидит зритель. Качество, звук и порт настраиваются на странице показа.")
+                RichText::new("Трансляция и просмотр на одном компьютере: вы увидите то же, что увидит зритель.")
                     .color(c_muted())
                     .size(13.0),
             );
             let busy = self.host.as_ref().is_some_and(|s| s.active()) || self.join.as_ref().is_some_and(|s| s.active());
             let r = ui.add_enabled_ui(!busy, |ui| big_button_i(ui, Some(Ico::Play), "Проверить на этом ПК", c_card_hover(), true)).inner;
             if busy {
-                ui.label(RichText::new("Сначала остановите текущий показ или просмотр.").color(c_muted()).size(12.5));
+                ui.label(RichText::new("Сначала остановите текущую трансляцию или просмотр.").color(c_muted()).size(12.5));
             }
             if r && !busy {
                 self.windows = wincap::list_windows();
@@ -2755,7 +2887,7 @@ impl GuiApp {
             self.page = Page::Settings;
             return;
         }
-        page_head(ui, Ico::Pad, "Тест геймпада", "Нажмите кнопки и подвигайте стики: так увидит показывающий");
+        page_head(ui, Ico::Pad, "Тест геймпада", "Нажмите кнопки и подвигайте стики: так увидит транслирующий");
         let xi = self.xi.get_or_insert_with(crate::xinput::XInput::load);
         let Some(xi) = xi.as_ref() else {
             section(ui, |ui| {
@@ -2783,7 +2915,7 @@ impl GuiApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("Геймпад {}", slot + 1)).font(bold(16.0)));
                     if let Some(v) = virt {
-                        ui.label(RichText::new(format!("→ виртуальный геймпад {v} у показывающего")).color(c_muted()));
+                        ui.label(RichText::new(format!("→ виртуальный геймпад {v} у транслирующего")).color(c_muted()));
                     }
                 });
                 pad_view(ui, st);
@@ -2799,7 +2931,7 @@ impl GuiApp {
         section(ui, |ui| {
             ui.label(
                 RichText::new(
-                    "Геймпады передаются по порядку: первый подключённый становится геймпадом 1 у показывающего, второй — геймпадом 2 и так до четырёх. \
+                    "Геймпады передаются по порядку: первый подключённый становится геймпадом 1 у транслирующего, второй — геймпадом 2 и так до четырёх. \
                      Во время просмотра эту же проверку можно открыть клавишей F2.",
                 )
                 .color(c_muted())
@@ -2812,10 +2944,10 @@ impl GuiApp {
     fn about_page(&mut self, ui: &mut egui::Ui) {
         page_head(ui, Ico::Info, "О программе", &format!("screenshare {}", env!("CARGO_PKG_VERSION")));
         section(ui, |ui| {
-            ui.label(RichText::new("Показ экрана напрямую, без серверов").font(bold(16.0)));
+            ui.label(RichText::new("Трансляция экрана напрямую, без серверов").font(bold(16.0)));
             ui.add(egui::Label::new(
                 RichText::new(
-                    "Видео и звук идут по прямому соединению между показывающим и зрителем, без промежуточных серверов. \
+                    "Видео и звук идут по прямому соединению между транслирующим и зрителем, без промежуточных серверов. \
                      Единственное, что может проходить через сервер, — короткий код в режиме «простое подключение (beta)»: он передаётся в зашифрованном виде через публичный сервер ntfy.sh.",
                 )
                 .color(c_muted())
@@ -2875,11 +3007,10 @@ impl GuiApp {
         ui.label(RichText::new("Оформление").font(bold(16.0)));
         ui.horizontal_wrapped(|ui| {
             ui.add_sized([44.0, 34.0], egui::Label::new(RichText::new("Тема").color(c_muted())));
-            if chip(ui, "Тёмная", !look.light, None) {
-                look.light = false;
-            }
-            if chip(ui, "Светлая", look.light, None) {
-                look.light = true;
+            for t in lg::Theme::ALL {
+                if chip(ui, t.label(), look.theme() == t, None) {
+                    look = look.with_theme(t);
+                }
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -2893,7 +3024,7 @@ impl GuiApp {
         });
         ui.checkbox(&mut look.anim, "Плавные анимации");
         ui.checkbox(&mut look.sounds, "Звуковые сигналы: подключение, отключение, ошибка").on_hover_text(
-            "Тихие короткие звуки. Пока идёт показ экрана, они молчат (звук компьютера уходит в трансляцию) — отключение и ошибки звучат уже после остановки.",
+            "Тихие короткие звуки. Пока идёт трансляция, они молчат (звук компьютера уходит в трансляцию) — отключение и ошибки звучат уже после остановки.",
         );
         let r = ui.add_enabled(self.glass_ok, egui::Checkbox::new(
                 &mut look.glass,
@@ -2921,7 +3052,7 @@ impl GuiApp {
         });
         ui.add_space(14.0);
         let tips = [
-            (Ico::Monitor, "Покажите экран", "Нажмите «Показать экран», выберите окно или весь экран и передайте зрителю код."),
+            (Ico::Monitor, "Транслируйте экран", "Нажмите «Транслировать экран», выберите окно или весь экран и передайте зрителю код."),
             (Ico::Eye, "Смотрите трансляцию", "Зрителю нужно нажать «Смотреть» и вставить ваш код. Видео и звук идут напрямую, без серверов."),
             (Ico::Wifi, "Следите за лампочкой", "Зелёная — всё хорошо, жёлтая — сеть слабая, красная — картинка будет терять качество. В окне просмотра: F11 — полный экран, колесо мыши — громкость."),
         ];
@@ -3014,7 +3145,7 @@ impl GuiApp {
 
     fn host_page(&mut self, ui: &mut egui::Ui) {
         if let Some(b) = self.tab_busy(lg::Tab::Host) {
-            page_head(ui, Ico::Monitor, "Показать экран", "Сейчас занято другим");
+            page_head(ui, Ico::Monitor, "Транслировать экран", "Сейчас занято другим");
             self.busy_notice(ui, b);
             return;
         }
@@ -3022,7 +3153,7 @@ impl GuiApp {
         page_head(
             ui,
             Ico::Monitor,
-            "Показать экран",
+            "Транслировать экран",
             if self.host.as_ref().is_some_and(|s| s.ctrl.is_some_and(|c| c.active)) {
                 "Зритель управляет вашим компьютером"
             } else if live {
@@ -3030,27 +3161,28 @@ impl GuiApp {
             } else if self.host.as_ref().is_some_and(|s| s.active()) {
                 "Идёт подключение"
             } else {
-                "Выберите, что показать, и нажмите «Начать»"
+                "Выберите, что транслировать, и нажмите «Начать трансляцию»"
             },
         );
 
         let Some(s) = &mut self.host else {
             section(ui, |ui| {
-                ui.label(RichText::new("Что показывать").font(bold(15.0)));
+                ui.label(RichText::new("Что транслировать").font(bold(15.0)));
                 // The cards give way so that quality and the start button stay on the screen (at 1024x740 and up).
                 let room = ui.ctx().content_rect().height() - 32.0 - HOST_FIXED_H;
                 self.pick_source_h(ui, room.clamp(170.0, 352.0));
             });
-            self.quality_card(ui);
             if let Some(e) = &self.start_error {
                 error_text(ui, e);
             }
-            if big_button_i(ui, Some(Ico::Play), "Начать показ", c_accent(), !self.monitors.is_empty()) {
+            if big_button_i(ui, Some(Ico::Play), "Начать трансляцию", c_accent(), !self.monitors.is_empty()) {
                 let ctx = ui.ctx().clone();
                 self.start_host(&ctx);
             }
-            ui.add_space(6.0);
-            fold(ui, "Дополнительно", |ui| self.advanced(ui, false, true, true));
+            if self.settings_line(ui) {
+                self.settings_tab = 0;
+                self.page = Page::Settings;
+            }
             return;
         };
 
@@ -3105,7 +3237,7 @@ impl GuiApp {
                         let mut windows = std::mem::take(&mut self.windows);
                         picked = source_picker(ui, &mut self.thumbs, &mut windows, &self.monitors, &self.rects, self.primary, self.choice, 352.0);
                         self.windows = windows;
-                        ui.label(RichText::new("Можно менять, не останавливая показ.").color(c_muted()).size(12.5));
+                        ui.label(RichText::new("Можно менять, не останавливая трансляцию.").color(c_muted()).size(12.5));
                     });
                     if std::mem::take(&mut self.pick_scroll) {
                         ui.scroll_to_rect(r.header_response.rect, Some(egui::Align::TOP));
@@ -3160,7 +3292,7 @@ impl GuiApp {
                     ui.label(RichText::new("Трансляция завершена").font(bold(20.0)));
                     ui.label(RichText::new(&s.status).color(c_muted()));
                 });
-                if big_button_i(ui, Some(Ico::Retry), "Показать снова", c_accent(), true) {
+                if big_button_i(ui, Some(Ico::Retry), "Транслировать снова", c_accent(), true) {
                     let ctx = ui.ctx().clone();
                     self.start_host(&ctx);
                 } else if big_button_i(ui, Some(Ico::Cross), "Закрыть", c_card_hover(), true) {
@@ -3212,7 +3344,7 @@ impl GuiApp {
             return;
         }
         let live = self.join.as_ref().is_some_and(|s| s.connected && s.active());
-        page_head(ui, Ico::Eye, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Нужен код от показывающего: он нажимает «Показать экран» и присылает код" });
+        page_head(ui, Ico::Eye, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Нужен код от транслирующего: он нажимает «Транслировать экран» и присылает код" });
 
         if let Some(s) = &mut self.join {
             if s.connected && !s.ended {
@@ -3269,7 +3401,7 @@ impl GuiApp {
             section(ui, |ui| {
                 step(ui, 1, &format!("Код {}", s.room.as_deref().unwrap_or("")));
                 ui.label(
-                    RichText::new("Окно «Показать экран» на другой стороне должно оставаться открытым. Если не выходит дольше минуты — отмените и используйте обычный длинный код.")
+                    RichText::new("Окно «Транслировать экран» на другой стороне должно оставаться открытым. Если не выходит дольше минуты — отмените и используйте обычный длинный код.")
                         .color(c_muted())
                         .size(13.0),
                 );
@@ -3337,7 +3469,7 @@ impl GuiApp {
         } else {
             let s = self.join.as_mut().unwrap();
             section(ui, |ui| {
-                step(ui, 2, "Передайте показывающему код ответа");
+                step(ui, 2, "Передайте транслирующему код ответа");
                 code_box(ui, s.code.as_ref().unwrap(), &mut self.copied_at);
             });
         }
@@ -3357,22 +3489,22 @@ impl GuiApp {
             self.page = Page::Settings;
             return;
         }
-        page_head(ui, Ico::Play, "Проверить на этом ПК", "Показ и просмотр на одном ПК — как увидит зритель");
+        page_head(ui, Ico::Play, "Проверить на этом ПК", "Трансляция и просмотр на одном ПК — как увидит зритель");
 
         if let Some((h, _, _, _)) = &mut self.test {
             drive_preview(ui.ctx(), self.show_preview, h); // the streaming side makes the pictures
         }
         let Some((h, c, _, _)) = &self.test else {
             section(ui, |ui| {
-                ui.label(RichText::new("Что показывать").font(bold(15.0)));
+                ui.label(RichText::new("Что транслировать").font(bold(15.0)));
                 self.pick_source(ui);
             });
             section(ui, |ui| {
                 ui.label(RichText::new("Совет").font(bold(15.0)));
                 ui.label(
                     RichText::new(
-                        "Окно просмотра откроется отдельно. Если показывать тот же монитор, на котором это окно, \
-                         получится «зеркало в зеркале» — это нормально. Нагляднее показывать второй монитор. \
+                        "Окно просмотра откроется отдельно. Если транслировать тот же монитор, на котором это окно, \
+                         получится «зеркало в зеркале» — это нормально. Нагляднее транслировать второй монитор. \
                          Звук в проверке не передаётся, чтобы не было эха.",
                     )
                     .color(c_muted())
@@ -3394,7 +3526,10 @@ impl GuiApp {
                 }
             }
             ui.add_space(6.0);
-            fold(ui, "Дополнительно", |ui| self.advanced(ui, true, false, false));
+            if self.settings_line(ui) {
+                self.settings_tab = 0;
+                self.page = Page::Settings;
+            }
             return;
         };
 

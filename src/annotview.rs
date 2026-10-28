@@ -11,6 +11,7 @@ use windows::core::{w, Result};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::*;
+use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -25,7 +26,8 @@ pub struct AnnotView {
 }
 
 impl AnnotView {
-    pub fn spawn(region: Arc<Mutex<Option<Region>>>) -> AnnotView {
+    /// `input`: the remote-control side, for the «the viewer asks for control» banner (v0.12.8).
+    pub fn spawn(region: Arc<Mutex<Option<Region>>>, input: Option<Arc<inputhost::InputHost>>) -> AnnotView {
         let board = Arc::new(Mutex::new(Board::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let enabled = Arc::new(AtomicBool::new(load_enabled()));
@@ -33,7 +35,7 @@ impl AnnotView {
         std::thread::Builder::new()
             .name("annot-view".into())
             .spawn(move || {
-                if let Err(err) = run(&b, &s, &e, &region) {
+                if let Err(err) = run(&b, &s, &e, &region, input.as_deref()) {
                     crate::net::conn_log(&format!("указка: окно не создано: {err}"));
                 }
             })
@@ -67,6 +69,7 @@ pub fn load_enabled() -> bool {
 
 struct Gfx {
     rt: ID2D1DCRenderTarget,
+    text: IDWriteTextFormat,
     dc: HDC,
     bmp: HBITMAP,
     cap: (i32, i32),
@@ -81,7 +84,12 @@ fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
-fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &Mutex<Option<Region>>) -> Result<()> {
+/// The banner at the top of the streamed screen while the viewer asks for control.
+const BANNER: &str = "Зритель просит управление — разрешите или отклоните в окне screenshare";
+const BANNER_W: f32 = 760.0;
+const BANNER_H: f32 = 54.0;
+
+fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &Mutex<Option<Region>>, input: Option<&inputhost::InputHost>) -> Result<()> {
     let hwnd = unsafe {
         let inst = GetModuleHandleW(None)?;
         let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: inst.into(), lpszClassName: w!("ScreenshareAnnot"), ..Default::default() };
@@ -112,7 +120,7 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
     };
     let mut gfx: Option<Gfx> = None;
     let mut shown = false;
-    let mut last_drawn: Option<(Option<(i32, i32)>, usize)> = None;
+    let mut last_drawn: Option<(Option<(i32, i32)>, usize, bool)> = None;
     // The dot glides toward the newest spot (packets come unevenly over the internet); jumps far away snap.
     let mut glide: Option<(f32, f32)> = None;
     let mut last_frame = Instant::now();
@@ -125,8 +133,9 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
         }
         let now = Instant::now();
         let reg = *region.lock().unwrap();
+        let asking = input.is_some_and(|i| i.asking(now));
         let mut b = board.lock().unwrap();
-        let busy = enabled.load(Ordering::Relaxed) && b.busy(now);
+        let busy = enabled.load(Ordering::Relaxed) && b.busy(now) || asking;
         let (Some(reg), true) = (reg, busy) else {
             drop(b);
             if shown {
@@ -164,7 +173,7 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
             .collect();
         drop(b);
         // A still laser and nothing moving: nothing to redraw.
-        let key = (laser, items.len());
+        let key = (laser, items.len(), asking);
         if items.is_empty() && last_drawn == Some(key) {
             std::thread::sleep(Duration::from_millis(2));
             continue;
@@ -181,13 +190,19 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
         for (_, (x, y), _, _, _) in &items {
             grow(*x, *y, STICKER * 0.55);
         }
+        // Top centre of the streamed monitor / window.
+        let banner = asking.then(|| inputhost::region_rect(reg)).flatten().map(|(rl, rt, rw, _)| (rl as f32 + rw as f32 / 2.0, rt as f32 + 80.0));
+        if let Some((x, y)) = banner {
+            grow(x - BANNER_W / 2.0 + BANNER_H / 2.0, y, BANNER_H / 2.0 + 2.0);
+            grow(x + BANNER_W / 2.0 - BANNER_H / 2.0, y, BANNER_H / 2.0 + 2.0);
+        }
         let (l, t) = (bb.0.floor() as i32 - PAD, bb.1.floor() as i32 - PAD);
         let (w, h) = ((bb.2.ceil() as i32 + PAD - l).max(1), (bb.3.ceil() as i32 + PAD - t).max(1));
         if gfx.as_ref().is_none_or(|g| g.cap.0 < w || g.cap.1 < h) {
             gfx = Some(make_gfx(w.max(256), h.max(256))?);
         }
         let g = gfx.as_ref().unwrap();
-        draw(g, (l, t, w, h), laser, &items)?;
+        draw(g, (l, t, w, h), laser, &items, banner)?;
         unsafe {
             let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8, ..Default::default() };
             let _ = UpdateLayeredWindow(
@@ -240,6 +255,10 @@ fn make_gfx(w: i32, h: i32) -> Result<Gfx> {
             minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
         };
         let rt = d2d.CreateDCRenderTarget(&props)?;
+        let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+        let text = dw.CreateTextFormat(w!("Segoe UI"), None, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 19.0, w!("ru-ru"))?;
+        text.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+        text.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
         let dc = CreateCompatibleDC(None);
         let bi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -256,11 +275,11 @@ fn make_gfx(w: i32, h: i32) -> Result<Gfx> {
         let mut bits = std::ptr::null_mut();
         let bmp = CreateDIBSection(Some(dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0)?;
         SelectObject(dc, bmp.into());
-        Ok(Gfx { rt, dc, bmp, cap: (w, h) })
+        Ok(Gfx { rt, text, dc, bmp, cap: (w, h) })
     }
 }
 
-fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, items: &[(usize, (f32, f32), f32, f32, Duration)]) -> Result<()> {
+fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, items: &[(usize, (f32, f32), f32, f32, Duration)], banner: Option<(f32, f32)>) -> Result<()> {
     let rt = &g.rt;
     unsafe {
         rt.BindDC(g.dc, &RECT { left: 0, top: 0, right: w, bottom: h })?;
@@ -282,6 +301,18 @@ fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, 
             let dst = D2D_RECT_F { left: x - r, top: y - r, right: x + r, bottom: y + r };
             rt.DrawBitmap(&bmp, Some(&dst), *alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
         }
+        if let Some((x, y)) = banner {
+            let (x, y) = (x - ox, y - oy);
+            let brush = rt.CreateSolidColorBrush(&color(0.07, 0.09, 0.13, 0.94), None)?;
+            let r = D2D_RECT_F { left: x - BANNER_W / 2.0, top: y - BANNER_H / 2.0, right: x + BANNER_W / 2.0, bottom: y + BANNER_H / 2.0 };
+            let rr = D2D1_ROUNDED_RECT { rect: r, radiusX: 14.0, radiusY: 14.0 };
+            rt.FillRoundedRectangle(&rr, &brush);
+            brush.SetColor(&color(0.94, 0.71, 0.24, 1.0));
+            rt.DrawRoundedRectangle(&rr, &brush, 2.0, None);
+            brush.SetColor(&color(1.0, 1.0, 1.0, 1.0));
+            let txt: Vec<u16> = BANNER.encode_utf16().collect();
+            rt.DrawText(&txt, &g.text, &r, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+        }
         if let Some((x, y)) = laser {
             let (x, y) = (x as f32 - ox, y as f32 - oy);
             let brush = rt.CreateSolidColorBrush(&color(1.0, 0.0, 0.0, 1.0), None)?;
@@ -297,7 +328,7 @@ fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, 
 
 /// `annottest`: shows the laser walking across `region`, every sticker once, then a burst of clicks (~7 s).
 pub fn demo(region: Region) {
-    let v = AnnotView::spawn(Arc::new(Mutex::new(Some(region))));
+    let v = AnnotView::spawn(Arc::new(Mutex::new(Some(region))), None);
     v.enabled.store(true, Ordering::Relaxed);
     let mut s = annot::Sender::new(1);
     let t0 = Instant::now();

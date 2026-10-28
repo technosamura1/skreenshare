@@ -255,11 +255,13 @@ pub struct CtrlInfo {
     /// The host's cursor is hidden (a game took the mouse): the viewer's own pointer should hide too, and only raw
     /// motion counts. Otherwise the host follows the pointer's position on the picture (since 0.11.7).
     pub relative: bool,
+    /// The owner turned down the viewer's request for control (a while; v0.12.8).
+    pub denied: bool,
 }
 
 pub fn encode_ctrl(c: &CtrlInfo, out: &mut Vec<u8>) {
     out.push(VERSION);
-    out.push(c.allowed as u8 | (c.pad as u8) << 1 | (c.kbm as u8) << 2 | (c.vigem as u8) << 3 | (c.relative as u8) << 4);
+    out.push(c.allowed as u8 | (c.pad as u8) << 1 | (c.kbm as u8) << 2 | (c.vigem as u8) << 3 | (c.relative as u8) << 4 | (c.denied as u8) << 5);
     out.push(c.pads);
 }
 
@@ -268,7 +270,7 @@ pub fn decode_ctrl(body: &[u8]) -> Option<CtrlInfo> {
         return None;
     }
     let f = body[1];
-    Some(CtrlInfo { allowed: f & 1 != 0, pad: f & 2 != 0, kbm: f & 4 != 0, vigem: f & 8 != 0, pads: body[2], relative: f & 16 != 0 })
+    Some(CtrlInfo { allowed: f & 1 != 0, pad: f & 2 != 0, kbm: f & 4 != 0, vigem: f & 8 != 0, pads: body[2], relative: f & 16 != 0, denied: f & 32 != 0 })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -406,7 +408,7 @@ mod tests {
 
     #[test]
     fn ctrl_and_rumble_round_trip() {
-        let c = CtrlInfo { allowed: true, pad: false, kbm: true, vigem: true, pads: 2, relative: true };
+        let c = CtrlInfo { allowed: true, pad: false, kbm: true, vigem: true, pads: 2, relative: true, denied: true };
         let mut b = Vec::new();
         encode_ctrl(&c, &mut b);
         assert_eq!(decode_ctrl(&b), Some(c));

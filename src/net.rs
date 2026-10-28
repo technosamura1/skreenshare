@@ -40,6 +40,8 @@ pub const PT_CTRL: u8 = 0xA9;
 pub const PT_RUMBLE: u8 = 0xAA;
 /// Viewer -> host laser pointer and reactions (annot.rs, v0.11.8). Old hosts ignore it.
 pub const PT_ANNOT: u8 = 0xAB;
+/// Viewer -> host: «I'd like to control» (ver u8 = 1 | want u8), about once a second while waiting (v0.12.8).
+pub const PT_CTLREQ: u8 = 0xAC;
 
 pub const ROLE_HOST: u8 = 1;
 pub const ROLE_CLIENT: u8 = 2;

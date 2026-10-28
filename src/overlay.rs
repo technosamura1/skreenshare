@@ -170,7 +170,7 @@ pub fn pad_panel(b: &mut Buf, s: i32, rows: &[PadRow], control_note: &str, alpha
     for (i, r) in rows.iter().enumerate() {
         let ry = y + 52 * s + row_h * i as i32;
         let title = match r.virt {
-            Some(v) => format!("Ваш геймпад {} → виртуальный геймпад {} у показывающего", r.slot + 1, v),
+            Some(v) => format!("Ваш геймпад {} → виртуальный геймпад {} у транслирующего", r.slot + 1, v),
             None => format!("Ваш геймпад {} (не передаётся)", r.slot + 1),
         };
         b.text(x + 20 * s, ry, 13.0 * s as f32, &title, FG, alpha);

@@ -32,6 +32,8 @@ pub struct ViewInput {
     xi: Option<XInput>,
     /// The host took control away (shown once in the window).
     pub revoked_at: Mutex<Option<Instant>>,
+    /// The host turned down our request for control (shown once in the window).
+    pub denied_at: Mutex<Option<Instant>>,
     /// Laser pointer and reactions (work without remote control).
     annot: Mutex<crate::annot::Sender>,
 }
@@ -49,6 +51,7 @@ impl ViewInput {
             rumble: Mutex::new(RumbleRx::new()),
             xi: XInput::load(),
             revoked_at: Mutex::new(None),
+            denied_at: Mutex::new(None),
             annot: Mutex::new(crate::annot::Sender::new(start)),
         })
     }
@@ -64,6 +67,11 @@ impl ViewInput {
         if g.is_some_and(|(old, t)| old.allowed && !c.allowed && t.elapsed() < CTRL_TTL) && self.want.load(Ordering::Relaxed) {
             // The host took control away: let go of everything and show it.
             *self.revoked_at.lock().unwrap() = Some(Instant::now());
+            self.want.store(false, Ordering::Relaxed);
+        }
+        if c.denied && self.want.load(Ordering::Relaxed) && !c.allowed {
+            // The host said no: stop asking and show it.
+            *self.denied_at.lock().unwrap() = Some(Instant::now());
             self.want.store(false, Ordering::Relaxed);
         }
         *g = Some((c, Instant::now()));
@@ -177,6 +185,7 @@ impl ViewInput {
                 let mut known = [false; MAX_PADS];
                 let mut was_active = false;
                 let mut linger_until: Option<Instant> = None;
+                let mut last_ask: Option<Instant> = None;
                 while alive() {
                     let now = Instant::now();
                     // 1. gamepads
@@ -237,7 +246,15 @@ impl ViewInput {
                         crate::annot::encode(&a, &mut out);
                         let _ = sock.send_to(&out, host);
                     }
-                    // 4. motors stop by themselves when the host goes quiet
+                    // 4. asking the host for control (it shows the owner a notice), once a second while waiting
+                    let asking = me.want.load(Ordering::Relaxed) && me.host_info().is_some_and(|c| !c.allowed && !c.denied);
+                    if asking && last_ask.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) || !asking && last_ask.is_some() {
+                        net::write_header(&mut out, net::PT_CTLREQ, token);
+                        out.extend_from_slice(&[1, asking as u8]);
+                        let _ = sock.send_to(&out, host);
+                        last_ask = asking.then_some(now);
+                    }
+                    // 5. motors stop by themselves when the host goes quiet
                     for i in me.rumble.lock().unwrap().tick(now) {
                         me.vibrate_virtual(i, 0, 0);
                     }

@@ -142,15 +142,23 @@ pub enum Accent {
     Blue,
     Purple,
     Green,
+    Teal,
+    Orange,
+    Pink,
+    Grey,
 }
 
 impl Accent {
-    pub const ALL: [Accent; 3] = [Accent::Blue, Accent::Purple, Accent::Green];
+    pub const ALL: [Accent; 7] = [Accent::Blue, Accent::Purple, Accent::Green, Accent::Teal, Accent::Orange, Accent::Pink, Accent::Grey];
     pub fn key(self) -> &'static str {
         match self {
             Accent::Blue => "blue",
             Accent::Purple => "purple",
             Accent::Green => "green",
+            Accent::Teal => "teal",
+            Accent::Orange => "orange",
+            Accent::Pink => "pink",
+            Accent::Grey => "grey",
         }
     }
     pub fn label(self) -> &'static str {
@@ -158,13 +166,40 @@ impl Accent {
             Accent::Blue => "Синий",
             Accent::Purple => "Фиолетовый",
             Accent::Green => "Зелёный",
+            Accent::Teal => "Бирюзовый",
+            Accent::Orange => "Оранжевый",
+            Accent::Pink => "Розовый",
+            Accent::Grey => "Серый",
         }
     }
     pub fn parse(s: Option<&str>) -> Accent {
-        match s.map(str::trim) {
-            Some("purple") => Accent::Purple,
-            Some("green") => Accent::Green,
-            _ => Accent::Blue,
+        let s = s.map(str::trim);
+        Accent::ALL.into_iter().find(|a| Some(a.key()) == s).unwrap_or(Accent::Blue)
+    }
+}
+
+/// The theme: dark, light, or monochrome (black, greys and white; v0.12.8).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Theme {
+    Dark,
+    Light,
+    Mono,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 3] = [Theme::Dark, Theme::Light, Theme::Mono];
+    pub fn key(self) -> &'static str {
+        match self {
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+            Theme::Mono => "mono",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Dark => "Тёмная",
+            Theme::Light => "Светлая",
+            Theme::Mono => "Монохромная",
         }
     }
 }
@@ -173,6 +208,8 @@ impl Accent {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Look {
     pub light: bool,
+    /// Monochrome: black and greys instead of the blue-tinted dark theme (`light` is false then).
+    pub mono: bool,
     pub accent: Accent,
     /// Animations on (off = every change is instant and nothing repaints by itself).
     pub anim: bool,
@@ -184,11 +221,25 @@ pub struct Look {
 
 impl Default for Look {
     fn default() -> Look {
-        Look { light: false, accent: Accent::Blue, anim: true, sounds: true, glass: false }
+        Look { light: false, mono: false, accent: Accent::Blue, anim: true, sounds: true, glass: false }
     }
 }
 
 impl Look {
+    pub fn theme(&self) -> Theme {
+        if self.light {
+            Theme::Light
+        } else if self.mono {
+            Theme::Mono
+        } else {
+            Theme::Dark
+        }
+    }
+
+    pub fn with_theme(self, t: Theme) -> Look {
+        Look { light: t == Theme::Light, mono: t == Theme::Mono, ..self }
+    }
+
     /// Reads the keys `theme`, `accent`, `anim`, `sounds`, `glass`; anything unknown means the default.
     pub fn from_ini(text: &str) -> Look {
         let get = |t: &str, k: &str| crate::volume::ini_get(t, k).map(str::to_string);
@@ -198,8 +249,10 @@ impl Look {
             Some("0") => false,
             _ => def,
         };
+        let theme = get(text, "theme");
         Look {
-            light: get(text, "theme").as_deref().map(str::trim) == Some("light"),
+            light: theme.as_deref().map(str::trim) == Some("light"),
+            mono: theme.as_deref().map(str::trim) == Some("mono"),
             accent: Accent::parse(get(text, "accent").as_deref()),
             anim: flag("anim", d.anim),
             sounds: flag("sounds", d.sounds),
@@ -353,6 +406,8 @@ pub struct CtrlStatus {
     pub active: bool,
     /// The owner took control away with the emergency hotkey.
     pub revoked: bool,
+    /// The viewer is asking for control (not allowed yet).
+    pub asked: bool,
 }
 
 pub fn parse_ctrl(text: &str) -> Option<CtrlStatus> {
@@ -369,12 +424,16 @@ pub fn parse_ctrl(text: &str) -> Option<CtrlStatus> {
             "pads" => c.pads = v.parse().ok()?,
             "active" => c.active = b,
             "revoked" => c.revoked = b,
+            "asked" => c.asked = b,
             _ => continue,
         }
         seen += 1;
     }
     (seen >= 5).then_some(c)
 }
+
+/// The owner's «no» to the viewer's request for control.
+pub const CONTROL_DENY: &str = "CONTROL deny=1";
 
 /// The line the GUI sends to the host process when the owner changes the switches.
 pub fn control_line(on: bool, pad: bool, kbm: bool) -> String {
@@ -405,7 +464,7 @@ pub enum Occupied {
 impl Occupied {
     pub fn title(self) -> &'static str {
         match self {
-            Occupied::Host => "Сейчас идёт показ вашего экрана",
+            Occupied::Host => "Сейчас идёт трансляция вашего экрана",
             Occupied::Join => "Сейчас идёт просмотр",
             Occupied::Test => "Сейчас идёт проверка на этом ПК",
         }
@@ -413,14 +472,14 @@ impl Occupied {
     /// "перейти к ..." / "остановить ..." button texts.
     pub fn open_text(self) -> &'static str {
         match self {
-            Occupied::Host => "Перейти к показу",
+            Occupied::Host => "Перейти к трансляции",
             Occupied::Join => "Перейти к просмотру",
             Occupied::Test => "Перейти к проверке",
         }
     }
     pub fn stop_text(self) -> &'static str {
         match self {
-            Occupied::Host => "Остановить показ",
+            Occupied::Host => "Остановить трансляцию",
             Occupied::Join => "Остановить просмотр",
             Occupied::Test => "Остановить проверку",
         }
@@ -558,7 +617,9 @@ mod tests {
     fn look_defaults_and_parsing() {
         assert_eq!(Look::from_ini(""), Look::default());
         let l = Look::from_ini("theme=light\naccent=purple\nanim=0\nsounds=0\nglass=1\n");
-        assert_eq!(l, Look { light: true, accent: Accent::Purple, anim: false, sounds: false, glass: true });
+        assert_eq!(l, Look { light: true, mono: false, accent: Accent::Purple, anim: false, sounds: false, glass: true });
+        assert!(Look::from_ini("theme=mono\naccent=grey\n").mono);
+        assert_eq!(Look::from_ini("theme=mono\naccent=grey\n").accent, Accent::Grey);
         let l = Look::from_ini("theme=weird\naccent=pink\nanim=maybe\n");
         assert_eq!(l, Look::default());
         for a in Accent::ALL {
