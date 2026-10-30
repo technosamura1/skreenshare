@@ -45,7 +45,7 @@ fn curl() -> String {
 /// Downloads the official installer to `dest`. Refuses anything whose hash is not the pinned 1.22.0 file.
 fn download(dest: &Path) -> Result<()> {
     let out = Command::new(curl())
-        .args(["-fsSL", "-m", "120", "-o"])
+        .args(["-fsSL", "--http1.1", "--ipv4", "--ssl-no-revoke", "-m", "120", "-o"])
         .arg(dest)
         .arg(INSTALLER_URL)
         .creation_flags(0x0800_0000)

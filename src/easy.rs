@@ -287,7 +287,7 @@ mod tests {
     fn real_ntfy_roundtrip() {
         use std::process::Command;
         let run = |args: &[&str]| {
-            let o = Command::new("curl").args(["-sS", "-f", "-m", "20"]).args(args).output().unwrap();
+            let o = Command::new("curl").args(["-sS", "-f", "--http1.1", "--ipv4", "--ssl-no-revoke", "-m", "20"]).args(args).output().unwrap();
             assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
             String::from_utf8_lossy(&o.stdout).into_owned()
         };

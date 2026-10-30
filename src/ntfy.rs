@@ -28,17 +28,39 @@ fn curl() -> String {
 }
 
 fn run(args: &[&str]) -> Result<String> {
-    let out = Command::new(curl())
-        .args(["-sS", "-f", "-m", "20"])
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .context("не удалось запустить curl.exe")?;
-    if !out.status.success() {
-        let e = String::from_utf8_lossy(&out.stderr);
-        bail!("сервер подключения недоступен: {}", e.trim());
+    // Windows curl (Schannel) often dies on ntfy.sh with
+    // "curl: (35) Recv failure: Connection was reset": HTTP/2, a dead IPv6 route, or a
+    // revocation check that never answers. HTTP/1.1 + IPv4 + no revocation check still
+    // verifies the certificate. A reset is retried; an HTTP error is not.
+    let mut last = String::new();
+    for attempt in 0..3 {
+        let out = Command::new(curl())
+            .args(["-sS", "-f", "--http1.1", "--ipv4", "--ssl-no-revoke", "-m", "20"])
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .context("не удалось запустить curl.exe")?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if attempt == 2 || !transient(&last) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400 * (attempt as u64 + 1)));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    bail!("сервер подключения недоступен: {last}");
+}
+
+fn transient(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("(35)")
+        || e.contains("(56)")
+        || e.contains("(28)")
+        || e.contains("(7)")
+        || e.contains("connection was reset")
+        || e.contains("schannel")
+        || e.contains("timed out")
 }
 
 /// `since` for an ntfy poll: `all`, or a message id. Nothing else, so it cannot rewrite the URL.
