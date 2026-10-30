@@ -1041,12 +1041,16 @@ struct GuiApp {
     friend_inbox_since: String,
     friend_pair_since: HashMap<[u8; 16], String>,
     friend_last_seen: HashMap<[u8; 16], u64>,
-    friend_pending_invite: Option<(friends::Invite, [u8; 16])>,
+    /// Invites waiting for «Смотреть». A second one must not erase the first: the relay cursor
+    /// already moved past both, so the overwritten invite would never come back.
+    friend_pending_invites: Vec<(friends::Invite, [u8; 16])>,
     /// Offer we accepted: (friend, nonce). The viewer's C… code is posted back once the client prints it.
     friend_answer: Option<([u8; 16], String)>,
-    /// After an invite, poll those friends' pair topics every 5 s so a C… answer is not stuck behind presence.
-    /// Several invites at once each keep their own deadline.
+    /// After an invite, poll those friends' pair topics quickly so a C… answer is not stuck behind presence.
+    /// Several invites at once each keep their own deadline. Rush does not own the scheduler:
+    /// two rushed polls, then one ordinary step, still one HTTP call and never faster than 5 s.
     friend_rush_ids: HashMap<[u8; 16], Instant>,
+    friend_rush_i: usize,
     friend_rename_input: String,
     friend_rename_id: Option<[u8; 16]>,
     friend_show_my_code: bool,
@@ -1163,9 +1167,10 @@ impl GuiApp {
             friend_inbox_since: String::new(),
             friend_pair_since: HashMap::new(),
             friend_last_seen: HashMap::new(),
-            friend_pending_invite: None,
+            friend_pending_invites: Vec::new(),
             friend_answer: None,
             friend_rush_ids: HashMap::new(),
+            friend_rush_i: 0,
             friend_rename_input: String::new(),
             friend_rename_id: None,
             friend_show_my_code: false,
@@ -1648,7 +1653,7 @@ impl GuiApp {
         }
         let now_friends = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let n_friends = self.book.friends.len();
-        let friend_live = if self.friend_pending_invite.is_some() {
+        let friend_live = if !self.friend_pending_invites.is_empty() {
             Some(c_accent())
         } else if self.book.friends.iter().any(|f| friends::is_online(self.friend_last_seen.get(&f.id).copied(), now_friends, n_friends)) {
             Some(c_green())
@@ -1991,8 +1996,10 @@ impl GuiApp {
                             self.friend_last_seen.insert(id, unix);
                         }
                         PairEvent::Invite(inv) => {
-                            if friends::invite_fresh(inv.unix, now) {
-                                self.friend_pending_invite = Some((inv, id));
+                            if friends::invite_fresh(inv.unix, now)
+                                && !self.friend_pending_invites.iter().any(|(i, fid)| i.nonce == inv.nonce && *fid == id)
+                            {
+                                self.friend_pending_invites.push((inv, id));
                             }
                         }
                         PairEvent::Answer { code, .. } => {
@@ -2027,27 +2034,31 @@ impl GuiApp {
             }
         }
         let now = Instant::now();
-        self.friend_rush_ids.retain(|_, until| *until > now);
-        if !self.friend_rush_ids.is_empty() {
-            if self.friend_poll_last.is_some_and(|t| t.elapsed().as_millis() < friends::RELAY_MIN_GAP_MS as u128) {
-                return;
-            }
-            self.friend_poll_last = Some(now);
+        self.friend_rush_ids.retain(|id, until| *until > now && self.book.pair_topic(id).is_some());
+        let n = self.book.friends.len();
+        let rushing = !self.friend_rush_ids.is_empty();
+        // Rush used to return here and poll nobody else for 120 s, so another friend's invite
+        // sat unread. Falling through while the 5 s gap has not elapsed does nothing either:
+        // the ordinary cycle waits at least that long too. Take turns instead.
+        let gap = if rushing { friends::RELAY_MIN_GAP_MS } else { friends::relay_gap_ms(n) };
+        if self.friend_poll_last.is_some_and(|t| t.elapsed().as_millis() < gap as u128) {
+            return;
+        }
+        if rushing && self.friend_rush_i % 3 != 2 {
             let mut ids: Vec<[u8; 16]> = self.friend_rush_ids.keys().copied().collect();
             ids.sort();
-            let id = ids[self.friend_poll_i % ids.len()];
-            self.friend_poll_i = self.friend_poll_i.wrapping_add(1);
+            let id = ids[self.friend_rush_i % ids.len()];
+            self.friend_rush_i = self.friend_rush_i.wrapping_add(1);
+            self.friend_poll_last = Some(now);
             let since = self.friend_pair_since.get(&id).cloned().unwrap_or_default();
             let Some(topic) = self.book.pair_topic(&id) else { return };
             self.spawn_friend_get(FriendNetKind::Pair { id, since: since.clone() }, topic, since);
             return;
         }
-        let n = self.book.friends.len();
-        let gap = friends::relay_gap_ms(n);
-        if self.friend_poll_last.is_some_and(|t| t.elapsed().as_millis() < gap as u128) {
-            return;
+        if rushing {
+            self.friend_rush_i = self.friend_rush_i.wrapping_add(1);
         }
-        self.friend_poll_last = Some(Instant::now());
+        self.friend_poll_last = Some(now);
 
         let ops = (friends::ops_per_cycle(n) as usize).max(1);
         let i = self.friend_poll_i % ops;
@@ -2126,6 +2137,7 @@ impl GuiApp {
                             self.friend_pair_since.remove(&id);
                             self.friend_last_seen.remove(&id);
                         }
+                        self.friend_poll_i = 0;
                         friends::save_book(&friends::profile_dir(), &self.book);
                         self.friend_ok = Some("Друг записан, отправляю ему hello…".into());
                         self.friend_code_input.clear();
@@ -2209,11 +2221,14 @@ impl GuiApp {
                 self.book.remove(&id);
                 self.friend_last_seen.remove(&id);
                 self.friend_pair_since.remove(&id);
+                self.friend_rush_ids.remove(&id);
+                self.friend_poll_i = 0;
                 if self.friend_rename_id == Some(id) {
                     self.friend_rename_id = None;
                 }
-                if self.friend_pending_invite.as_ref().is_some_and(|(_, from)| *from == id) {
-                    self.friend_pending_invite = None;
+                self.friend_pending_invites.retain(|(_, fid)| *fid != id);
+                if self.friend_answer.as_ref().is_some_and(|(fid, _)| *fid == id) {
+                    self.friend_answer = None;
                 }
                 friends::save_book(&friends::profile_dir(), &self.book);
             }
@@ -2243,7 +2258,9 @@ impl GuiApp {
 
     /// Shown on every page, same idea as the "viewer asks for control" card.
     fn friend_invite_card(&mut self, ui: &mut egui::Ui) {
-        let Some((inv, from_id)) = self.friend_pending_invite.clone() else { return };
+        let now = unix_now();
+        self.friend_pending_invites.retain(|(inv, _)| friends::invite_fresh(inv.unix, now));
+        let Some((inv, from_id)) = self.friend_pending_invites.first().cloned() else { return };
         let fname = self.book.friends.iter().find(|f| f.id == from_id).map(|f| f.name.clone()).unwrap_or_else(|| "Друг".into());
         let mut watch = false;
         let mut decline = false;
@@ -2254,7 +2271,13 @@ impl GuiApp {
             .inner_margin(Margin::same(14))
             .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(RichText::new(format!("{fname} приглашает посмотреть трансляцию")).font(bold(17.0)));
+                    let extra = self.friend_pending_invites.len().saturating_sub(1);
+                    let title = if extra == 0 {
+                        format!("{fname} приглашает посмотреть трансляцию")
+                    } else {
+                        format!("{fname} приглашает посмотреть трансляцию · ещё {extra}")
+                    };
+                    ui.label(RichText::new(title).font(bold(17.0)));
                     ui.label(RichText::new("Нажмите «Смотреть» — подключение без кодов.").color(c_muted()).size(13.0));
                     ui.add_space(6.0);
                     ui.columns(2, |cols| {
@@ -2269,17 +2292,17 @@ impl GuiApp {
         ui.add_space(8.0);
         if watch {
             self.join_media_key = self.book.friends.iter().find(|f| f.id == from_id).map(|f| f.pair);
-            self.friend_answer = if inv.kind == InviteKind::Offer { Some((from_id, inv.nonce)) } else { None };
+            self.friend_answer = if inv.kind == InviteKind::Offer { Some((from_id, inv.nonce.clone())) } else { None };
             self.input = inv.code;
             self.page = Page::Join;
             let ctx = ui.ctx();
             self.start_join(&ctx);
-            self.friend_pending_invite = None;
+            self.friend_pending_invites.retain(|(i, fid)| !(i.nonce == inv.nonce && *fid == from_id));
         } else if decline {
             if let Some(msg) = self.book.decline(&from_id, &inv.nonce) {
                 self.spawn_friend_post(msg.topic, msg.body, "Приглашение отклонено.".into());
             }
-            self.friend_pending_invite = None;
+            self.friend_pending_invites.retain(|(i, fid)| !(i.nonce == inv.nonce && *fid == from_id));
         }
     }
 
