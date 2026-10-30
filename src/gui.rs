@@ -2649,7 +2649,7 @@ fn control_card(ui: &mut egui::Ui, ctl: &mut CtlUi, vigem: bool, drv: &DrvUi, li
             let running = matches!(drv, DrvUi::Running(_));
             if !vigem {
                 ui.label(
-                    RichText::new("Без драйвера ViGEmBus геймпад зрителя в игру не попадёт — мышь и клавиатура работают. Установщик драйвера уже внутри программы, скачивать ничего не нужно: Windows спросит разрешение, установка займёт около минуты.")
+                    RichText::new("Без драйвера ViGEmBus геймпад зрителя в игру не попадёт — мышь и клавиатура работают. По кнопке один раз скачается официальный установщик Nefarius (нужен интернет), затем Windows спросит разрешение.")
                         .color(c_muted())
                         .size(12.5),
                 );
@@ -2665,7 +2665,7 @@ fn control_card(ui: &mut egui::Ui, ctl: &mut CtlUi, vigem: bool, drv: &DrvUi, li
                 }
             }
             match drv {
-                DrvUi::Running(_) => spinner_line(ui, "Устанавливаю драйвер… подтвердите запрос Windows и дождитесь окончания."),
+                DrvUi::Running(_) => spinner_line(ui, "Скачиваю официальный установщик… затем подтвердите запрос Windows и дождитесь окончания."),
                 DrvUi::Done(e) => {
                     let text = lg::driver_end_text(*e);
                     if matches!(e, lg::DriverEnd::Ready) {

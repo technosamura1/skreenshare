@@ -30,8 +30,8 @@ fn build_opus() {
     println!("cargo:rerun-if-changed=vendor/opus");
 }
 
-/// The ViGEmBus installer is embedded as-is (src/driverinst.rs): refuse to build with any other file than the official
-/// ViGEmBus 1.22.0 setup from github.com/nefarius/ViGEmBus/releases/tag/v1.22.0.
+/// The official ViGEmBus 1.22.0 setup. Not linked into the exe (Defender then calls the whole program
+/// unwanted). Runtime downloads this exact file; the copy in vendor/ is only so this hash can be checked.
 const VIGEM_SHA256: &str = "89220a7865076b342892f98865f3499fb7c4cfd673159e89d352c360fd014c6a";
 
 fn check_vigem() {

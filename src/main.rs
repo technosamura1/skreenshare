@@ -253,7 +253,7 @@ fn run(mut a: Args) -> Result<()> {
             a.finish()?;
             client::overlay_preview(&out, panel, on)?;
         }
-        // Hidden: unpack the bundled ViGEmBus setup and run it the way the GUI button does (UAC, silent switches).
+        // Hidden: download the official ViGEmBus setup (sha256-pinned) and run it the way the GUI button does.
         "drvinstall" => {
             a.finish()?;
             let end = driverinst::install(inputhost::vigem_installed)?;
