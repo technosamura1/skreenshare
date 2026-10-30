@@ -1051,6 +1051,8 @@ struct GuiApp {
     friend_rename_id: Option<[u8; 16]>,
     friend_show_my_code: bool,
     friend_code_copied: Option<Instant>,
+    /// Set just before «Смотреть» on a friend invite: the client gets `--media-key`.
+    join_media_key: Option<[u8; 32]>,
 }
 
 /// State of "Установить драйвер геймпада".
@@ -1168,6 +1170,7 @@ impl GuiApp {
             friend_rename_id: None,
             friend_show_my_code: false,
             friend_code_copied: None,
+            join_media_key: None,
         }
     }
 
@@ -1249,6 +1252,9 @@ impl GuiApp {
         let room = easy::normalize(&code);
         if let Some(r) = &room {
             args.extend(["--room".to_string(), r.clone()]);
+        }
+        if let Some(key) = self.join_media_key.take() {
+            args.extend(["--media-key".into(), crate::crypto::hex_key(&key)]);
         }
         self.join = None;
         match Session::start(ctx, args) {
@@ -1637,6 +1643,7 @@ impl GuiApp {
             self.page = Page::Host;
         }
         if nav_item(ui, Ico::Eye, "Смотреть", self.page == Page::Join, join_live) {
+            self.join_media_key = None;
             self.page = Page::Join;
         }
         let now_friends = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -2261,6 +2268,7 @@ impl GuiApp {
                 });
         ui.add_space(8.0);
         if watch {
+            self.join_media_key = self.book.friends.iter().find(|f| f.id == from_id).map(|f| f.pair);
             self.friend_answer = if inv.kind == InviteKind::Offer { Some((from_id, inv.nonce)) } else { None };
             self.input = inv.code;
             self.page = Page::Join;
@@ -2293,6 +2301,12 @@ impl GuiApp {
         if let Some(msg) = self.book.invite(&friend_id, kind, &code, unix_now()) {
             self.friend_ok = Some("Отправляю приглашение…".into());
             self.friend_rush_ids.insert(friend_id, Instant::now() + Duration::from_secs(120));
+            let pair = self.book.friends.iter().find(|f| f.id == friend_id).map(|f| f.pair);
+            if let Some(pair) = pair {
+                if let Some(s) = self.host.as_mut() {
+                    s.proc.send(&format!("MEDIAKEY {}", crate::crypto::hex_key(&pair)));
+                }
+            }
             self.spawn_friend_post(msg.topic, msg.body, "Приглашение отправлено.".into());
         }
     }

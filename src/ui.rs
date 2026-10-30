@@ -176,6 +176,14 @@ pub fn control_line(l: &str) -> bool {
             }
             false
         }
+        l if l.starts_with("MEDIAKEY ") => {
+            if let Some(k) = crate::crypto::parse_key(l.trim_start_matches("MEDIAKEY ")) {
+                if let Ok(mut g) = MEDIA_PAIR.lock() {
+                    *g = Some(k);
+                }
+            }
+            false
+        }
         l => {
             // `SOURCE ...`: change what is streamed. Only the newest request matters.
             if let Some(r) = crate::source::SourceReq::parse(l) {
@@ -186,6 +194,30 @@ pub fn control_line(l: &str) -> bool {
             false
         }
     }
+}
+
+/// `Some(stop)` if `l` is a GUI control line rather than a connection code.
+/// The host is invited while it is still waiting for the viewer's code, and that wait used to throw
+/// `MEDIAKEY` away as a bad code — the stream then stayed in the clear.
+fn control_during_wait(l: &str) -> Option<bool> {
+    let t = l.trim();
+    let is = t == "STOP"
+        || t == "PREVIEW"
+        || t.starts_with("CONTROL")
+        || t.starts_with("AUDIO")
+        || t.starts_with("MEDIAKEY ")
+        || t.starts_with("SOURCE ");
+    if !is {
+        return None;
+    }
+    Some(control_line(t))
+}
+
+static MEDIA_PAIR: std::sync::Mutex<Option<[u8; 32]>> = std::sync::Mutex::new(None);
+
+/// Friend secret the GUI handed the host (`MEDIAKEY <64 hex>`). Newest one wins.
+pub fn take_media_pair() -> Option<[u8; 32]> {
+    MEDIA_PAIR.lock().ok().and_then(|mut g| g.take())
 }
 
 static CONTROL_REQ: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -413,12 +445,14 @@ pub fn read_code(
                 }
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(l) if l.is_empty() => bail!("интерфейс закрыт"),
-                    Ok(l) if l == "STOP" => bail!("остановлено"),
-                    Ok(l) if l == "PREVIEW" => {}
-                    Ok(l) => match validate(&l) {
-                        Ok(c) => return Ok(c),
-                        Err(e) if ipc() => println!("@BADCODE {e:#}"),
-                        Err(e) => println!("Не подошло: {e:#}"),
+                    Ok(l) => match control_during_wait(&l) {
+                        Some(true) => bail!("остановлено"),
+                        Some(false) => {}
+                        None => match validate(&l) {
+                            Ok(c) => return Ok(c),
+                            Err(e) if ipc() => println!("@BADCODE {e:#}"),
+                            Err(e) => println!("Не подошло: {e:#}"),
+                        },
                     },
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => bail!("ввод закрыт"),
@@ -451,6 +485,11 @@ pub fn read_code(
                     bail!("интерфейс закрыт");
                 }
                 continue;
+            }
+            match control_during_wait(&line) {
+                Some(true) => bail!("остановлено"),
+                Some(false) => continue,
+                None => {}
             }
             match validate(&line) {
                 Ok(c) => return Ok(c),

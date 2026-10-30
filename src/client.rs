@@ -43,6 +43,8 @@ pub struct ClientOpts {
     /// Test mode: save a decoded frame as BMP and quit after this many frames.
     pub screenshot: Option<PathBuf>,
     pub frames: Option<u64>,
+    /// Friend pair secret. When set, media is encrypted and the host is told via CAP_ENC.
+    pub media_pair: Option<[u8; 32]>,
 }
 
 /// Old (v0.5.0 and earlier) audio datagram, PT_AUDIO: seq u32 | rate u32 | n u16 | n samples | previous datagram's samples.
@@ -276,13 +278,16 @@ pub fn run(o: ClientOpts) -> Result<()> {
     let me = Code::for_socket(net::ROLE_CLIENT, host.token, &sock, &nat);
     ui::show_code(&o.exchange, &me.encode(), "client.code", "Ваш код ответа — передайте его тому, кто транслирует экран:")?;
     println!("Жду, пока код ответа введут на стороне показа...");
-    let peer = net::punch(&sock, net::ROLE_CLIENT, host.token, &host.cands, Duration::from_secs(300))?;
+    let peer = net::punch(&sock, net::ROLE_CLIENT, host.token, &host.cands, Duration::from_secs(300), o.media_pair.is_some())?;
     println!("Подключено! Открываю окно просмотра.");
     ui::connected();
     view(sock, peer, host.token, o)
 }
 
 fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Result<()> {
+    if let Some(pair) = o.media_pair {
+        net::install_media_key(&pair, token);
+    }
     let event_loop = EventLoop::<UserEv>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let sh = Arc::new(Shared {
@@ -330,6 +335,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
     }
     // Remote control: its own thread; it sends nothing until the "Управление" switch is on and the host allows it.
     let control = o.control;
+    let enc = o.media_pair.is_some();
     let input = ViewInput::new();
     // Always: the laser pointer and reactions go through the same thread (the input itself stays off).
     {
@@ -402,9 +408,18 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             while sh.running.load(Ordering::Relaxed) {
                 match sock.recv_from(&mut buf) {
                     Ok((n, from)) => {
-                        if let Some((ty, body)) = net::parse_header(&buf[..n], token) {
+                        let incoming = net::open_incoming(&buf[..n]);
+                        if matches!(incoming, net::Incoming::Drop) {
+                            continue;
+                        }
+                        let owned = match incoming {
+                            net::Incoming::Opened(p) => Some(p),
+                            _ => None,
+                        };
+                        let pkt = owned.as_deref().unwrap_or(&buf[..n]);
+                        if let Some((ty, body)) = net::parse_header(pkt, token) {
                             sh.last_seen_ms.store(sh.now_ms(), Ordering::Relaxed);
-                            sh.recv_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            sh.recv_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                             match ty {
                                 net::PT_VIDEO if body.len() >= 9 => {
                                     let fid = u32::from_le_bytes(body[0..4].try_into().unwrap());
@@ -536,6 +551,13 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             let mut gr_bytes0 = 0u64;
             // Ping right away: the first round-trip time sets the retry timing for lost packets.
             send_ping(&sock, peer, token, &sh, &mut out);
+            if audio_on || control || enc {
+                // Once, before the first sleep: the host encrypts only after CAP_ENC, and the first frame should
+                // not go out in the clear.
+                net::write_header(&mut out, net::PT_CAPS, token);
+                out.push(if audio_on { net::CAP_OPUS } else { 0 } | if control { net::CAP_INPUT } else { 0 } | if enc { net::CAP_ENC } else { 0 });
+                let _ = sock.send_to(&out, peer);
+            }
             while sh.running.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
                 tick += 1;
@@ -545,11 +567,11 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     let _ = sock.send_to(&out, peer);
                     sh.keyreqs.store(keyreq.sent, Ordering::Relaxed);
                 }
-                if (audio_on || control) && tick % 10 == 1 {
+                if (audio_on || control || enc) && tick % 10 == 1 {
                     // Tell the host what we understand: Opus audio (it only sends Opus to viewers that say so)
                     // and remote control (it only sends control answers to viewers that say so).
                     net::write_header(&mut out, net::PT_CAPS, token);
-                    out.push(if audio_on { net::CAP_OPUS } else { 0 } | if control { net::CAP_INPUT } else { 0 });
+                    out.push(if audio_on { net::CAP_OPUS } else { 0 } | if control { net::CAP_INPUT } else { 0 } | if enc { net::CAP_ENC } else { 0 });
                     let _ = sock.send_to(&out, peer);
                 }
                 if tick % 5 == 0 {

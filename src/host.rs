@@ -419,7 +419,7 @@ pub fn run(o: HostOpts) -> Result<()> {
         nat.keepalive_server,
     )?;
     println!("Соединяюсь...");
-    let peer = net::punch(&sock, net::ROLE_HOST, token, &peer_code.cands, Duration::from_secs(30))?;
+    let peer = net::punch(&sock, net::ROLE_HOST, token, &peer_code.cands, Duration::from_secs(30), false)?;
     println!("Подключено! Идёт трансляция.");
     ui::connected();
     stream(sock, peer, token, monitor, &o)
@@ -481,6 +481,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 };
                 let Some((ty, body)) = net::parse_header(&buf[..n], token) else { continue };
                 sh.last_seen_ms.store(sh.now_ms(), Ordering::Relaxed);
+                net::absorb_media_pair(token);
                 match ty {
                     net::PT_KEYREQ => sh.keyreq.store(true, Ordering::Relaxed),
                     net::PT_PING => {
@@ -490,8 +491,12 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     }
                     net::PT_PUNCH => net::answer_punch(&sock, token, net::ROLE_HOST, body, from),
                     net::PT_CAPS => {
-                        sh.peer_opus.store(body.first().is_some_and(|f| f & net::CAP_OPUS != 0), Ordering::Relaxed);
-                        input.set_peer_caps(body.first().copied().unwrap_or(0));
+                        let flags = body.first().copied().unwrap_or(0);
+                        sh.peer_opus.store(flags & net::CAP_OPUS != 0, Ordering::Relaxed);
+                        if flags & net::CAP_ENC != 0 {
+                            net::note_peer_enc(token);
+                        }
+                        input.set_peer_caps(flags);
                     }
                     // Remote control: only from the connected viewer's address, and only acted on if the owner allowed it.
                     net::PT_INPUT if from == peer => input.on_input(body),

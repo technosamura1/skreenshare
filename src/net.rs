@@ -42,6 +42,14 @@ pub const PT_RUMBLE: u8 = 0xAA;
 pub const PT_ANNOT: u8 = 0xAB;
 /// Viewer -> host: «I'd like to control» (ver u8 = 1 | want u8), about once a second while waiting (v0.12.8).
 pub const PT_CTLREQ: u8 = 0xAC;
+/// Encrypted video (v0.12.11). Clear header is the same as PT_VIDEO, then nonce and ciphertext.
+pub const PT_VIDEO_ENC: u8 = 0x94;
+/// Encrypted Opus audio. Nonce carries the datagram sequence, so two packets never share it.
+pub const PT_AUDIO_ENC: u8 = 0x95;
+/// Encrypted legacy audio (PT_AUDIO2). Same idea as PT_AUDIO_ENC, separate stream number.
+pub const PT_AUDIO2_ENC: u8 = 0x96;
+/// Viewer understands encrypted media and has the friend secret. Host stays in the clear until it sees this.
+pub const CAP_ENC: u8 = 4;
 
 pub const ROLE_HOST: u8 = 1;
 pub const ROLE_CLIENT: u8 = 2;
@@ -95,11 +103,125 @@ fn sim_drop() -> bool {
 }
 
 /// send_to for media packets (subject to the loss simulation).
+/// Video and audio are encrypted once the viewer has announced [`CAP_ENC`] and the friend secret is installed.
 pub fn send_media(sock: &UdpSocket, pkt: &[u8], to: SocketAddr) {
     if sim_drop() {
         return;
     }
+    if pkt.len() >= HEADER_LEN {
+        let token = u32::from_le_bytes(pkt[1..5].try_into().unwrap());
+        absorb_media_pair(token);
+    }
+    if let Some(key) = armed_media_key() {
+        if let Some(sealed) = seal_media(&key, pkt) {
+            let _ = sock.send_to(&sealed, to);
+            return;
+        }
+    }
     let _ = sock.send_to(pkt, to);
+}
+
+/// What a receiver should do with one datagram.
+pub enum Incoming {
+    /// Not an encrypted type: parse the buffer you already have.
+    Plain,
+    /// Encrypted type, opened back into the plaintext packet (PT_VIDEO / PT_AUDIO2 / PT_AUDIO3).
+    Opened(Vec<u8>),
+    /// Encrypted type we could not open (no key yet, or the tag failed).
+    Drop,
+}
+
+pub fn open_incoming(pkt: &[u8]) -> Incoming {
+    match pkt.first().copied() {
+        Some(PT_VIDEO_ENC) | Some(PT_AUDIO_ENC) | Some(PT_AUDIO2_ENC) => {}
+        _ => return Incoming::Plain,
+    }
+    let Some(key) = armed_media_key() else { return Incoming::Drop };
+    match open_media(&key, pkt) {
+        Some(p) => Incoming::Opened(p),
+        None => Incoming::Drop,
+    }
+}
+
+fn seal_media(key: &[u8; 32], pkt: &[u8]) -> Option<Vec<u8>> {
+    match pkt.first().copied()? {
+        PT_VIDEO if pkt.len() >= VIDEO_HEADER_LEN => {
+            let frame_id = u32::from_le_bytes(pkt[5..9].try_into().ok()?);
+            let frag = u16::from_le_bytes(pkt[9..11].try_into().ok()?);
+            crate::crypto::seal(key, pkt, PT_VIDEO_ENC, VIDEO_HEADER_LEN, frame_id, frag, 0)
+        }
+        PT_AUDIO3 if pkt.len() >= HEADER_LEN + 4 => {
+            let seq = u32::from_le_bytes(pkt[5..9].try_into().ok()?);
+            crate::crypto::seal(key, pkt, PT_AUDIO_ENC, HEADER_LEN, seq, 0, 1)
+        }
+        PT_AUDIO2 if pkt.len() >= HEADER_LEN + 4 => {
+            let seq = u32::from_le_bytes(pkt[5..9].try_into().ok()?);
+            crate::crypto::seal(key, pkt, PT_AUDIO2_ENC, HEADER_LEN, seq, 0, 2)
+        }
+        _ => None,
+    }
+}
+
+fn open_media(key: &[u8; 32], pkt: &[u8]) -> Option<Vec<u8>> {
+    match pkt.first().copied()? {
+        PT_VIDEO_ENC => crate::crypto::open(key, pkt, PT_VIDEO, VIDEO_HEADER_LEN),
+        PT_AUDIO_ENC => crate::crypto::open(key, pkt, PT_AUDIO3, HEADER_LEN),
+        PT_AUDIO2_ENC => crate::crypto::open(key, pkt, PT_AUDIO2, HEADER_LEN),
+        _ => None,
+    }
+}
+
+struct MediaArm {
+    pair: Option<[u8; 32]>,
+    peer_ready: bool,
+    key: Option<[u8; 32]>,
+}
+
+fn media_arm() -> &'static std::sync::Mutex<MediaArm> {
+    use std::sync::OnceLock;
+    static M: OnceLock<std::sync::Mutex<MediaArm>> = OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(MediaArm { pair: None, peer_ready: false, key: None }))
+}
+
+fn armed_media_key() -> Option<[u8; 32]> {
+    media_arm().lock().ok().and_then(|g| g.key)
+}
+
+/// Viewer side: the key is known before the first media packet. Encrypt and decrypt immediately.
+pub fn install_media_key(pair: &[u8; 32], token: u32) {
+    if let Ok(mut g) = media_arm().lock() {
+        g.pair = Some(*pair);
+        g.peer_ready = true;
+        g.key = Some(crate::crypto::media_key(pair, token));
+    }
+}
+
+/// Host side, from the GUI: remember the friend secret. Encryption waits for [`note_peer_enc`].
+pub fn note_media_pair(pair: [u8; 32], token: u32) {
+    if let Ok(mut g) = media_arm().lock() {
+        g.pair = Some(pair);
+        if g.peer_ready {
+            g.key = Some(crate::crypto::media_key(&pair, token));
+        }
+    }
+}
+
+/// `MEDIAKEY` may arrive on the GUI stdin while the host is still waiting for a code. Pick it up at the
+/// next send or receive so it is not stuck until some unrelated packet.
+pub fn absorb_media_pair(token: u32) {
+    if let Some(pair) = crate::ui::take_media_pair() {
+        note_media_pair(pair, token);
+    }
+}
+
+/// Host side: the connected viewer sent [`CAP_ENC`].
+pub fn note_peer_enc(token: u32) {
+    if let Ok(mut g) = media_arm().lock() {
+        g.peer_ready = true;
+        if let Some(pair) = g.pair {
+            g.key = Some(crate::crypto::media_key(&pair, token));
+        }
+    }
 }
 
 pub fn write_header(buf: &mut Vec<u8>, ty: u8, token: u32) {
@@ -469,9 +591,18 @@ impl Code {
     }
 }
 
+fn write_punch(out: &mut Vec<u8>, token: u32, my_role: u8, announce_enc: bool) {
+    write_header(out, PT_PUNCH, token);
+    out.push(my_role);
+    // Second byte: this viewer can decrypt. A host from before 0.12.11 only reads the role.
+    if announce_enc {
+        out.push(CAP_ENC);
+    }
+}
+
 /// Sends punch packets to every candidate until the peer answers.
 /// Returns the address that actually works.
-pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], timeout: Duration) -> Result<SocketAddr> {
+pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], timeout: Duration, announce_enc: bool) -> Result<SocketAddr> {
     let _ = sock.set_read_timeout(Some(Duration::from_millis(20)));
     let start = Instant::now();
     let mut last_send: Option<Instant> = None;
@@ -496,8 +627,7 @@ pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], t
             ));
         }
         if last_send.map_or(true, |t| t.elapsed() >= Duration::from_millis(100)) {
-            write_header(&mut out, PT_PUNCH, token);
-            out.push(my_role);
+            write_punch(&mut out, token, my_role, announce_enc);
             for c in peer {
                 let _ = sock.send_to(&out, SocketAddr::V4(*c));
             }
@@ -510,8 +640,7 @@ pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], t
         // packets then come from a port that is not in its code, and ours never open the way for them. Knocking on
         // the neighbouring ports too opens it (and finds the right one from our side).
         if last_spray.map_or(true, |t| t.elapsed() >= Duration::from_millis(250)) {
-            write_header(&mut out, PT_PUNCH, token);
-            out.push(my_role);
+            write_punch(&mut out, token, my_role, announce_enc);
             for a in &sprayed {
                 let _ = sock.send_to(&out, SocketAddr::V4(*a));
             }
@@ -537,6 +666,11 @@ pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], t
                 if body.first().copied() == Some(my_role) {
                     continue; // our own packet looped back
                 }
+                // Viewer on 0.12.11 puts CAP_ENC after its role. Old hosts ignore the extra byte.
+                if ty == PT_PUNCH && body.get(1).copied() == Some(CAP_ENC) {
+                    absorb_media_pair(token);
+                    note_peer_enc(token);
+                }
                 if ty == PT_PUNCH {
                     write_header(&mut out, PT_PUNCH_ACK, token);
                     out.push(my_role);
@@ -553,7 +687,16 @@ pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], t
                 }
             }
             // The other side already decided we're connected and started talking.
-            PT_VIDEO | PT_AUDIO | PT_AUDIO2 | PT_AUDIO3 | PT_KEYREQ | PT_PING | PT_PONG | PT_NACK | PT_REPORT | PT_ANACK | PT_CAPS => break Ok(from),
+            PT_CAPS => {
+                let flags = body.first().copied().unwrap_or(0);
+                if flags & CAP_ENC != 0 {
+                    absorb_media_pair(token);
+                    note_peer_enc(token);
+                }
+                break Ok(from);
+            }
+            PT_VIDEO | PT_AUDIO | PT_AUDIO2 | PT_AUDIO3 | PT_KEYREQ | PT_PING | PT_PONG | PT_NACK | PT_REPORT | PT_ANACK
+            | PT_VIDEO_ENC | PT_AUDIO_ENC | PT_AUDIO2_ENC => break Ok(from),
             _ => {}
         }
     };
@@ -596,6 +739,41 @@ mod tests {
         assert_eq!(t.len(), 36);
         // CGNAT (100.64/10) addresses are not reachable from outside either.
         assert!(spray_targets(&["100.70.1.1:4000".parse().unwrap()]).is_empty());
+    }
+
+    #[test]
+    fn sealed_media_roundtrips_and_plaintext_stays_plaintext() {
+        let pair = [3u8; 32];
+        let token = 0xA1B2_C3D4u32;
+        install_media_key(&pair, token);
+        let mut video = vec![PT_VIDEO];
+        video.extend_from_slice(&token.to_le_bytes());
+        video.extend_from_slice(&7u32.to_le_bytes());
+        video.extend_from_slice(&1u16.to_le_bytes());
+        video.extend_from_slice(&4u16.to_le_bytes());
+        video.push(1);
+        video.extend_from_slice(b"nal");
+        let sealed = seal_media(&armed_media_key().unwrap(), &video).unwrap();
+        assert_eq!(sealed[0], PT_VIDEO_ENC);
+        assert!(sealed.len() > video.len());
+        match open_incoming(&sealed) {
+            Incoming::Opened(p) => assert_eq!(p, video),
+            Incoming::Plain => panic!("plaintext"),
+            Incoming::Drop => panic!("dropped"),
+        }
+        let mut audio = vec![PT_AUDIO3];
+        audio.extend_from_slice(&token.to_le_bytes());
+        audio.extend_from_slice(&9u32.to_le_bytes());
+        audio.extend_from_slice(b"op");
+        let a = seal_media(&armed_media_key().unwrap(), &audio).unwrap();
+        assert_eq!(a[0], PT_AUDIO_ENC);
+        match open_incoming(&a) {
+            Incoming::Opened(p) => assert_eq!(p, audio),
+            Incoming::Plain => panic!("plaintext"),
+            Incoming::Drop => panic!("dropped"),
+        }
+        // Control packets are not media.
+        assert!(seal_media(&armed_media_key().unwrap(), &[PT_PING, 0, 0, 0, 0]).is_none());
     }
 
     #[test]

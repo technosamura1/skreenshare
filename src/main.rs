@@ -40,6 +40,7 @@ mod opus;
 mod opusaudio;
 mod playout;
 mod plc;
+mod crypto;
 mod ntfy;
 mod preview;
 mod ratectl;
@@ -181,6 +182,10 @@ fn client_opts(a: &mut Args) -> Result<client::ClientOpts> {
         game: a.flag("--game"),
         screenshot: a.value("--screenshot")?.map(PathBuf::from),
         frames: a.value("--frames")?.map(|v| v.parse()).transpose().context("--frames")?,
+        media_pair: match a.value("--media-key")? {
+            Some(s) => Some(crate::crypto::parse_key(&s).context("--media-key: нужен 64-значный hex")?),
+            None => None,
+        },
         exchange: exchange(a)?,
     })
 }
