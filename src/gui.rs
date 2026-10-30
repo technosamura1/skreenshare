@@ -1044,9 +1044,9 @@ struct GuiApp {
     friend_pending_invite: Option<(friends::Invite, [u8; 16])>,
     /// Offer we accepted: (friend, nonce). The viewer's C… code is posted back once the client prints it.
     friend_answer: Option<([u8; 16], String)>,
-    /// After an invite, poll that friend's pair topic every 5 s so the C… answer is not stuck behind presence.
-    friend_rush_id: Option<[u8; 16]>,
-    friend_rush_until: Option<Instant>,
+    /// After an invite, poll those friends' pair topics every 5 s so a C… answer is not stuck behind presence.
+    /// Several invites at once each keep their own deadline.
+    friend_rush_ids: HashMap<[u8; 16], Instant>,
     friend_rename_input: String,
     friend_rename_id: Option<[u8; 16]>,
     friend_show_my_code: bool,
@@ -1163,8 +1163,7 @@ impl GuiApp {
             friend_last_seen: HashMap::new(),
             friend_pending_invite: None,
             friend_answer: None,
-            friend_rush_id: None,
-            friend_rush_until: None,
+            friend_rush_ids: HashMap::new(),
             friend_rename_input: String::new(),
             friend_rename_id: None,
             friend_show_my_code: false,
@@ -2020,15 +2019,17 @@ impl GuiApp {
                 Ok(msg) => self.apply_friend_net(msg),
             }
         }
-        if self.friend_rush_until.is_some_and(|t| t <= Instant::now()) {
-            self.friend_rush_until = None;
-            self.friend_rush_id = None;
-        }
-        if let Some(id) = self.friend_rush_id {
+        let now = Instant::now();
+        self.friend_rush_ids.retain(|_, until| *until > now);
+        if !self.friend_rush_ids.is_empty() {
             if self.friend_poll_last.is_some_and(|t| t.elapsed().as_millis() < friends::RELAY_MIN_GAP_MS as u128) {
                 return;
             }
-            self.friend_poll_last = Some(Instant::now());
+            self.friend_poll_last = Some(now);
+            let mut ids: Vec<[u8; 16]> = self.friend_rush_ids.keys().copied().collect();
+            ids.sort();
+            let id = ids[self.friend_poll_i % ids.len()];
+            self.friend_poll_i = self.friend_poll_i.wrapping_add(1);
             let since = self.friend_pair_since.get(&id).cloned().unwrap_or_default();
             let Some(topic) = self.book.pair_topic(&id) else { return };
             self.spawn_friend_get(FriendNetKind::Pair { id, since: since.clone() }, topic, since);
@@ -2291,8 +2292,7 @@ impl GuiApp {
         };
         if let Some(msg) = self.book.invite(&friend_id, kind, &code, unix_now()) {
             self.friend_ok = Some("Отправляю приглашение…".into());
-            self.friend_rush_id = Some(friend_id);
-            self.friend_rush_until = Some(Instant::now() + Duration::from_secs(120));
+            self.friend_rush_ids.insert(friend_id, Instant::now() + Duration::from_secs(120));
             self.spawn_friend_post(msg.topic, msg.body, "Приглашение отправлено.".into());
         }
     }

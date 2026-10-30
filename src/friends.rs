@@ -136,9 +136,11 @@ impl Book {
         self.me.name = sanitize_name(name);
     }
 
-    /// Remember `code`'s owner and seal a hello into their inbox. The pair secret comes from both
-    /// inbox keys ([`pair_secret`]), so both people can paste the code and still land on one channel.
-    /// Adding again sends that same secret; a name the user edited is kept.
+    /// Remember `code`'s owner and seal a hello into their inbox. A new friend gets the pair secret
+    /// derived from both inbox keys ([`pair_secret`]), so both people can paste the code and still
+    /// land on one channel. A friend already in the list keeps the secret they were added with:
+    /// 0.12.8 stored a random one, and replacing it would split the channel. Adding again resends
+    /// that same secret. A name the user edited is kept.
     pub fn add(&mut self, code: &str) -> Result<OutMsg, AddError> {
         let (id, key) = parse_code(code).ok_or(AddError::BadCode)?;
         if id == self.me.id {
@@ -147,21 +149,21 @@ impl Book {
         if self.friends.len() >= MAX_FRIENDS && self.friends.iter().all(|f| f.id != id) {
             return Err(AddError::Full);
         }
-        let pair = pair_secret(&self.me.id, &self.me.key, &id, &key);
-        if let Some(f) = self.friends.iter_mut().find(|f| f.id == id) {
+        if let Some(f) = self.friends.iter().find(|f| f.id == id) {
             if f.their_key != key {
                 return Err(AddError::BadCode);
             }
-            f.pair = pair;
-        } else {
-            self.friends.push(Friend {
-                id,
-                their_key: key,
-                pair,
-                name: "Друг".into(),
-                renamed: false,
-            });
+            let pair = f.pair;
+            return Ok(seal_hello(&self.me, &id, &key, &pair));
         }
+        let pair = pair_secret(&self.me.id, &self.me.key, &id, &key);
+        self.friends.push(Friend {
+            id,
+            their_key: key,
+            pair,
+            name: "Друг".into(),
+            renamed: false,
+        });
         Ok(seal_hello(&self.me, &id, &key, &pair))
     }
 
@@ -179,6 +181,8 @@ impl Book {
     }
 
     /// Hellos addressed to us. A hello whose id we already know is applied only when the inbox key matches.
+    /// An existing pair is kept, unless the hello carries the derived secret ([`pair_secret`]): that one
+    /// replaces a leftover random secret from 0.12.8. A random hello never overwrites a pair we already have.
     pub fn take_hellos(&mut self, messages: &[String]) -> usize {
         let ch = inbox_channel(&self.me.id, &self.me.key);
         let mut n = 0;
@@ -192,7 +196,10 @@ impl Book {
                 if f.their_key != key {
                     continue;
                 }
-                f.pair = pair;
+                let canonical = pair_secret(&self.me.id, &self.me.key, &id, &key);
+                if f.pair != pair && pair == canonical {
+                    f.pair = pair;
+                }
                 if !f.renamed {
                     f.name = name;
                 }
@@ -829,6 +836,32 @@ mod tests {
         let again = b.add(&a.code()).unwrap();
         assert_eq!(a.take_hellos(&[again.body]), 1);
         assert_eq!(a.friends[0].pair, b.friends[0].pair);
+    }
+
+    #[test]
+    fn a_saved_random_pair_is_not_replaced_by_a_readd_or_a_stray_hello() {
+        let mut old = fixed(30, "Старый");
+        let mut newer = fixed(31, "Новый");
+        let random = [42u8; 32];
+        // What 0.12.8 wrote down after one of them pasted the code: the same random secret on both sides.
+        old.friends.push(Friend { id: newer.me.id, their_key: newer.me.key, pair: random, name: "Новый".into(), renamed: false });
+        newer.friends.push(Friend { id: old.me.id, their_key: old.me.key, pair: random, name: "Старый".into(), renamed: false });
+
+        let again = newer.add(&old.code()).unwrap();
+        assert_eq!(newer.friends[0].pair, random);
+        assert_eq!(old.take_hellos(&[again.body]), 1);
+        assert_eq!(old.friends[0].pair, random);
+        assert_eq!(old.pair_topic(&newer.me.id), newer.pair_topic(&old.me.id));
+
+        let stray = seal_hello(&newer.me, &old.me.id, &old.me.key, &[7u8; 32]);
+        old.take_hellos(&[stray.body]);
+        assert_eq!(old.friends[0].pair, random);
+
+        // A hello that carries the derived secret does pull a leftover random pair onto it.
+        let canonical = pair_secret(&newer.me.id, &newer.me.key, &old.me.id, &old.me.key);
+        let heal = seal_hello(&newer.me, &old.me.id, &old.me.key, &canonical);
+        assert_eq!(old.take_hellos(&[heal.body]), 1);
+        assert_eq!(old.friends[0].pair, canonical);
     }
 
     #[test]
