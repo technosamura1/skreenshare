@@ -1042,6 +1042,11 @@ struct GuiApp {
     friend_pair_since: HashMap<[u8; 16], String>,
     friend_last_seen: HashMap<[u8; 16], u64>,
     friend_pending_invite: Option<(friends::Invite, [u8; 16])>,
+    /// Offer we accepted: (friend, nonce). The viewer's C… code is posted back once the client prints it.
+    friend_answer: Option<([u8; 16], String)>,
+    /// After an invite, poll that friend's pair topic every 5 s so the C… answer is not stuck behind presence.
+    friend_rush_id: Option<[u8; 16]>,
+    friend_rush_until: Option<Instant>,
     friend_rename_input: String,
     friend_rename_id: Option<[u8; 16]>,
     friend_show_my_code: bool,
@@ -1157,6 +1162,9 @@ impl GuiApp {
             friend_pair_since: HashMap::new(),
             friend_last_seen: HashMap::new(),
             friend_pending_invite: None,
+            friend_answer: None,
+            friend_rush_id: None,
+            friend_rush_until: None,
             friend_rename_input: String::new(),
             friend_rename_id: None,
             friend_show_my_code: false,
@@ -2001,6 +2009,7 @@ impl GuiApp {
     /// An empty list still polls the inbox — that is how the other side's hello arrives.
     fn friends_poll(&mut self) {
         self.drain_friend_post();
+        self.friend_flush_answer();
         if let Some(rx) = self.friend_net.take() {
             match rx.try_recv() {
                 Err(mpsc::TryRecvError::Empty) => {
@@ -2010,6 +2019,20 @@ impl GuiApp {
                 Err(mpsc::TryRecvError::Disconnected) => {}
                 Ok(msg) => self.apply_friend_net(msg),
             }
+        }
+        if self.friend_rush_until.is_some_and(|t| t <= Instant::now()) {
+            self.friend_rush_until = None;
+            self.friend_rush_id = None;
+        }
+        if let Some(id) = self.friend_rush_id {
+            if self.friend_poll_last.is_some_and(|t| t.elapsed().as_millis() < friends::RELAY_MIN_GAP_MS as u128) {
+                return;
+            }
+            self.friend_poll_last = Some(Instant::now());
+            let since = self.friend_pair_since.get(&id).cloned().unwrap_or_default();
+            let Some(topic) = self.book.pair_topic(&id) else { return };
+            self.spawn_friend_get(FriendNetKind::Pair { id, since: since.clone() }, topic, since);
+            return;
         }
         let n = self.book.friends.len();
         let gap = friends::relay_gap_ms(n);
@@ -2237,6 +2260,7 @@ impl GuiApp {
                 });
         ui.add_space(8.0);
         if watch {
+            self.friend_answer = if inv.kind == InviteKind::Offer { Some((from_id, inv.nonce)) } else { None };
             self.input = inv.code;
             self.page = Page::Join;
             let ctx = ui.ctx();
@@ -2267,7 +2291,27 @@ impl GuiApp {
         };
         if let Some(msg) = self.book.invite(&friend_id, kind, &code, unix_now()) {
             self.friend_ok = Some("Отправляю приглашение…".into());
+            self.friend_rush_id = Some(friend_id);
+            self.friend_rush_until = Some(Instant::now() + Duration::from_secs(120));
             self.spawn_friend_post(msg.topic, msg.body, "Приглашение отправлено.".into());
+        }
+    }
+
+    /// The client prints its C… code a moment after "Смотреть". Post it once, on the pair channel.
+    fn friend_flush_answer(&mut self) {
+        let Some((id, nonce)) = self.friend_answer.clone() else { return };
+        let Some(join) = self.join.as_ref() else {
+            self.friend_answer = None;
+            return;
+        };
+        if join.ended {
+            self.friend_answer = None;
+            return;
+        }
+        let Some(code) = join.code.clone() else { return };
+        self.friend_answer = None;
+        if let Some(msg) = self.book.answer(&id, &nonce, &code) {
+            self.spawn_friend_post(msg.topic, msg.body, "Подключаюсь…".into());
         }
     }
 }

@@ -2,8 +2,9 @@
 //!
 //! Each install has a random id and inbox key (created once, kept next to gui.ini). The friend code / link
 //! is that pair: it names an unguessable inbox topic and is the only key that opens it. Adding someone posts
-//! one sealed hello there; both sides then share a pair topic derived from the two ids and a fresh pair
-//! secret, so a stranger who never saw the hello cannot find the topic or read it.
+//! one sealed hello there; both sides then share a pair topic. The pair secret is derived from the two
+//! inbox keys, so it is the same no matter who pastes the code, or if both do. A stranger who never saw
+//! either key cannot find the topic or read it.
 //!
 //! This file is pure logic (std + the crypto crates). HTTP stays in `ntfy.rs`, the window in `gui.rs`.
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -135,8 +136,9 @@ impl Book {
         self.me.name = sanitize_name(name);
     }
 
-    /// Remember `code`'s owner and seal a hello into their inbox. Re-adding rotates the pair secret
-    /// (the other side accepts it because the inbox key matches) but keeps a name the user edited.
+    /// Remember `code`'s owner and seal a hello into their inbox. The pair secret comes from both
+    /// inbox keys ([`pair_secret`]), so both people can paste the code and still land on one channel.
+    /// Adding again sends that same secret; a name the user edited is kept.
     pub fn add(&mut self, code: &str) -> Result<OutMsg, AddError> {
         let (id, key) = parse_code(code).ok_or(AddError::BadCode)?;
         if id == self.me.id {
@@ -145,8 +147,7 @@ impl Book {
         if self.friends.len() >= MAX_FRIENDS && self.friends.iter().all(|f| f.id != id) {
             return Err(AddError::Full);
         }
-        let mut pair = [0u8; 32];
-        getrandom::fill(&mut pair).expect("rng");
+        let pair = pair_secret(&self.me.id, &self.me.key, &id, &key);
         if let Some(f) = self.friends.iter_mut().find(|f| f.id == id) {
             if f.their_key != key {
                 return Err(AddError::BadCode);
@@ -443,6 +444,15 @@ fn kdf(label: &str, parts: &[&[u8]]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&d);
     out
+}
+
+fn pair_secret(a_id: &[u8; 16], a_key: &[u8; 32], b_id: &[u8; 16], b_key: &[u8; 32]) -> [u8; 32] {
+    let (lo_id, lo_key, hi_id, hi_key) = if a_id <= b_id {
+        (a_id.as_slice(), a_key.as_slice(), b_id.as_slice(), b_key.as_slice())
+    } else {
+        (b_id.as_slice(), b_key.as_slice(), a_id.as_slice(), a_key.as_slice())
+    };
+    kdf("screenshare-friend-pair-secret-v1", &[lo_id, lo_key, hi_id, hi_key])
 }
 
 fn inbox_channel(id: &[u8; 16], key: &[u8; 32]) -> Channel {
@@ -801,6 +811,24 @@ mod tests {
         assert!(!seen.contains(room));
         assert!(!seen.contains("Хост") && !seen.contains("Зритель"));
         assert!(!seen.contains(&hex(&a.me.id)) && !seen.contains(&hex(&b.me.key)));
+    }
+
+    #[test]
+    fn both_paste_the_code_and_still_share_one_channel() {
+        let mut a = fixed(21, "A");
+        let mut b = fixed(22, "B");
+        let to_b = a.add(&b.code()).unwrap();
+        let to_a = b.add(&a.code()).unwrap();
+        assert_eq!(a.take_hellos(&[to_a.body]), 1);
+        assert_eq!(b.take_hellos(&[to_b.body]), 1);
+        assert_eq!(a.friends[0].pair, b.friends[0].pair);
+        assert_eq!(a.pair_topic(&b.me.id), b.pair_topic(&a.me.id));
+        let msg = a.invite(&b.me.id, InviteKind::Offer, "Hcode", 10).unwrap();
+        assert!(matches!(b.open_pair(&a.me.id, &msg.body), Some(PairEvent::Invite(_))));
+        // Adding again does not fork the channel.
+        let again = b.add(&a.code()).unwrap();
+        assert_eq!(a.take_hellos(&[again.body]), 1);
+        assert_eq!(a.friends[0].pair, b.friends[0].pair);
     }
 
     #[test]
