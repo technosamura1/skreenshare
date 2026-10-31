@@ -555,8 +555,8 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             // Ping right away: the first round-trip time sets the retry timing for lost packets.
             send_ping(&sock, peer, token, &sh, &mut out);
             if audio_on || control || enc {
-                // Once, before the first sleep: the host encrypts only after CAP_ENC, and the first frame should
-                // not go out in the clear.
+                // Once, before the first sleep: a friend host starts on the session key and switches to the
+                // pair key only after CAP_ENC. Say it immediately so that switch is not late.
                 net::write_header(&mut out, net::PT_CAPS, token);
                 out.push(if audio_on { net::CAP_OPUS } else { 0 } | if control { net::CAP_INPUT } else { 0 } | if enc { net::CAP_ENC } else { 0 });
                 let _ = sock.send_to(&out, peer);

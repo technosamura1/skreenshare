@@ -482,6 +482,12 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                         continue;
                     }
                 };
+                if n >= net::HEADER_LEN {
+                    let t = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+                    if t == token {
+                        net::absorb_media_pair(token);
+                    }
+                }
                 let raw = &buf[..n];
                 let opened;
                 let pkt: &[u8] = match net::open_incoming(raw) {

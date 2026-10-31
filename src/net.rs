@@ -138,16 +138,32 @@ pub enum Incoming {
 }
 
 pub fn open_incoming(pkt: &[u8]) -> Incoming {
-    match pkt.first().copied() {
-        Some(PT_VIDEO_ENC) | Some(PT_AUDIO_ENC) | Some(PT_AUDIO2_ENC) | Some(PT_INPUT_ENC) | Some(PT_ANNOT_ENC)
-        | Some(PT_CTLREQ_ENC) | Some(PT_CTRL_ENC) | Some(PT_RUMBLE_ENC) => {}
-        _ => return Incoming::Plain,
+    let ty = pkt.first().copied();
+    let encrypted = matches!(
+        ty,
+        Some(PT_VIDEO_ENC)
+            | Some(PT_AUDIO_ENC)
+            | Some(PT_AUDIO2_ENC)
+            | Some(PT_INPUT_ENC)
+            | Some(PT_ANNOT_ENC)
+            | Some(PT_CTLREQ_ENC)
+            | Some(PT_CTRL_ENC)
+            | Some(PT_RUMBLE_ENC)
+    );
+    if encrypted {
+        for key in decrypt_keys() {
+            if let Some(p) = open_media(&key, pkt) {
+                return Incoming::Opened(p);
+            }
+        }
+        return Incoming::Drop;
     }
-    let Some(key) = armed_media_key() else { return Incoming::Drop };
-    match open_media(&key, pkt) {
-        Some(p) => Incoming::Opened(p),
-        None => Incoming::Drop,
+    // A v2 session has a key the packet headers do not carry. Clear picture or input would let anyone
+    // who can see the token (it is in every header) inject keystrokes or frames.
+    if session_armed() && matches!(ty, Some(PT_VIDEO | PT_AUDIO | PT_AUDIO2 | PT_AUDIO3 | PT_INPUT | PT_ANNOT | PT_CTLREQ | PT_CTRL | PT_RUMBLE)) {
+        return Incoming::Drop;
     }
+    Incoming::Plain
 }
 
 fn seal_media(key: &[u8; 32], pkt: &[u8]) -> Option<Vec<u8>> {
@@ -204,48 +220,63 @@ fn open_media(key: &[u8; 32], pkt: &[u8]) -> Option<Vec<u8>> {
 }
 
 struct MediaArm {
+    /// Derived key from the H… code. None for an old code: the stream stays clear.
+    session: Option<[u8; 32]>,
+    /// Derived friend-pair key.
     pair: Option<[u8; 32]>,
-    peer_ready: bool,
-    key: Option<[u8; 32]>,
+    /// Send with the pair key. Until the viewer confirms, the host keeps sending with the session key,
+    /// which the viewer can also open. Nothing goes out in the clear once a session key exists.
+    send_pair: bool,
+    peer_enc: bool,
     ctrl_nonce: u32,
 }
 
 fn media_arm() -> &'static std::sync::Mutex<MediaArm> {
     use std::sync::OnceLock;
     static M: OnceLock<std::sync::Mutex<MediaArm>> = OnceLock::new();
-    M.get_or_init(|| std::sync::Mutex::new(MediaArm { pair: None, peer_ready: false, key: None, ctrl_nonce: 0 }))
+    M.get_or_init(|| {
+        std::sync::Mutex::new(MediaArm { session: None, pair: None, send_pair: false, peer_enc: false, ctrl_nonce: 0 })
+    })
 }
 
 fn armed_media_key() -> Option<[u8; 32]> {
-    media_arm().lock().ok().and_then(|g| g.key)
+    let g = media_arm().lock().ok()?;
+    if g.send_pair { g.pair.or(g.session) } else { g.session }
 }
 
-/// Viewer side: the key is known before the first media packet. Encrypt and decrypt immediately.
+fn decrypt_keys() -> Vec<[u8; 32]> {
+    let Ok(g) = media_arm().lock() else { return Vec::new() };
+    [g.pair, g.session].into_iter().flatten().collect()
+}
+
+fn session_armed() -> bool {
+    media_arm().lock().ok().and_then(|g| g.session).is_some()
+}
+
+/// Viewer side, friend call: the pair key is known before the first packet.
+/// The session key, if the code had one, stays installed so the host's first packets still open.
 pub fn install_media_key(pair: &[u8; 32], token: u32) {
     if let Ok(mut g) = media_arm().lock() {
-        g.pair = Some(*pair);
-        g.peer_ready = true;
-        g.key = Some(crate::crypto::media_key(pair, token));
+        g.pair = Some(crate::crypto::media_key(pair, token));
+        g.send_pair = true;
     }
 }
 
-/// Both sides of a normal (not friend) connection. The secret travelled only inside the H… code,
-/// never in a UDP header, so someone watching the packets does not have it.
-/// A friend secret, once it is known, replaces this.
+/// Both sides of a v2 connection. The secret travelled only inside the H… code, never in a UDP header.
 pub fn install_session_key(secret: &[u8; 32], token: u32) {
     if let Ok(mut g) = media_arm().lock() {
-        if g.pair.is_none() {
-            g.key = Some(crate::crypto::media_key(secret, token));
-        }
+        g.session = Some(crate::crypto::media_key(secret, token));
     }
 }
 
-/// Host side, from the GUI: remember the friend secret. Encryption waits for [`note_peer_enc`].
-/// Until then the stream stays clear: the friend viewer has the pair key, not the session key.
+/// Host side, from the GUI. Decrypt with the pair key immediately; keep sending with the session key
+/// until the viewer says it has the pair key too ([`note_peer_enc`]).
 pub fn note_media_pair(pair: [u8; 32], token: u32) {
     if let Ok(mut g) = media_arm().lock() {
-        g.pair = Some(pair);
-        g.key = if g.peer_ready { Some(crate::crypto::media_key(&pair, token)) } else { None };
+        g.pair = Some(crate::crypto::media_key(&pair, token));
+        if g.peer_enc {
+            g.send_pair = true;
+        }
     }
 }
 
@@ -258,11 +289,11 @@ pub fn absorb_media_pair(token: u32) {
 }
 
 /// Host side: the connected viewer sent [`CAP_ENC`].
-pub fn note_peer_enc(token: u32) {
+pub fn note_peer_enc(_token: u32) {
     if let Ok(mut g) = media_arm().lock() {
-        g.peer_ready = true;
-        if let Some(pair) = g.pair {
-            g.key = Some(crate::crypto::media_key(&pair, token));
+        g.peer_enc = true;
+        if g.pair.is_some() {
+            g.send_pair = true;
         }
     }
 }
@@ -814,9 +845,12 @@ mod tests {
 
     #[test]
     fn sealed_media_roundtrips_and_plaintext_stays_plaintext() {
-        let pair = [3u8; 32];
         let token = 0xA1B2_C3D4u32;
-        install_media_key(&pair, token);
+        if let Ok(mut g) = media_arm().lock() {
+            *g = MediaArm { session: None, pair: None, send_pair: false, peer_enc: false, ctrl_nonce: 0 };
+        }
+        install_session_key(&[3u8; 32], token);
+        install_media_key(&[9u8; 32], token);
         let mut video = vec![PT_VIDEO];
         video.extend_from_slice(&token.to_le_bytes());
         video.extend_from_slice(&7u32.to_le_bytes());
@@ -851,6 +885,23 @@ mod tests {
         let sealed_in = seal_media(&armed_media_key().unwrap(), &input).unwrap();
         assert_eq!(sealed_in[0], PT_INPUT_ENC);
         match open_incoming(&sealed_in) {
+            Incoming::Opened(p) => assert_eq!(p, input),
+            Incoming::Plain => panic!("plaintext"),
+            Incoming::Drop => panic!("dropped"),
+        }
+        // The token is visible in every header. A clear input packet must not be accepted once the
+        // session key exists, and a packet sealed with the session key must still open after the
+        // friend key takes over sending.
+        let mut clear = vec![PT_INPUT, 0, 0, 0, 0, 1];
+        clear[1..5].copy_from_slice(&token.to_le_bytes());
+        assert!(matches!(open_incoming(&clear), Incoming::Drop));
+        assert!(matches!(open_incoming(&[PT_PING, 0, 0, 0, 0]), Incoming::Plain));
+        let session_only = {
+            let g = media_arm().lock().unwrap();
+            g.session.unwrap()
+        };
+        let sealed_session = seal_media(&session_only, &input).unwrap();
+        match open_incoming(&sealed_session) {
             Incoming::Opened(p) => assert_eq!(p, input),
             Incoming::Plain => panic!("plaintext"),
             Incoming::Drop => panic!("dropped"),
