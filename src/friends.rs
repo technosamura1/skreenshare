@@ -116,10 +116,12 @@ impl Identity {
 }
 
 impl Book {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(me: Identity) -> Book {
         Book { me, friends: Vec::new() }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn generate(name: &str) -> Book {
         Book::new(Identity::generate(name))
     }
@@ -128,10 +130,12 @@ impl Book {
         encode_code(&self.me.id, &self.me.key)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn link(&self) -> String {
         format!("screenshare://friend/{}", encode_code_raw(&self.me.id, &self.me.key))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_my_name(&mut self, name: &str) {
         self.me.name = sanitize_name(name);
     }

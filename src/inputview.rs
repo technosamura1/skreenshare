@@ -232,7 +232,7 @@ impl ViewInput {
                         if let Some(f) = f {
                             net::write_header(&mut out, net::PT_INPUT, token);
                             inputproto::encode(&f, &mut out);
-                            let _ = sock.send_to(&out, host);
+                            net::send_media(&sock, &out, host);
                         }
                     }
                     let (a, pointing) = {
@@ -244,14 +244,14 @@ impl ViewInput {
                     if let Some(a) = a {
                         net::write_header(&mut out, net::PT_ANNOT, token);
                         crate::annot::encode(&a, &mut out);
-                        let _ = sock.send_to(&out, host);
+                        net::send_media(&sock, &out, host);
                     }
                     // 4. asking the host for control (it shows the owner a notice), once a second while waiting
                     let asking = me.want.load(Ordering::Relaxed) && me.host_info().is_some_and(|c| !c.allowed && !c.denied);
                     if asking && last_ask.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) || !asking && last_ask.is_some() {
                         net::write_header(&mut out, net::PT_CTLREQ, token);
                         out.extend_from_slice(&[1, asking as u8]);
-                        let _ = sock.send_to(&out, host);
+                        net::send_media(&sock, &out, host);
                         last_ask = asking.then_some(now);
                     }
                     // 5. motors stop by themselves when the host goes quiet

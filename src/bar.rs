@@ -63,6 +63,7 @@ pub struct Bar {
 }
 
 impl Bar {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(ww: i32, wh: i32, s: i32) -> Bar {
         Bar::with_control(ww, wh, s, false)
     }

@@ -420,14 +420,14 @@ impl InputHost {
                         if last_ctrl.is_none_or(|(c, t)| c != info || now.duration_since(t) >= Duration::from_secs(1)) {
                             net::write_header(&mut out, net::PT_CTRL, token);
                             inputproto::encode_ctrl(&info, &mut out);
-                            let _ = sock.send_to(&out, peer);
+                            net::send_media(&sock, &out, peer);
                             last_ctrl = Some((info, now));
                         }
                         let rs = me.rumble.lock().unwrap().poll(now);
                         for r in rs {
                             net::write_header(&mut out, net::PT_RUMBLE, token);
                             inputproto::encode_rumble(&r, &mut out);
-                            let _ = sock.send_to(&out, peer);
+                            net::send_media(&sock, &out, peer);
                         }
                     }
                     // Status for the GUI: on change, and once a second so a late reader catches up.

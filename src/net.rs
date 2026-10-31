@@ -48,6 +48,12 @@ pub const PT_VIDEO_ENC: u8 = 0x94;
 pub const PT_AUDIO_ENC: u8 = 0x95;
 /// Encrypted legacy audio (PT_AUDIO2). Same idea as PT_AUDIO_ENC, separate stream number.
 pub const PT_AUDIO2_ENC: u8 = 0x96;
+/// Encrypted remote control. A network observer who can see the session token still cannot forge or read these.
+pub const PT_INPUT_ENC: u8 = 0xB0;
+pub const PT_ANNOT_ENC: u8 = 0xB1;
+pub const PT_CTLREQ_ENC: u8 = 0xB2;
+pub const PT_CTRL_ENC: u8 = 0xB3;
+pub const PT_RUMBLE_ENC: u8 = 0xB4;
 /// Viewer understands encrypted media and has the friend secret. Host stays in the clear until it sees this.
 pub const CAP_ENC: u8 = 4;
 
@@ -102,8 +108,8 @@ fn sim_drop() -> bool {
     next
 }
 
-/// send_to for media packets (subject to the loss simulation).
-/// Video and audio are encrypted once the viewer has announced [`CAP_ENC`] and the friend secret is installed.
+/// Video, audio and remote-control packets are encrypted once a key is installed.
+/// Punch, ping and loss reports stay clear: they carry no picture and no keystrokes.
 pub fn send_media(sock: &UdpSocket, pkt: &[u8], to: SocketAddr) {
     if sim_drop() {
         return;
@@ -133,7 +139,8 @@ pub enum Incoming {
 
 pub fn open_incoming(pkt: &[u8]) -> Incoming {
     match pkt.first().copied() {
-        Some(PT_VIDEO_ENC) | Some(PT_AUDIO_ENC) | Some(PT_AUDIO2_ENC) => {}
+        Some(PT_VIDEO_ENC) | Some(PT_AUDIO_ENC) | Some(PT_AUDIO2_ENC) | Some(PT_INPUT_ENC) | Some(PT_ANNOT_ENC)
+        | Some(PT_CTLREQ_ENC) | Some(PT_CTRL_ENC) | Some(PT_RUMBLE_ENC) => {}
         _ => return Incoming::Plain,
     }
     let Some(key) = armed_media_key() else { return Incoming::Drop };
@@ -158,8 +165,28 @@ fn seal_media(key: &[u8; 32], pkt: &[u8]) -> Option<Vec<u8>> {
             let seq = u32::from_le_bytes(pkt[5..9].try_into().ok()?);
             crate::crypto::seal(key, pkt, PT_AUDIO2_ENC, HEADER_LEN, seq, 0, 2)
         }
+        PT_INPUT => seal_ctrl(key, pkt, PT_INPUT_ENC, 3),
+        PT_ANNOT => seal_ctrl(key, pkt, PT_ANNOT_ENC, 4),
+        PT_CTLREQ => seal_ctrl(key, pkt, PT_CTLREQ_ENC, 5),
+        PT_CTRL => seal_ctrl(key, pkt, PT_CTRL_ENC, 6),
+        PT_RUMBLE => seal_ctrl(key, pkt, PT_RUMBLE_ENC, 7),
         _ => None,
     }
+}
+
+/// Control packets repeat and their own sequence is only 16 bits, which would reuse a ChaCha nonce.
+/// The nonce here is a counter plus the stream, and it travels with the packet.
+fn seal_ctrl(key: &[u8; 32], pkt: &[u8], enc_type: u8, stream: u16) -> Option<Vec<u8>> {
+    if pkt.len() < HEADER_LEN {
+        return None;
+    }
+    let n = {
+        let mut g = media_arm().lock().ok()?;
+        let n = g.ctrl_nonce;
+        g.ctrl_nonce = g.ctrl_nonce.wrapping_add(1);
+        n
+    };
+    crate::crypto::seal(key, pkt, enc_type, HEADER_LEN, n, 0, stream)
 }
 
 fn open_media(key: &[u8; 32], pkt: &[u8]) -> Option<Vec<u8>> {
@@ -167,6 +194,11 @@ fn open_media(key: &[u8; 32], pkt: &[u8]) -> Option<Vec<u8>> {
         PT_VIDEO_ENC => crate::crypto::open(key, pkt, PT_VIDEO, VIDEO_HEADER_LEN),
         PT_AUDIO_ENC => crate::crypto::open(key, pkt, PT_AUDIO3, HEADER_LEN),
         PT_AUDIO2_ENC => crate::crypto::open(key, pkt, PT_AUDIO2, HEADER_LEN),
+        PT_INPUT_ENC => crate::crypto::open(key, pkt, PT_INPUT, HEADER_LEN),
+        PT_ANNOT_ENC => crate::crypto::open(key, pkt, PT_ANNOT, HEADER_LEN),
+        PT_CTLREQ_ENC => crate::crypto::open(key, pkt, PT_CTLREQ, HEADER_LEN),
+        PT_CTRL_ENC => crate::crypto::open(key, pkt, PT_CTRL, HEADER_LEN),
+        PT_RUMBLE_ENC => crate::crypto::open(key, pkt, PT_RUMBLE, HEADER_LEN),
         _ => None,
     }
 }
@@ -175,12 +207,13 @@ struct MediaArm {
     pair: Option<[u8; 32]>,
     peer_ready: bool,
     key: Option<[u8; 32]>,
+    ctrl_nonce: u32,
 }
 
 fn media_arm() -> &'static std::sync::Mutex<MediaArm> {
     use std::sync::OnceLock;
     static M: OnceLock<std::sync::Mutex<MediaArm>> = OnceLock::new();
-    M.get_or_init(|| std::sync::Mutex::new(MediaArm { pair: None, peer_ready: false, key: None }))
+    M.get_or_init(|| std::sync::Mutex::new(MediaArm { pair: None, peer_ready: false, key: None, ctrl_nonce: 0 }))
 }
 
 fn armed_media_key() -> Option<[u8; 32]> {
@@ -196,13 +229,23 @@ pub fn install_media_key(pair: &[u8; 32], token: u32) {
     }
 }
 
+/// Both sides of a normal (not friend) connection. The secret travelled only inside the H… code,
+/// never in a UDP header, so someone watching the packets does not have it.
+/// A friend secret, once it is known, replaces this.
+pub fn install_session_key(secret: &[u8; 32], token: u32) {
+    if let Ok(mut g) = media_arm().lock() {
+        if g.pair.is_none() {
+            g.key = Some(crate::crypto::media_key(secret, token));
+        }
+    }
+}
+
 /// Host side, from the GUI: remember the friend secret. Encryption waits for [`note_peer_enc`].
+/// Until then the stream stays clear: the friend viewer has the pair key, not the session key.
 pub fn note_media_pair(pair: [u8; 32], token: u32) {
     if let Ok(mut g) = media_arm().lock() {
         g.pair = Some(pair);
-        if g.peer_ready {
-            g.key = Some(crate::crypto::media_key(&pair, token));
-        }
+        g.key = if g.peer_ready { Some(crate::crypto::media_key(&pair, token)) } else { None };
     }
 }
 
@@ -530,13 +573,17 @@ pub fn stun_keepalive(sock: &UdpSocket, server: Option<SocketAddr>) {
     }
 }
 
+#[derive(Clone)]
 pub struct Code {
     pub role: u8,
     pub token: u32,
     pub cands: Vec<SocketAddrV4>,
+    /// Present only in a host code of version 2. Not the token: the token is visible on every packet.
+    pub secret: Option<[u8; 32]>,
 }
 
 const CODE_VERSION: u8 = 1;
+const CODE_VERSION_KEY: u8 = 2;
 
 impl Code {
     pub fn for_socket(role: u8, token: u32, sock: &UdpSocket, nat: &NatInfo) -> Code {
@@ -557,12 +604,22 @@ impl Code {
                 cands.push(p);
             }
         }
-        Code { role, token, cands }
+        let secret = if role == ROLE_HOST {
+            let mut s = [0u8; 32];
+            getrandom::fill(&mut s).expect("rng");
+            Some(s)
+        } else {
+            None
+        };
+        Code { role, token, cands, secret }
     }
 
     pub fn encode(&self) -> String {
-        let mut b = vec![CODE_VERSION, self.role];
+        let mut b = vec![if self.secret.is_some() { CODE_VERSION_KEY } else { CODE_VERSION }, self.role];
         b.extend_from_slice(&self.token.to_le_bytes());
+        if let Some(s) = &self.secret {
+            b.extend_from_slice(s);
+        }
         for c in &self.cands {
             b.extend_from_slice(&c.ip().octets());
             b.extend_from_slice(&c.port().to_be_bytes());
@@ -577,17 +634,31 @@ impl Code {
         let b = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(body)
             .context("код повреждён — скопируйте его целиком")?;
-        if b.len() < 6 || (b.len() - 6) % 6 != 0 {
+        if b.len() < 6 {
             bail!("код повреждён — скопируйте его целиком");
         }
-        if b[0] != CODE_VERSION {
-            bail!("код от другой версии программы — обновитесь оба");
-        }
-        let cands = b[6..]
+        let (secret, rest) = match b[0] {
+            CODE_VERSION => {
+                if (b.len() - 6) % 6 != 0 {
+                    bail!("код повреждён — скопируйте его целиком");
+                }
+                (None, &b[6..])
+            }
+            CODE_VERSION_KEY => {
+                if b.len() < 38 || (b.len() - 38) % 6 != 0 {
+                    bail!("код повреждён — скопируйте его целиком");
+                }
+                let mut s = [0u8; 32];
+                s.copy_from_slice(&b[6..38]);
+                (Some(s), &b[38..])
+            }
+            _ => bail!("код от другой версии программы — обновитесь оба"),
+        };
+        let cands = rest
             .chunks(6)
             .map(|c| SocketAddrV4::new(Ipv4Addr::new(c[0], c[1], c[2], c[3]), u16::from_be_bytes([c[4], c[5]])))
             .collect();
-        Ok(Code { role: b[1], token: u32::from_le_bytes(b[2..6].try_into().unwrap()), cands })
+        Ok(Code { role: b[1], token: u32::from_le_bytes(b[2..6].try_into().unwrap()), cands, secret })
     }
 }
 
@@ -772,8 +843,18 @@ mod tests {
             Incoming::Plain => panic!("plaintext"),
             Incoming::Drop => panic!("dropped"),
         }
-        // Control packets are not media.
+        // Ping is not picture and not input.
         assert!(seal_media(&armed_media_key().unwrap(), &[PT_PING, 0, 0, 0, 0]).is_none());
+        let mut input = vec![PT_INPUT];
+        input.extend_from_slice(&token.to_le_bytes());
+        input.extend_from_slice(&[1, 0, 1]);
+        let sealed_in = seal_media(&armed_media_key().unwrap(), &input).unwrap();
+        assert_eq!(sealed_in[0], PT_INPUT_ENC);
+        match open_incoming(&sealed_in) {
+            Incoming::Opened(p) => assert_eq!(p, input),
+            Incoming::Plain => panic!("plaintext"),
+            Incoming::Drop => panic!("dropped"),
+        }
     }
 
     #[test]
@@ -782,6 +863,7 @@ mod tests {
             role: ROLE_HOST,
             token: 0xDEADBEEF,
             cands: vec!["192.168.1.5:5000".parse().unwrap(), "1.2.3.4:61000".parse().unwrap()],
+            secret: None,
         };
         let s = c.encode();
         assert!(s.starts_with('H'));
@@ -789,6 +871,14 @@ mod tests {
         assert_eq!(d.role, ROLE_HOST);
         assert_eq!(d.token, 0xDEADBEEF);
         assert_eq!(d.cands, c.cands);
+        assert!(d.secret.is_none());
+        let mut keyed = c.clone();
+        keyed.secret = Some([9u8; 32]);
+        let s2 = keyed.encode();
+        let d2 = Code::decode(&s2).unwrap();
+        assert_eq!(d2.secret, Some([9u8; 32]));
+        assert_eq!(d2.cands, c.cands);
+        assert_eq!(d2.token, c.token);
     }
 
     #[test]

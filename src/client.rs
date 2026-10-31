@@ -275,6 +275,9 @@ pub fn run(o: ClientOpts) -> Result<()> {
         &sock,
         nat.keepalive_server,
     )?;
+    if let Some(secret) = host.secret {
+        net::install_session_key(&secret, host.token);
+    }
     let me = Code::for_socket(net::ROLE_CLIENT, host.token, &sock, &nat);
     ui::show_code(&o.exchange, &me.encode(), "client.code", "Ваш код ответа — передайте его тому, кто транслирует экран:")?;
     println!("Жду, пока код ответа введут на стороне показа...");

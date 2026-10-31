@@ -408,6 +408,9 @@ pub fn run(o: HostOpts) -> Result<()> {
     ui::report_nat(&nat);
     let token = net::random_token();
     let me = Code::for_socket(net::ROLE_HOST, token, &sock, &nat);
+    if let Some(secret) = me.secret {
+        net::install_session_key(&secret, token);
+    }
     ui::show_code(&o.exchange, &me.encode(), "host.code", "Ваш код — передайте его зрителю:")?;
     let peer_code = ui::read_code(
         &o.exchange,
@@ -479,7 +482,17 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                         continue;
                     }
                 };
-                let Some((ty, body)) = net::parse_header(&buf[..n], token) else { continue };
+                let raw = &buf[..n];
+                let opened;
+                let pkt: &[u8] = match net::open_incoming(raw) {
+                    net::Incoming::Drop => continue,
+                    net::Incoming::Plain => raw,
+                    net::Incoming::Opened(p) => {
+                        opened = p;
+                        &opened
+                    }
+                };
+                let Some((ty, body)) = net::parse_header(pkt, token) else { continue };
                 sh.last_seen_ms.store(sh.now_ms(), Ordering::Relaxed);
                 net::absorb_media_pair(token);
                 match ty {

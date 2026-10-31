@@ -43,6 +43,7 @@ pub mod btn {
     pub const RTHUMB: u16 = 0x0080;
     pub const LB: u16 = 0x0100;
     pub const RB: u16 = 0x0200;
+    #[allow(dead_code)]
     pub const GUIDE: u16 = 0x0400;
     pub const A: u16 = 0x1000;
     pub const B: u16 = 0x2000;
