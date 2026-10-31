@@ -1038,8 +1038,10 @@ struct GuiApp {
     friend_poll_i: usize,
     friend_net: Option<Receiver<FriendNet>>,
     friend_post: Option<Receiver<Result<String, String>>>,
-    friend_inbox_since: String,
-    friend_pair_since: HashMap<[u8; 16], String>,
+    /// Where the relay polls stopped, kept in the profile folder (see `friends::Cursors`).
+    friend_cursors: friends::Cursors,
+    /// Pending invitations already announced with a taskbar flash (a new one flashes again).
+    friend_invites_flashed: usize,
     friend_last_seen: HashMap<[u8; 16], u64>,
     /// Invites waiting for «Смотреть». A second one must not erase the first: the relay cursor
     /// already moved past both, so the overwritten invite would never come back.
@@ -1169,8 +1171,8 @@ impl GuiApp {
             friend_poll_i: 0,
             friend_net: None,
             friend_post: None,
-            friend_inbox_since: String::new(),
-            friend_pair_since: HashMap::new(),
+            friend_cursors: friends::load_cursors(&friends::profile_dir()),
+            friend_invites_flashed: 0,
             friend_last_seen: HashMap::new(),
             friend_pending_invites: Vec::new(),
             friend_answer: None,
@@ -1367,7 +1369,10 @@ impl eframe::App for GuiApp {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    /// Everything that is not drawing: the sessions, friends on the relay, the taskbar. eframe runs this before
+    /// every `ui` and also while the window is minimized — `ui` is not called then, and the friends' relay used
+    /// to stop with it (no invitation arrived, the host never got the viewer's answer).
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         for s in [&mut self.host, &mut self.join].into_iter().flatten() {
             s.poll();
         }
@@ -1404,7 +1409,7 @@ impl eframe::App for GuiApp {
             // Stopped from the viewer's bar, by closing its window or from our own button: one click, everything
             // back to the start (button, preview and the two status lines go with the sessions).
             self.test = None;
-            ui.ctx().request_repaint();
+            ctx.request_repaint();
         }
         self.play_cues();
         self.friends_poll();
@@ -1415,7 +1420,7 @@ impl eframe::App for GuiApp {
         } else {
             friends::relay_gap_ms(self.book.friends.len())
         };
-        ui.ctx().request_repaint_after(Duration::from_millis(friend_wait));
+        ctx.request_repaint_after(Duration::from_millis(friend_wait));
         if self.host.as_ref().is_some_and(|s| s.ended) {
             self.ctl.allow = false;
         }
@@ -1429,7 +1434,7 @@ impl eframe::App for GuiApp {
                     self.drv = DrvUi::Done(end);
                 }
                 Ok(Err(e)) => self.drv = DrvUi::Error(e),
-                Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint_after(Duration::from_millis(250)),
+                Err(mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(250)),
                 Err(mpsc::TryRecvError::Disconnected) => self.drv = DrvUi::Error("установка прервана".into()),
             }
         }
@@ -1445,9 +1450,14 @@ impl eframe::App for GuiApp {
             || self.join.as_ref().is_some_and(|s| s.active())
             || self.test.is_some();
         if busy {
-            ui.ctx().request_repaint_after(Duration::from_millis(250));
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
 
+        self.notify_hidden(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let _ = &frame;
         let vid = self.view_id();
         if vid != self.view_key {
             self.view_key = vid;
@@ -1520,27 +1530,27 @@ impl eframe::App for GuiApp {
 }
 
 impl GuiApp {
+    /// A request for control or a friend's invitation while the window may be minimized: the taskbar button
+    /// flashes until the window is brought up (once per new request / invitation).
+    fn notify_hidden(&mut self, ctx: &egui::Context) {
+        let asked = self.host.as_ref().is_some_and(|s| !s.ended && s.ctrl.is_some_and(|c| c.asked && !c.on));
+        let flash_ask = asked && !self.asked_seen;
+        self.asked_seen = asked;
+        let invites = self.friend_pending_invites.len();
+        let flash_invite = invites > self.friend_invites_flashed;
+        self.friend_invites_flashed = invites;
+        if flash_ask || flash_invite {
+            flash_taskbar(self.hwnd);
+            ctx.request_repaint();
+        }
+    }
+
     /// The viewer asks for control (v0.12.8): a card on top of every page with «Разрешить» / «Отклонить», and the
     /// taskbar button flashes once per request (the banner on the screen itself is drawn by the host process).
     fn control_ask(&mut self, ui: &mut egui::Ui) {
         let asked = self.host.as_ref().is_some_and(|s| !s.ended && s.ctrl.is_some_and(|c| c.asked && !c.on));
         if !asked {
-            self.asked_seen = false;
             return;
-        }
-        if !self.asked_seen {
-            self.asked_seen = true;
-            use windows::Win32::UI::WindowsAndMessaging::{FlashWindowEx, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG};
-            let fi = FLASHWINFO {
-                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
-                hwnd: windows::Win32::Foundation::HWND(self.hwnd as *mut core::ffi::c_void),
-                dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
-                uCount: 0,
-                dwTimeout: 0,
-            };
-            unsafe {
-                let _ = FlashWindowEx(&fi);
-            }
         }
         let mut answer = None;
         egui::Frame::new()
@@ -1944,6 +1954,20 @@ fn graph_panel(ui: &mut egui::Ui, g: &lg::Graph, host: bool) {
 
 // ---------------------------------------------------------------- friends
 
+fn flash_taskbar(hwnd: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{FlashWindowEx, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG};
+    let fi = FLASHWINFO {
+        cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+        hwnd: windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void),
+        dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+        uCount: 0,
+        dwTimeout: 0,
+    };
+    unsafe {
+        let _ = FlashWindowEx(&fi);
+    }
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
@@ -1999,11 +2023,19 @@ impl GuiApp {
             FriendNetKind::Inbox => {
                 let lines = friends::parse_relay(&raw);
                 let messages: Vec<String> = lines.iter().map(|l| l.message.clone()).collect();
-                let n = self.book.take_hellos(&messages);
-                if n > 0 {
+                let from = self.book.take_hellos_from(&messages);
+                if !from.is_empty() {
                     friends::save_book(&friends::profile_dir(), &self.book);
                 }
-                self.friend_inbox_since = friends::next_since(&self.friend_inbox_since, &lines).to_string();
+                // Whoever just added us sees us online at once, and we look at our pair quickly for a while.
+                for id in from {
+                    self.friend_greet(id, None);
+                }
+                let next = friends::next_since(&self.friend_cursors.inbox, &lines).to_string();
+                if next != self.friend_cursors.inbox {
+                    self.friend_cursors.inbox = next;
+                    friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
+                }
             }
             FriendNetKind::Pair { id, since } => {
                 let lines = friends::parse_relay(&raw);
@@ -2029,10 +2061,35 @@ impl GuiApp {
                     }
                 }
                 let new_since = friends::next_since(&since, &lines).to_string();
-                self.friend_pair_since.insert(id, new_since);
+                if new_since != since && self.book.pair_topic(&id).is_some() {
+                    self.friend_cursors.set_pair(id, &new_since);
+                    friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
+                }
             }
             FriendNetKind::Presence => {}
         }
+    }
+
+    /// A friend was just added (by us: `hello` to post first) or said hello: post our presence on the pair at
+    /// once and poll it quickly for 90 s, so both sides see each other in seconds, not after a full cycle.
+    fn friend_greet(&mut self, id: [u8; 16], hello: Option<friends::OutMsg>) {
+        let Some(presence) = self.book.presence(&id, unix_now()) else { return };
+        let ours = hello.is_some();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut r = Ok(());
+            if let Some(h) = hello {
+                r = crate::ntfy::post(&h.topic, &h.body);
+            }
+            if r.is_ok() {
+                r = crate::ntfy::post(&presence.topic, &presence.body);
+            }
+            let _ = tx.send(r.map(|_| "Друг добавлен. Как только его программа будет запущена, он появится «в сети».".to_string()).map_err(|e| format!("{e:#}")));
+        });
+        if ours {
+            self.friend_post = Some(rx);
+        }
+        self.friend_rush_ids.insert(id, Instant::now() + Duration::from_secs(90));
     }
 
     /// One relay call at a time, never faster than [`friends::relay_gap_ms`].
@@ -2068,7 +2125,7 @@ impl GuiApp {
             let id = ids[self.friend_rush_i % ids.len()];
             self.friend_rush_i = self.friend_rush_i.wrapping_add(1);
             self.friend_poll_last = Some(now);
-            let since = self.friend_pair_since.get(&id).cloned().unwrap_or_default();
+            let since = self.friend_cursors.pair(&id);
             let Some(topic) = self.book.pair_topic(&id) else { return };
             self.spawn_friend_get(FriendNetKind::Pair { id, since: since.clone() }, topic, since);
             return;
@@ -2083,14 +2140,14 @@ impl GuiApp {
         self.friend_poll_i = self.friend_poll_i.wrapping_add(1);
         if i == 0 {
             let topic = self.book.inbox_topic();
-            let since = self.friend_inbox_since.clone();
+            let since = self.friend_cursors.inbox.clone();
             self.spawn_friend_get(FriendNetKind::Inbox, topic, since);
             return;
         }
         let ids: Vec<[u8; 16]> = self.book.friends.iter().map(|f| f.id).collect();
         if i <= n {
             let id = ids[i - 1];
-            let since = self.friend_pair_since.get(&id).cloned().unwrap_or_default();
+            let since = self.friend_cursors.pair(&id);
             let Some(topic) = self.book.pair_topic(&id) else { return };
             self.spawn_friend_get(FriendNetKind::Pair { id, since: since.clone() }, topic, since);
             return;
@@ -2152,14 +2209,17 @@ impl GuiApp {
                 match self.book.add(&raw) {
                     Ok(msg) => {
                         if let Some((id, _)) = friends::parse_code(&raw) {
-                            self.friend_pair_since.remove(&id);
+                            self.friend_cursors.forget(&id);
+                            friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
                             self.friend_last_seen.remove(&id);
                         }
                         self.friend_poll_i = 0;
                         friends::save_book(&friends::profile_dir(), &self.book);
                         self.friend_ok = Some("Друг добавлен. Когда он запустит программу, появится в списке.".into());
                         self.friend_code_input.clear();
-                        self.spawn_friend_post(msg.topic, msg.body, "Друг добавлен. Когда он запустит программу, появится в списке.".into());
+                        if let Some((id, _)) = friends::parse_code(&raw) {
+                            self.friend_greet(id, Some(msg));
+                        }
                     }
                     Err(e) => self.friend_error = Some(friends::add_error_text(e).into()),
                 }
@@ -2238,7 +2298,8 @@ impl GuiApp {
             if let Some(id) = to_remove {
                 self.book.remove(&id);
                 self.friend_last_seen.remove(&id);
-                self.friend_pair_since.remove(&id);
+                self.friend_cursors.forget(&id);
+                friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
                 self.friend_rush_ids.remove(&id);
                 self.friend_poll_i = 0;
                 if self.friend_rename_id == Some(id) {

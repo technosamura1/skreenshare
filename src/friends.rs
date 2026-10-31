@@ -23,8 +23,9 @@ pub const KIND_DECLINE: u8 = b'N';
 
 /// How long an invitation stays tappable.
 pub const INVITE_TTL_SECS: u64 = 15 * 60;
-/// At least this often we would like a presence beat, when the relay budget allows it.
-pub const PRESENCE_WANT_SECS: u64 = 45;
+/// At least this often we would like a presence beat, when the relay budget allows it. (45 s made a new
+/// friend take up to two minutes to show up; 20 s is still well inside ntfy.sh's 1 request / 5 s.)
+pub const PRESENCE_WANT_SECS: u64 = 20;
 /// ntfy.sh: after a burst, one request per 5 s. Never schedule faster than that.
 pub const RELAY_MIN_GAP_MS: u64 = 5_000;
 pub const MAX_FRIENDS: usize = 32;
@@ -187,9 +188,15 @@ impl Book {
     /// Hellos addressed to us. A hello whose id we already know is applied only when the inbox key matches.
     /// An existing pair is kept, unless the hello carries the derived secret ([`pair_secret`]): that one
     /// replaces a leftover random secret from 0.12.8. A random hello never overwrites a pair we already have.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn take_hellos(&mut self, messages: &[String]) -> usize {
+        self.take_hellos_from(messages).len()
+    }
+
+    /// [`Self::take_hellos`], returning who said hello (to answer with a presence at once).
+    pub fn take_hellos_from(&mut self, messages: &[String]) -> Vec<[u8; 16]> {
         let ch = inbox_channel(&self.me.id, &self.me.key);
-        let mut n = 0;
+        let mut n = Vec::new();
         for m in messages {
             let Some(body) = ch.open(KIND_HELLO, m) else { continue };
             let Some((id, key, pair, name)) = parse_hello(&body) else { continue };
@@ -210,21 +217,18 @@ impl Book {
             } else {
                 self.friends.push(Friend { id, their_key: key, pair, name, renamed: false });
             }
-            n += 1;
+            if !n.contains(&id) {
+                n.push(id);
+            }
         }
         n
     }
 
     pub fn presence(&self, id: &[u8; 16], unix: u64) -> Option<OutMsg> {
-        let f = self.friends.iter().find(|f| &f.id == id)?;
-        let ch = pair_channel(&self.me.id, &f.id, &f.pair);
-        let body = format!("{unix}\n{}", self.me.name);
-        Some(pack(ch, KIND_PRESENCE, &body))
+        self.pair_line(id, KIND_PRESENCE, &format!("{unix}\n{}", self.me.name))
     }
 
     pub fn invite(&self, id: &[u8; 16], kind: InviteKind, code: &str, unix: u64) -> Option<OutMsg> {
-        let f = self.friends.iter().find(|f| &f.id == id)?;
-        let ch = pair_channel(&self.me.id, &f.id, &f.pair);
         let mut nonce = [0u8; 8];
         getrandom::fill(&mut nonce).expect("rng");
         let tag = match kind {
@@ -232,7 +236,7 @@ impl Book {
             InviteKind::Offer => "offer",
         };
         let body = format!("{tag}\n{code}\n{unix}\n{}\n{}", hex(&nonce), self.me.name);
-        Some(pack(ch, KIND_INVITE, &body))
+        self.pair_line(id, KIND_INVITE, &body)
     }
 
     pub fn answer(&self, id: &[u8; 16], nonce: &str, code: &str) -> Option<OutMsg> {
@@ -243,17 +247,32 @@ impl Book {
         self.pair_line(id, KIND_DECLINE, nonce)
     }
 
+    /// Both people write to the one pair topic and both read all of it, so every message says who wrote it
+    /// (`@<sender id hex>` first line, v0.12.18). Without that each side took its own presence for the
+    /// friend's (always «в сети») and the host was offered its own invitation.
     fn pair_line(&self, id: &[u8; 16], kind: u8, body: &str) -> Option<OutMsg> {
         let f = self.friends.iter().find(|f| &f.id == id)?;
         let ch = pair_channel(&self.me.id, &f.id, &f.pair);
-        Some(pack(ch, kind, body))
+        Some(pack(ch, kind, &format!("@{}\n{body}", hex(&self.me.id))))
     }
 
-    /// One sealed pair-topic message from `id`, if it is theirs. Also learns a presence name.
+    /// One sealed pair-topic message from `id`, if it is theirs. Also learns a presence name. Our own messages
+    /// (we read the whole topic) and anything signed by a third id are skipped; an unsigned one is from a peer
+    /// before 0.12.18 and is taken as the friend's.
     pub fn open_pair(&mut self, id: &[u8; 16], message: &str) -> Option<PairEvent> {
         let f = self.friends.iter().find(|f| &f.id == id)?;
         let ch = pair_channel(&self.me.id, &f.id, &f.pair);
         let (kind, body) = ch.open_any(message)?;
+        let body = match body.strip_prefix('@') {
+            Some(rest) => {
+                let (from, body) = rest.split_once('\n')?;
+                if unhex16(from)? != *id {
+                    return None;
+                }
+                body.to_string()
+            }
+            None => body,
+        };
         let ev = parse_pair(kind, &body)?;
         if let PairEvent::Presence { name, .. } = &ev {
             if let Some(f) = self.friends.iter_mut().find(|f| &f.id == id) {
@@ -369,6 +388,68 @@ pub fn save_book(dir: &Path, book: &Book) {
     let _ = std::fs::create_dir_all(dir);
     let _ = write_identity(&dir.join("identity.txt"), &book.me);
     let _ = write_friends(&dir.join("friends.txt"), &book.friends);
+}
+
+/// Where the relay polls stopped (`since=` ids), kept between runs: without it every start read the last
+/// 12 hours again — a removed friend came back from his old hello, a handled invitation popped up again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cursors {
+    pub inbox: String,
+    pub pairs: Vec<([u8; 16], String)>,
+}
+
+impl Cursors {
+    pub fn pair(&self, id: &[u8; 16]) -> String {
+        self.pairs.iter().find(|(i, _)| i == id).map(|(_, s)| s.clone()).unwrap_or_default()
+    }
+
+    pub fn set_pair(&mut self, id: [u8; 16], since: &str) {
+        match self.pairs.iter_mut().find(|(i, _)| *i == id) {
+            Some(p) => p.1 = since.to_string(),
+            None => self.pairs.push((id, since.to_string())),
+        }
+    }
+
+    pub fn forget(&mut self, id: &[u8; 16]) {
+        self.pairs.retain(|(i, _)| i != id);
+    }
+}
+
+fn cursor_token(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty() && t.len() <= 80 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')).then(|| t.to_string())
+}
+
+pub fn load_cursors(dir: &Path) -> Cursors {
+    let mut c = Cursors::default();
+    let Ok(t) = std::fs::read_to_string(dir.join("relay_cursors.txt")) else { return c };
+    for l in t.lines() {
+        let mut p = l.split_whitespace();
+        match (p.next(), p.next(), p.next()) {
+            (Some("inbox"), Some(s), None) => c.inbox = cursor_token(s).unwrap_or_default(),
+            (Some("pair"), Some(id), Some(s)) => {
+                if let (Some(id), Some(s)) = (unhex16(id), cursor_token(s)) {
+                    c.set_pair(id, &s);
+                }
+            }
+            _ => {}
+        }
+    }
+    c
+}
+
+pub fn save_cursors(dir: &Path, c: &Cursors) {
+    let mut text = String::new();
+    if let Some(s) = cursor_token(&c.inbox) {
+        text.push_str(&format!("inbox {s}\n"));
+    }
+    for (id, s) in &c.pairs {
+        if let Some(s) = cursor_token(s) {
+            text.push_str(&format!("pair {} {s}\n", hex(id)));
+        }
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join("relay_cursors.txt"), text);
 }
 
 fn default_name() -> String {
@@ -869,6 +950,53 @@ mod tests {
     }
 
     #[test]
+    fn own_messages_on_the_pair_topic_are_not_the_friends() {
+        let mut a = fixed(40, "Хост");
+        let mut b = fixed(41, "Зритель");
+        let hello = b.add(&a.code()).unwrap();
+        assert_eq!(a.take_hellos(&[hello.body]), 1);
+        // Each side polls the whole topic and so reads what it posted itself.
+        let mine = a.presence(&b.me.id, 100).unwrap();
+        assert_eq!(a.open_pair(&b.me.id, &mine.body), None, "own presence is not the friend online");
+        let inv = a.invite(&b.me.id, InviteKind::Offer, "Hcode", 100).unwrap();
+        assert_eq!(a.open_pair(&b.me.id, &inv.body), None, "the host is not invited by itself");
+        assert!(matches!(b.open_pair(&a.me.id, &inv.body), Some(PairEvent::Invite(_))));
+        let ans = b.answer(&a.me.id, "0011223344556677", "Ccode").unwrap();
+        assert_eq!(b.open_pair(&a.me.id, &ans.body), None);
+        assert!(matches!(a.open_pair(&b.me.id, &ans.body), Some(PairEvent::Answer { .. })));
+        // A message from 0.12.17 and older has no sender line: still taken as the friend's.
+        let ch = pair_channel(&a.me.id, &b.me.id, &a.friends[0].pair);
+        let old = ch.seal(KIND_PRESENCE, "100\nСтарый");
+        assert!(matches!(a.open_pair(&b.me.id, &old), Some(PairEvent::Presence { .. })));
+        // Signed by some third id: not theirs.
+        let forged = ch.seal(KIND_PRESENCE, &format!("@{}\n100\nX", hex(&[3u8; 16])));
+        assert_eq!(a.open_pair(&b.me.id, &forged), None);
+    }
+
+    #[test]
+    fn relay_cursors_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("ss-cursors-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(load_cursors(&dir), Cursors::default());
+        let mut c = Cursors { inbox: "AbC123".into(), pairs: Vec::new() };
+        c.set_pair([1; 16], "m1");
+        c.set_pair([2; 16], "m2");
+        c.set_pair([1; 16], "m3");
+        save_cursors(&dir, &c);
+        let back = load_cursors(&dir);
+        assert_eq!(back, c);
+        assert_eq!(back.pair(&[1; 16]), "m3");
+        assert_eq!(back.pair(&[9; 16]), "");
+        c.forget(&[1; 16]);
+        assert_eq!(c.pair(&[1; 16]), "");
+        // Junk that could rewrite the URL is never stored.
+        c.inbox = "x&since=all".into();
+        save_cursors(&dir, &c);
+        assert_eq!(load_cursors(&dir).inbox, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn offer_answer_roundtrip_and_decline() {
         let mut a = fixed(3, "A");
         let mut b = fixed(4, "B");
@@ -1004,6 +1132,57 @@ mod tests {
                 assert!(cycle_secs(n) <= 60, "n={n} cycle {}", cycle_secs(n));
             }
         }
+    }
+
+    /// Two fresh profiles over the real ntfy.sh (needs the internet): add, hello, presence both ways,
+    /// invite, answer — the same calls the window makes. `cargo test -- --ignored real_relay`.
+    #[test]
+    #[ignore]
+    fn real_relay_friends_roundtrip() {
+        let mut a = Book::generate("Хост-тест");
+        let mut b = Book::generate("Зритель-тест");
+        let poll = |topic: &str, since: &str| parse_relay(&crate::ntfy::poll_since(topic, since).expect("poll"));
+        // B pastes A's code: hello to A's inbox + B's presence on the pair.
+        let hello = b.add(&a.code()).unwrap();
+        crate::ntfy::post(&hello.topic, &hello.body).expect("post hello");
+        crate::ntfy::post(&b.presence(&a.me.id, 1000).unwrap().topic, &b.presence(&a.me.id, 1000).unwrap().body).expect("post presence");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        // A reads its inbox and learns B.
+        let lines = poll(&a.inbox_topic(), "");
+        let from = a.take_hellos_from(&lines.iter().map(|l| l.message.clone()).collect::<Vec<_>>());
+        assert_eq!(from, vec![b.me.id]);
+        assert_eq!(a.friends[0].name, "Зритель-тест");
+        // A sees B's presence, not its own; posts its own, B sees it.
+        let pair = a.pair_topic(&b.me.id).unwrap();
+        assert_eq!(Some(pair.clone()), b.pair_topic(&a.me.id));
+        let p = a.presence(&b.me.id, 1001).unwrap();
+        crate::ntfy::post(&p.topic, &p.body).expect("post");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let lines = poll(&pair, "");
+        let a_sees: Vec<_> = lines.iter().filter_map(|l| a.open_pair(&b.me.id, &l.message)).collect();
+        let b_sees: Vec<_> = lines.iter().filter_map(|l| b.open_pair(&a.me.id, &l.message)).collect();
+        assert_eq!(a_sees, vec![PairEvent::Presence { unix: 1000, name: "Зритель-тест".into() }]);
+        assert_eq!(b_sees, vec![PairEvent::Presence { unix: 1001, name: "Хост-тест".into() }]);
+        let since = next_since("", &lines).to_string();
+        // A invites, B answers; each sees only the other's.
+        let inv = a.invite(&b.me.id, InviteKind::Offer, "Hcode-real", 1002).unwrap();
+        crate::ntfy::post(&inv.topic, &inv.body).expect("post");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let lines = poll(&pair, &since);
+        assert!(lines.iter().all(|l| a.open_pair(&b.me.id, &l.message).is_none()), "the host must not see its own invite");
+        let got = lines.iter().find_map(|l| match b.open_pair(&a.me.id, &l.message) {
+            Some(PairEvent::Invite(i)) => Some(i),
+            _ => None,
+        });
+        let got = got.expect("B gets the invite");
+        assert_eq!(got.code, "Hcode-real");
+        let since = next_since(&since, &lines).to_string();
+        let ans = b.answer(&a.me.id, &got.nonce, "Ccode-real").unwrap();
+        crate::ntfy::post(&ans.topic, &ans.body).expect("post");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let lines = poll(&pair, &since);
+        let answer = lines.iter().find_map(|l| a.open_pair(&b.me.id, &l.message));
+        assert_eq!(answer, Some(PairEvent::Answer { nonce: got.nonce.clone(), code: "Ccode-real".into() }));
     }
 
     #[test]
