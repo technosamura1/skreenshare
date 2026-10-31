@@ -1057,6 +1057,11 @@ struct GuiApp {
     friend_code_copied: Option<Instant>,
     /// Set just before «Смотреть» on a friend invite: the client gets `--media-key`.
     join_media_key: Option<[u8; 32]>,
+    /// «Пригласить» while the host has no code yet. Sent on the next frame that has one.
+    friend_invite_wait: Vec<[u8; 16]>,
+    friend_invite_since: Option<Instant>,
+    /// The wait above started the broadcast itself, so the status line says so.
+    friend_invite_autostart: bool,
 }
 
 /// State of "Установить драйвер геймпада".
@@ -1176,6 +1181,9 @@ impl GuiApp {
             friend_show_my_code: false,
             friend_code_copied: None,
             join_media_key: None,
+            friend_invite_wait: Vec::new(),
+            friend_invite_since: None,
+            friend_invite_autostart: false,
         }
     }
 
@@ -1363,6 +1371,7 @@ impl eframe::App for GuiApp {
         for s in [&mut self.host, &mut self.join].into_iter().flatten() {
             s.poll();
         }
+        self.flush_invite_wait();
         // Red dot on our taskbar button while the screen is being shown to someone.
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1399,7 +1408,9 @@ impl eframe::App for GuiApp {
         }
         self.play_cues();
         self.friends_poll();
-        let friend_wait = if self.friend_net.is_some() || self.friend_post.is_some() {
+        let friend_wait = if !self.friend_invite_wait.is_empty() {
+            200
+        } else if self.friend_net.is_some() || self.friend_post.is_some() {
             200
         } else {
             friends::relay_gap_ms(self.book.friends.len())
@@ -1937,6 +1948,13 @@ fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+/// What `send_invite` did. `Waiting` means the host is up but its code is not printed yet.
+enum InviteSend {
+    Sent,
+    Waiting,
+    Gone,
+}
+
 impl GuiApp {
     fn spawn_friend_get(&mut self, kind: FriendNetKind, topic: String, since: String) {
         let (tx, rx) = mpsc::channel();
@@ -2094,7 +2112,7 @@ impl GuiApp {
         section(ui, |ui| {
             ui.label(RichText::new("Ваш код друга").font(bold(16.0)));
             ui.label(
-                RichText::new("Передайте этот код тому, кого хотите добавить. Он вставит его в «Друзья» на своём компьютере.")
+                RichText::new("Этот код можно отправить другу. Или попросите его код и вставьте ниже — достаточно одного из двух.")
                     .color(c_muted())
                     .size(13.0),
             );
@@ -2118,7 +2136,7 @@ impl GuiApp {
 
         section(ui, |ui| {
             ui.label(RichText::new("Добавить друга").font(bold(16.0)));
-            ui.label(RichText::new("Вставьте код друга или ссылку screenshare://friend/...").color(c_muted()).size(13.0));
+            ui.label(RichText::new("Попросите друга показать его код из вкладки «Друзья». Вставьте его сюда.").color(c_muted()).size(13.0));
             ui.add_space(4.0);
             let enter = code_input(ui, &mut self.friend_code_input, "Код друга...");
             if let Some(e) = &self.friend_error {
@@ -2139,9 +2157,9 @@ impl GuiApp {
                         }
                         self.friend_poll_i = 0;
                         friends::save_book(&friends::profile_dir(), &self.book);
-                        self.friend_ok = Some("Друг записан, отправляю ему hello…".into());
+                        self.friend_ok = Some("Друг добавлен. Когда он запустит программу, появится в списке.".into());
                         self.friend_code_input.clear();
-                        self.spawn_friend_post(msg.topic, msg.body, "Друг добавлен. Когда он запустит программу — появится в списке.".into());
+                        self.spawn_friend_post(msg.topic, msg.body, "Друг добавлен. Когда он запустит программу, появится в списке.".into());
                     }
                     Err(e) => self.friend_error = Some(friends::add_error_text(e).into()),
                 }
@@ -2233,7 +2251,8 @@ impl GuiApp {
                 friends::save_book(&friends::profile_dir(), &self.book);
             }
             if let Some(id) = to_invite {
-                self.invite_friend(id);
+                let ctx = ui.ctx().clone();
+                self.invite_friend(&ctx, id);
             }
         }
 
@@ -2306,32 +2325,101 @@ impl GuiApp {
         }
     }
 
-    fn invite_friend(&mut self, friend_id: [u8; 16]) {
+    fn invite_friend(&mut self, ctx: &egui::Context, friend_id: [u8; 16]) {
         self.friend_error = None;
         self.friend_ok = None;
-        let Some(s) = self.host.as_ref().filter(|s| !s.ended) else {
-            self.friend_error = Some("Сначала начните трансляцию на вкладке «Транслировать».".into());
+        let mut started = false;
+        if self.host.as_ref().filter(|s| !s.ended).is_none() {
+            // Quality, fps, sound and the chosen screen stay as they are. A fresh install is already
+            // auto / 60 / with sound / primary monitor, so this is the default broadcast.
+            self.start_host(ctx);
+            started = true;
+            if self.host.as_ref().filter(|s| !s.ended).is_none() {
+                self.friend_error = Some(self.start_error.clone().unwrap_or_else(|| "Не удалось запустить трансляцию.".into()));
+                return;
+            }
+        }
+        match self.send_invite(friend_id, started) {
+            InviteSend::Sent => {
+                self.friend_invite_wait.retain(|id| *id != friend_id);
+                if self.friend_invite_wait.is_empty() {
+                    self.friend_invite_since = None;
+                }
+            }
+            InviteSend::Waiting => {
+                if !self.friend_invite_wait.contains(&friend_id) {
+                    self.friend_invite_wait.push(friend_id);
+                }
+                if self.friend_invite_since.is_none() {
+                    self.friend_invite_since = Some(Instant::now());
+                }
+                self.friend_invite_autostart |= started;
+                self.friend_ok = Some("Запускаю трансляцию…".into());
+            }
+            InviteSend::Gone => {
+                self.friend_error = Some("Этого друга уже нет в списке.".into());
+            }
+        }
+    }
+
+    /// The host prints its code a moment after the process starts. Sleeping here would freeze the
+    /// window and still not see the code: it arrives on a later frame, in `Session::poll`.
+    fn flush_invite_wait(&mut self) {
+        if self.friend_invite_wait.is_empty() {
             return;
-        };
+        }
+        let failed = self.host.as_ref().and_then(|s| s.error.clone());
+        let dead = self.host.as_ref().is_none_or(|s| s.ended) || failed.is_some();
+        let timed_out = self.friend_invite_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(15));
+        if dead || timed_out {
+            self.friend_invite_wait.clear();
+            self.friend_invite_since = None;
+            self.friend_invite_autostart = false;
+            self.friend_ok = None;
+            self.friend_error = Some(if timed_out && !dead {
+                "Код трансляции ещё не готов. Подождите пару секунд и пригласите снова.".into()
+            } else {
+                failed.unwrap_or_else(|| "Не удалось запустить трансляцию.".into())
+            });
+            return;
+        }
+        let ids = std::mem::take(&mut self.friend_invite_wait);
+        let started = self.friend_invite_autostart;
+        for id in ids {
+            match self.send_invite(id, started) {
+                InviteSend::Sent => {}
+                InviteSend::Waiting => self.friend_invite_wait.push(id),
+                InviteSend::Gone => {}
+            }
+        }
+        if self.friend_invite_wait.is_empty() {
+            self.friend_invite_since = None;
+            self.friend_invite_autostart = false;
+        }
+    }
+
+    fn send_invite(&mut self, friend_id: [u8; 16], just_started: bool) -> InviteSend {
+        let Some(s) = self.host.as_ref().filter(|s| !s.ended) else { return InviteSend::Waiting };
         let (kind, code) = if let Some(room) = &s.room {
             (InviteKind::Room, room.clone())
         } else if let Some(code) = &s.code {
             (InviteKind::Offer, code.clone())
         } else {
-            self.friend_error = Some("Код трансляции ещё не готов. Подождите пару секунд и пригласите снова.".into());
-            return;
+            return InviteSend::Waiting;
         };
-        if let Some(msg) = self.book.invite(&friend_id, kind, &code, unix_now()) {
-            self.friend_ok = Some("Отправляю приглашение…".into());
-            self.friend_rush_ids.insert(friend_id, Instant::now() + Duration::from_secs(120));
-            let pair = self.book.friends.iter().find(|f| f.id == friend_id).map(|f| f.pair);
-            if let Some(pair) = pair {
-                if let Some(s) = self.host.as_mut() {
-                    s.proc.send(&format!("MEDIAKEY {}", crate::crypto::hex_key(&pair)));
-                }
+        let Some(msg) = self.book.invite(&friend_id, kind, &code, unix_now()) else { return InviteSend::Gone };
+        self.friend_ok = Some(
+            if just_started { "Трансляция запущена, отправляю приглашение…".to_string() } else { "Отправляю приглашение…".to_string() },
+        );
+        self.friend_rush_ids.insert(friend_id, Instant::now() + Duration::from_secs(120));
+        let pair = self.book.friends.iter().find(|f| f.id == friend_id).map(|f| f.pair);
+        if let Some(pair) = pair {
+            if let Some(s) = self.host.as_mut() {
+                s.proc.send(&format!("MEDIAKEY {}", crate::crypto::hex_key(&pair)));
             }
-            self.spawn_friend_post(msg.topic, msg.body, "Приглашение отправлено.".into());
         }
+        self.spawn_friend_post(msg.topic, msg.body, "Приглашение отправлено.".into());
+        InviteSend::Sent
     }
 
     /// The client prints its C… code a moment after "Смотреть". Post it once, on the pair channel.
