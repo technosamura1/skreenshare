@@ -450,6 +450,7 @@ pub fn run(o: HostOpts) -> Result<()> {
 }
 
 fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: MonitorInfo, o: &HostOpts) -> Result<()> {
+    let _awake = crate::keepawake::SessionAwake::acquire()?;
     let sh = Arc::new(Shared {
         running: AtomicBool::new(true),
         keyreq: AtomicBool::new(true),

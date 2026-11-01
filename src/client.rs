@@ -291,6 +291,7 @@ pub fn run(o: ClientOpts) -> Result<()> {
 }
 
 fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Result<()> {
+    let _awake = crate::keepawake::SessionAwake::acquire()?;
     if let Some(pair) = o.media_pair {
         net::install_media_key(&pair, token);
     }
