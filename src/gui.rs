@@ -1057,6 +1057,7 @@ struct GuiApp {
     /// already moved past both, so the overwritten invite would never come back.
     friend_pending_invites: Vec<(friends::Invite, [u8; 16])>,
     watch_requests: Vec<([u8; 16], u64, String)>,
+    watch_post: Option<([u8; 16], String)>,
     watch_sent: HashMap<[u8; 16], (String, Instant)>,
     /// Offer we accepted: (friend, nonce). The viewer's C… code is posted back once the client prints it.
     friend_answer: Option<([u8; 16], String)>,
@@ -1194,6 +1195,7 @@ impl GuiApp {
             friend_last_seen: HashMap::new(),
             friend_pending_invites: Vec::new(),
             watch_requests: Vec::new(),
+            watch_post: None,
             watch_sent: HashMap::new(),
             friend_answer: None,
             friend_rush_ids: HashMap::new(),
@@ -2060,6 +2062,7 @@ impl GuiApp {
     }
 
     fn spawn_friend_post(&mut self, topic: String, body: String, ok_text: String) {
+        self.watch_post = None;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let r = crate::ntfy::post(&topic, &body).map(|_| ok_text).map_err(|e| format!("{e:#}"));
@@ -2073,14 +2076,17 @@ impl GuiApp {
         match rx.try_recv() {
             Err(mpsc::TryRecvError::Empty) => self.friend_post = Some(rx),
             Ok(Ok(text)) => {
+                if let Some((id, nonce)) = self.watch_post.take() { self.watch_sent.insert(id, (nonce, Instant::now())); }
                 self.friend_ok = Some(text);
                 self.friend_error = None;
             }
             Ok(Err(e)) => {
+                self.watch_post = None;
                 self.friend_error = Some(e);
                 self.friend_ok = None;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
+                self.watch_post = None;
                 self.friend_error = Some("отправка прервалась".into());
             }
         }
@@ -2174,6 +2180,7 @@ impl GuiApp {
             let _ = tx.send(r.map(|_| "Друг добавлен. Как только его программа будет запущена, он появится «в сети».".to_string()).map_err(|e| format!("{e:#}")));
         });
         if ours {
+            self.watch_post = None;
             self.friend_post = Some(rx);
         }
         self.friend_rush_ids.insert(id, Instant::now() + Duration::from_secs(90));
@@ -4242,6 +4249,8 @@ impl GuiApp {
             ui.label("Добавьте друга, чтобы запросить трансляцию без кодов.");
             if ui.button("К друзьям").clicked() { self.page = Page::Friends; }
         }
+        let retry = crate::ntfy::retry_after_seconds();
+        if retry > 0 { ui.label(RichText::new(format!("Пауза сервера: ещё {retry} с. Затем можно повторить запрос.")).color(c_muted())); }
         let query = self.friend_search.trim().to_lowercase();
         let peers = self.book.friends.clone();
         let mut request = None;
@@ -4252,15 +4261,16 @@ impl GuiApp {
                 ui.horizontal_wrapped(|ui| {
                     crate::profileui::avatar(ui, &profile, ("watch", f.id), 40.0);
                     ui.label(RichText::new(&f.name).font(bold(15.0)));
-                    if ui.add_enabled(!sent && self.friend_post.is_none(), egui::Button::new(if sent { "Запрос отправлен" } else { "Попросить трансляцию" })).clicked() { request = Some(f.id); }
+                    if ui.add_enabled(retry == 0 && !sent && self.friend_post.is_none(), egui::Button::new(if self.watch_post.as_ref().is_some_and(|(id, _)| *id == f.id) { "Отправляем…" } else if sent { "Запрос отправлен" } else { "Попросить трансляцию" })).clicked() { request = Some(f.id); }
                 });
             });
         }
         if let Some(id) = request {
             if let Some((msg, nonce)) = self.book.request_watch(&id, unix_now()) {
-                self.watch_sent.insert(id, (nonce, Instant::now()));
+                self.friend_ok = None;
                 self.friend_error = None;
                 self.spawn_friend_post(msg.topic, msg.body, "Запрос отправлен. Друг выберет экран и пришлёт приглашение.".into());
+                self.watch_post = Some((id, nonce));
             }
         }
         ui.label(RichText::new("Друг сам подтвердит запуск и выберет, что показать. Для запросов нужна новая версия у обоих.").color(c_muted()).size(12.0));
