@@ -257,10 +257,10 @@ mod tests {
 
     #[test]
     fn identical_monitor_frame_copies_without_scaling() {
-        let input: Vec<u8> = (0u8..48).collect(); // 4x3 BGRA
-        let mut dst = vec![255; 4 * 3 * 4];
+        let input: Vec<u8> = (0u8..64).collect(); // 4x4 BGRA
+        let mut dst = vec![255; 4 * 4 * 4];
         let mut scratch = Vec::new();
-        draw_letterboxed(&input, (4, 3), &mut dst, 16, (4, 3), &mut scratch,
+        draw_letterboxed(&input, (4, 4), &mut dst, 16, (4, 4), &mut scratch,
             |_, _, _, _, _, _| panic!("matching canvas must not scale")).unwrap();
         assert_eq!(dst, input);
         assert!(scratch.is_empty());
