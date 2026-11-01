@@ -22,6 +22,10 @@ pub struct AnnotView {
     stop: Arc<AtomicBool>,
     /// The host's "show the viewer's pointer and reactions" switch.
     pub enabled: Arc<AtomicBool>,
+    /// Set by the capture loop. Desktop Duplication must never capture the overlay.
+    pub capture_safe: Arc<AtomicBool>,
+    /// Acknowledgement from the draw thread that the overlay is hidden.
+    pub paused: Arc<AtomicBool>,
     got_any: AtomicBool,
 }
 
@@ -31,16 +35,19 @@ impl AnnotView {
         let board = Arc::new(Mutex::new(Board::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let enabled = Arc::new(AtomicBool::new(load_enabled()));
-        let (b, s, e) = (board.clone(), stop.clone(), enabled.clone());
+        // Fail closed until the capture backend has been selected.
+        let capture_safe = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let (b, s, e, c, p) = (board.clone(), stop.clone(), enabled.clone(), capture_safe.clone(), paused.clone());
         std::thread::Builder::new()
             .name("annot-view".into())
             .spawn(move || {
-                if let Err(err) = run(&b, &s, &e, &region, input.as_deref()) {
+                if let Err(err) = run(&b, &s, &e, &c, &p, &region, input.as_deref()) {
                     crate::net::conn_log(&format!("указка: окно не создано: {err}"));
                 }
             })
             .ok();
-        AnnotView { board, stop, enabled, got_any: AtomicBool::new(false) }
+        AnnotView { board, stop, enabled, capture_safe, paused, got_any: AtomicBool::new(false) }
     }
 
     pub fn on_packet(&self, body: &[u8]) {
@@ -89,7 +96,18 @@ const BANNER: &str = "Зритель просит управление — ра�
 const BANNER_W: f32 = 760.0;
 const BANNER_H: f32 = 54.0;
 
-fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &Mutex<Option<Region>>, input: Option<&inputhost::InputHost>) -> Result<()> {
+fn run(
+    board: &Mutex<Board>,
+    stop: &AtomicBool,
+    enabled: &AtomicBool,
+    capture_safe: &AtomicBool,
+    paused: &AtomicBool,
+    region: &Mutex<Option<Region>>,
+    input: Option<&inputhost::InputHost>,
+) -> Result<()> {
+    // Explicit screenshot/debug override. Otherwise the overlay stays hidden if Windows
+    // does not actually confirm its exclusion affinity.
+    let mut affinity_ok = std::env::var("SS_ANNOT_VISIBLE").is_ok();
     let hwnd = unsafe {
         let inst = GetModuleHandleW(None)?;
         let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: inst.into(), lpszClassName: w!("ScreenshareAnnot"), ..Default::default() };
@@ -108,16 +126,19 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
             Some(inst.into()),
             None,
         )?;
-        // Not in the stream (Windows 10 2004+); on older systems the viewer just sees it a second time.
-        // SS_ANNOT_VISIBLE=1: let screenshots see it (for checking the drawing).
-        if std::env::var("SS_ANNOT_VISIBLE").is_err() {
+        // SS_ANNOT_VISIBLE is only for deliberate screenshot debugging.
+        if !affinity_ok {
             let r = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE);
             let mut got = 0u32;
-            let _ = GetWindowDisplayAffinity(h, &mut got);
-            crate::net::conn_log(&format!("указка: исключение из захвата: {r:?}, сейчас {got:#x}"));
+            let checked = GetWindowDisplayAffinity(h, &mut got);
+            affinity_ok = r.is_ok() && checked.is_ok() && got == WDA_EXCLUDEFROMCAPTURE.0;
+            crate::net::conn_log(&format!("указка: исключение из захвата: {r:?}, проверка {checked:?}, сейчас {got:#x}"));
         }
         h
     };
+    if !affinity_ok {
+        crate::net::conn_log("указка/стикеры скрыты: Windows не подтвердила исключение окна из захвата");
+    }
     let mut gfx: Option<Gfx> = None;
     let mut shown = false;
     let mut last_drawn: Option<(Option<(i32, i32)>, usize, bool)> = None;
@@ -135,7 +156,8 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
         let reg = *region.lock().unwrap();
         let asking = input.is_some_and(|i| i.asking(now));
         let mut b = board.lock().unwrap();
-        let busy = enabled.load(Ordering::Relaxed) && b.busy(now) || asking;
+        let can_draw = capture_safe.load(Ordering::Acquire) && affinity_ok;
+        let busy = can_draw && ((enabled.load(Ordering::Relaxed) && b.busy(now)) || asking);
         let (Some(reg), true) = (reg, busy) else {
             drop(b);
             if shown {
@@ -145,10 +167,15 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
                 shown = false;
                 last_drawn = None;
             }
+            // Acknowledge only after the window has actually been hidden.
+            if !capture_safe.load(Ordering::Acquire) {
+                paused.store(true, Ordering::Release);
+            }
             std::thread::sleep(Duration::from_millis(15));
             continue;
         };
-        let target = b.laser(now).and_then(|p| inputhost::region_point(reg, p));
+        let target = enabled.load(Ordering::Relaxed).then(|| b.laser(now)).flatten()
+            .and_then(|p| inputhost::region_point(reg, p));
         let dt = now.saturating_duration_since(last_frame).as_secs_f32().min(0.1);
         last_frame = now;
         glide = match (target, glide) {
@@ -164,6 +191,7 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
         let items: Vec<(usize, (f32, f32), f32, f32, Duration)> = b
             .reactions(now)
             .iter()
+            .filter(|_| enabled.load(Ordering::Relaxed))
             .filter_map(|s| {
                 let (x, y) = inputhost::region_point(reg, s.at)?;
                 let age = now.saturating_duration_since(s.born);
@@ -203,6 +231,11 @@ fn run(board: &Mutex<Board>, stop: &AtomicBool, enabled: &AtomicBool, region: &M
         }
         let g = gfx.as_ref().unwrap();
         draw(g, (l, t, w, h), laser, &items, banner)?;
+        // Capture may have switched while drawing; let the next loop hide/ack instead
+        // of revealing another overlay frame after it was disabled.
+        if !capture_safe.load(Ordering::Acquire) {
+            continue;
+        }
         unsafe {
             let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8, ..Default::default() };
             let _ = UpdateLayeredWindow(

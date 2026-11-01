@@ -1192,6 +1192,7 @@ mod tests {
     /// invite, answer — the same calls the window makes. `cargo test -- --ignored real_relay`.
     #[test]
     #[ignore]
+    #[cfg(not(lossim))] // This integration test needs the Windows-only ntfy client and internet.
     fn real_relay_friends_roundtrip() {
         let mut a = Book::generate("Хост-тест");
         let mut b = Book::generate("Зритель-тест");

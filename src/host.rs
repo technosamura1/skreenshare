@@ -220,6 +220,25 @@ enum Cap {
     Monitor(Box<WindowCapturer>),
 }
 
+/// Prevent Desktop Duplication from seeing the host overlay, including the control-request banner.
+/// Wait for the overlay thread's acknowledgement, not an arbitrary sleep: drawing can be delayed.
+fn sync_annotation_capture(cap: &Cap, capture_safe: &AtomicBool, paused: &AtomicBool) -> Result<()> {
+    let safe = matches!(cap, Cap::Window(_) | Cap::Monitor(_));
+    paused.store(false, Ordering::SeqCst);
+    capture_safe.store(safe, Ordering::SeqCst);
+    if !safe {
+        let start = Instant::now();
+        while !paused.load(Ordering::Acquire) {
+            if start.elapsed() > Duration::from_secs(2) {
+                bail!("не удалось скрыть указку и стикеры до включения Desktop Duplication");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        crate::net::conn_log("Desktop Duplication: оверлей скрыт до начала захвата");
+    }
+    Ok(())
+}
+
 /// The whole monitor: through Windows Graphics Capture when the pointer/sticker overlay is on (so it
 /// stays out of the stream), else (or when that fails) Desktop Duplication as always.
 fn open_screen(monitor: &MonitorInfo) -> Result<Cap> {
@@ -235,6 +254,7 @@ fn open_screen(monitor: &MonitorInfo) -> Result<Cap> {
             Err(e) => crate::net::conn_log(&format!("захват экрана через Windows Graphics Capture не вышел ({e:#}); Desktop Duplication")),
         }
     }
+    crate::net::conn_log("захват экрана: Desktop Duplication (оверлей будет скрыт)");
     Ok(Cap::Screen(Capturer::new(monitor)?))
 }
 
@@ -247,7 +267,7 @@ fn open_window(h: isize) -> Result<Cap> {
 fn fall_back_to_screen(why: &str, monitor: &MonitorInfo) -> Result<Cap> {
     ui::source_status(&format!("{why} — транслирую весь экран"), true);
     ui::source_label(&crate::source::source_label(None));
-    Ok(Cap::Screen(Capturer::new(monitor)?))
+    open_screen(monitor)
 }
 
 /// What a live source switch produced.
@@ -455,6 +475,9 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     }
     // The viewer's laser pointer and reactions, drawn over the picture on this screen.
     let annot_view = crate::annotview::AnnotView::spawn(input.region_handle(), Some(input.clone()));
+    // Control receiver owns annot_view; the capture loop needs the same safety/acknowledgement flags.
+    let annot_capture_safe = annot_view.capture_safe.clone();
+    let annot_paused = annot_view.paused.clone();
     let (nack_tx, nack_rx) = mpsc::channel::<(u32, Vec<u16>)>();
     let (rep_tx, rep_rx) = mpsc::channel::<crate::ratectl::ReportDelta>();
 
@@ -640,6 +663,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             open_screen(&monitor)?
         }
     };
+    sync_annotation_capture(&cap, &annot_capture_safe, &annot_paused)?;
     // The window whose process is the sound source (None while a whole screen is shown).
     let mut audio_window = match &cap {
         Cap::Window(_) => o.window,
@@ -667,7 +691,11 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     let mut fid = 0u32;
     let mut stat_t = Instant::now();
     let mut stat_frames = 0u32;
-    let mut stat_enc = Duration::ZERO;
+    // Measure the expensive host-side stages separately, to diagnose 60/144 FPS limits.
+    let mut stat_prep = Duration::ZERO;
+    let mut stat_encode = Duration::ZERO;
+    let mut stat_prep_peak = Duration::ZERO;
+    let mut stat_encode_peak = Duration::ZERO;
     let mut stat_bytes0 = 0u64;
     let mut flash = crate::avsync::FlashEdge::default();
     let mut rc = if o.auto_bitrate {
@@ -791,7 +819,9 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 } else {
                     format!("Захват окна «{}» не удался", crate::source::ellipsize(&title, 40))
                 };
-                cap = fall_back_to_screen(&why, &monitor)?;
+                let next_cap = fall_back_to_screen(&why, &monitor)?;
+                sync_annotation_capture(&next_cap, &annot_capture_safe, &annot_paused)?;
+                cap = next_cap;
                 audio_window = None; // back to the system sound without Discord
                 audio_dirty = true;
                 canvas = match &cap {
@@ -815,6 +845,14 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             };
             match open_requested(req, &monitor, matches!(cap, Cap::Screen(_) | Cap::Monitor(_))) {
                 Ok(Some(n)) => {
+                    // Hide the overlay and wait for the paint thread before an unsafe capture takes over.
+                    if let Err(e) = sync_annotation_capture(&n.cap, &annot_capture_safe, &annot_paused) {
+                        // The requested backend is not safe to activate. Keep the old capture,
+                        // restoring its overlay policy rather than ending the running stream.
+                        annot_capture_safe.store(matches!(cap, Cap::Window(_) | Cap::Monitor(_)), Ordering::SeqCst);
+                        ui::source_status(&format!("Переключение отменено: {e:#}"), true);
+                        continue;
+                    }
                     // The old capture is released only now, after the new one works.
                     cap = n.cap;
                     window_title = n.title;
@@ -921,6 +959,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         {
             crate::avsync::log("host_video", crate::avsync::now_us());
         }
+        let prep_time = t0.elapsed();
+        stat_prep += prep_time;
+        stat_prep_peak = stat_prep_peak.max(prep_time);
+        let encode_started = Instant::now();
         let key_now = force_key;
         e.encode(key_now, |data, key| {
             sh.backlog.fetch_add(1, Ordering::Relaxed);
@@ -932,7 +974,9 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 sh.keyreq.store(true, Ordering::Relaxed);
             }
         })?;
-        stat_enc += t0.elapsed();
+        let encode_time = encode_started.elapsed();
+        stat_encode += encode_time;
+        stat_encode_peak = stat_encode_peak.max(encode_time);
         if key_now {
             gate.note_key(Instant::now());
         }
@@ -950,7 +994,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             let glitches = crate::audio::CAPTURE_GLITCHES.load(Ordering::Relaxed);
             let skipped = sh.skipped_busy.load(Ordering::Relaxed);
             ui::stat(&format!(
-                "{enc_short} · {:.0} кадров/с (экран обновился {:.0}/с, отложено из-за сети {}) · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · кодирование {:.1} мс · звук {}{}",
+                "{enc_short} · {:.0} кадров/с (экран обновился {:.0}/с, отложено из-за сети {}) · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · подготовка {:.1}/{:.1} мс, кодирование {:.1}/{:.1} мс (ср/макс) · звук {}{}",
                 stat_frames as f64 / secs,
                 stat_updates as f64 / secs,
                 skipped - stat_skipped0,
@@ -958,7 +1002,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 rc.cur,
                 loss * 100.0,
                 resent - stat_resent0,
-                if stat_frames > 0 { stat_enc.as_secs_f64() * 1000.0 / stat_frames as f64 } else { 0.0 },
+                if stat_frames > 0 { stat_prep.as_secs_f64() * 1000.0 / stat_frames as f64 } else { 0.0 },
+                stat_prep_peak.as_secs_f64() * 1000.0,
+                if stat_frames > 0 { stat_encode.as_secs_f64() * 1000.0 / stat_frames as f64 } else { 0.0 },
+                stat_encode_peak.as_secs_f64() * 1000.0,
                 if sh.peer_opus.load(Ordering::Relaxed) { "Opus" } else { "обычный" },
                 if glitches > 0 { format!(" · пропуски в захвате звука: {glitches}") } else { String::new() },
             ));
@@ -967,7 +1014,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             stat_skipped0 = skipped;
             stat_t = Instant::now();
             stat_frames = 0;
-            stat_enc = Duration::ZERO;
+            stat_prep = Duration::ZERO;
+            stat_encode = Duration::ZERO;
+            stat_prep_peak = Duration::ZERO;
+            stat_encode_peak = Duration::ZERO;
             stat_bytes0 = bytes;
         }
     }
