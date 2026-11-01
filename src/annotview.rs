@@ -131,7 +131,7 @@ fn run(
             let r = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE);
             let mut got = 0u32;
             let checked = GetWindowDisplayAffinity(h, &mut got);
-            affinity_ok = r.is_ok() && checked.is_ok() && got == WDA_EXCLUDEFROMCAPTURE;
+            affinity_ok = r.is_ok() && checked.is_ok() && got == WDA_EXCLUDEFROMCAPTURE.0;
             crate::net::conn_log(&format!("указка: исключение из захвата: {r:?}, проверка {checked:?}, сейчас {got:#x}"));
         }
         h
