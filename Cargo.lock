@@ -1235,6 +1235,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2327,6 +2329,7 @@ dependencies = [
  "eframe",
  "ffmpeg-next",
  "getrandom 0.3.4",
+ "image",
  "pbkdf2",
  "raw-window-handle",
  "sha2",

@@ -22,6 +22,7 @@ mod hdrmath;
 mod guilogic;
 mod glass;
 mod gui;
+mod profileui;
 mod icon;
 mod inputview;
 mod overlay;

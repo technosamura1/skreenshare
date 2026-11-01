@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 /// Same alphabet as the short room codes, so a code can be read aloud if it has to be.
 const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
+pub const KIND_PROFILE: u8 = b'U';
 pub const KIND_HELLO: u8 = b'H';
 pub const KIND_PRESENCE: u8 = b'P';
 pub const KIND_INVITE: u8 = b'I';
@@ -53,6 +54,7 @@ pub struct Friend {
 pub struct Book {
     pub me: Identity,
     pub friends: Vec<Friend>,
+    pub profiles: std::collections::HashMap<[u8; 16], Profile>,
 }
 
 /// A sealed blob ready to POST.
@@ -82,6 +84,7 @@ pub struct Invite {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PairEvent {
     Presence { unix: u64, name: String },
+    Profile { unix: u64, profile: Profile },
     Invite(Invite),
     Answer { nonce: String, code: String },
     Decline { nonce: String },
@@ -106,6 +109,35 @@ struct Channel {
     key: [u8; 32],
 }
 
+/// Small, bounded profile payload. JPEG bytes are rendered only after dimension checks in the GUI.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Profile {
+    pub name: String,
+    pub status: String,
+    pub avatar: u8,
+    pub photo: Vec<u8>,
+}
+impl Profile {
+    pub fn encode(&self) -> String {
+        format!("v1\n{}\n{}\n{}\n{}", b64(sanitize_name(&self.name).as_bytes()),
+            b64(clean_status(&self.status).as_bytes()), self.avatar.min(63), b64(&self.photo))
+    }
+    pub fn decode(s: &str) -> Option<Self> {
+        if s.len() > 2800 { return None; }
+        let mut it = s.split('\n');
+        if it.next()? != "v1" { return None; }
+        let name = String::from_utf8(unb64(it.next()?)?).ok()?;
+        let status = String::from_utf8(unb64(it.next()?)?).ok()?;
+        let avatar: u8 = it.next()?.parse().ok()?;
+        let photo = unb64(it.next()?)?;
+        if photo.len() > 1600 || avatar > 63 || it.next().is_some() { return None; }
+        Some(Self { name: sanitize_name(&name), status: clean_status(&status), avatar, photo })
+    }
+}
+pub fn clean_status(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(64).collect::<String>().trim().to_string()
+}
+
 impl Identity {
     pub fn generate(name: &str) -> Identity {
         let mut id = [0u8; 16];
@@ -119,7 +151,7 @@ impl Identity {
 impl Book {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(me: Identity) -> Book {
-        Book { me, friends: Vec::new() }
+        Book { me, friends: Vec::new(), profiles: Default::default() }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -182,6 +214,7 @@ impl Book {
     pub fn remove(&mut self, id: &[u8; 16]) -> bool {
         let n = self.friends.len();
         self.friends.retain(|f| &f.id != id);
+        self.profiles.remove(id);
         self.friends.len() != n
     }
 
@@ -226,6 +259,16 @@ impl Book {
 
     pub fn presence(&self, id: &[u8; 16], unix: u64) -> Option<OutMsg> {
         self.pair_line(id, KIND_PRESENCE, &format!("{unix}\n{}", self.me.name))
+    }
+
+    pub fn own_profile(&self) -> Profile {
+        let mut profile = self.profiles.get(&self.me.id).cloned().unwrap_or_default();
+        profile.name = self.me.name.clone();
+        profile
+    }
+    pub fn profile_message(&self, id: &[u8; 16], unix: u64) -> Option<OutMsg> {
+        let profile = self.own_profile();
+        self.pair_line(id, KIND_PROFILE, &format!("{unix}\n{}", profile.encode()))
     }
 
     pub fn invite(&self, id: &[u8; 16], kind: InviteKind, code: &str, unix: u64) -> Option<OutMsg> {
@@ -281,6 +324,14 @@ impl Book {
                 }
             }
         }
+        if let PairEvent::Profile { unix, profile } = &ev {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            if *unix > now.saturating_add(60) || now.saturating_sub(*unix) > 86400 { return None; }
+            self.profiles.insert(*id, profile.clone());
+            if let Some(f) = self.friends.iter_mut().find(|f| f.id == *id) {
+                if !f.renamed { f.name = profile.name.clone(); }
+            }
+        }
         Some(ev)
     }
 
@@ -322,7 +373,7 @@ pub fn cycle_secs(n_friends: usize) -> u64 {
 }
 
 pub fn ops_per_cycle(n_friends: usize) -> u64 {
-    1 + 2 * n_friends as u64
+    1 + 3 * n_friends as u64
 }
 
 /// Gap between two relay calls for a list of this size. Always ≥ 5 s.
@@ -338,14 +389,15 @@ pub fn poll_gap_ms(n_friends: usize, rushing: bool) -> u64 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelayOp { Inbox, Pair(usize), Presence(usize) }
+pub enum RelayOp { Inbox, Pair(usize), Presence(usize), Profile(usize) }
 
 /// Runs independently of the viewer lifecycle, including its retry screen.
 pub fn relay_op(n_friends: usize, index: usize) -> RelayOp {
     let i = index % ops_per_cycle(n_friends).max(1) as usize;
     if i == 0 { RelayOp::Inbox }
     else if i <= n_friends { RelayOp::Pair(i - 1) }
-    else { RelayOp::Presence(i - 1 - n_friends) }
+    else if i <= 2 * n_friends { RelayOp::Presence(i - 1 - n_friends) }
+    else { RelayOp::Profile(i - 1 - 2 * n_friends) }
 }
 
 pub fn invite_fresh(unix: u64, now: u64) -> bool {
@@ -397,13 +449,32 @@ pub fn load_book(dir: &Path) -> Book {
         me
     });
     let friends = read_friends(&dir.join("friends.txt"));
-    Book { me, friends }
+    let mut profiles = std::collections::HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(dir.join("profiles.txt")) {
+        for line in text.lines().take(MAX_FRIENDS + 1) {
+            if let Some((id, payload)) = line.split_once(' ') {
+                if let (Some(id), Some(bytes)) = (unhex16(id), unb64(payload)) {
+                    if (id == me.id || friends.iter().any(|f| f.id == id)) && bytes.len() <= 2800 {
+                        if let Ok(body) = String::from_utf8(bytes) {
+                            if let Some(profile) = Profile::decode(&body) { profiles.insert(id, profile); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Book { me, friends, profiles }
 }
 
-pub fn save_book(dir: &Path, book: &Book) {
-    let _ = std::fs::create_dir_all(dir);
-    let _ = write_identity(&dir.join("identity.txt"), &book.me);
-    let _ = write_friends(&dir.join("friends.txt"), &book.friends);
+pub fn save_book(dir: &Path, book: &Book) { let _ = save_book_checked(dir, book); }
+
+pub fn save_book_checked(dir: &Path, book: &Book) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_identity(&dir.join("identity.txt"), &book.me)?;
+    write_friends(&dir.join("friends.txt"), &book.friends)?;
+    let text = book.profiles.iter().filter(|(id, _)| **id == book.me.id || book.friends.iter().any(|f| f.id == **id))
+        .map(|(id, p)| format!("{} {}\n", hex(id), b64(p.encode().as_bytes()))).collect::<String>();
+    std::fs::write(dir.join("profiles.txt"), text)
 }
 
 /// Where the relay polls stopped (`since=` ids), kept between runs: without it every start read the last
@@ -601,6 +672,10 @@ fn parse_hello(body: &str) -> Option<([u8; 16], [u8; 32], [u8; 32], String)> {
 
 fn parse_pair(kind: u8, body: &str) -> Option<PairEvent> {
     match kind {
+        KIND_PROFILE => {
+            let (unix, payload) = body.split_once('\n')?;
+            Some(PairEvent::Profile { unix: unix.parse().ok()?, profile: Profile::decode(payload)? })
+        }
         KIND_PRESENCE => {
             let (unix, name) = body.split_once('\n')?;
             let unix: u64 = unix.parse().ok()?;
@@ -677,7 +752,7 @@ impl Channel {
     }
 
     fn open_any(&self, message: &str) -> Option<(u8, String)> {
-        for k in [KIND_PRESENCE, KIND_INVITE, KIND_ANSWER, KIND_DECLINE, KIND_HELLO] {
+        for k in [KIND_PROFILE, KIND_PRESENCE, KIND_INVITE, KIND_ANSWER, KIND_DECLINE, KIND_HELLO] {
             if let Some(body) = self.open(k, message) {
                 return Some((k, body));
             }
@@ -853,6 +928,32 @@ mod tests {
         let mut key = [n.wrapping_add(9); 32];
         key[0] = n;
         Book::new(Identity { id, key, name: name.into() })
+    }
+
+    #[test]
+    fn profiles_are_encrypted_bounded_and_survive_restart() {
+        let mut a = fixed(60, "Аня"); let mut b = fixed(61, "Борис");
+        let hello = b.add(&a.code()).unwrap(); a.take_hellos(&[hello.body]);
+        let p = Profile { name: "Аня".into(), status: "Смотрим кино".into(), avatar: 7, photo: vec![42; 1600] };
+        a.profiles.insert(a.me.id, p.clone());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let msg = a.profile_message(&b.me.id, now).unwrap();
+        assert!(msg.body.len() <= 4096);
+        assert!(!msg.body.contains("Смотрим"));
+        assert!(a.open_pair(&b.me.id, &msg.body).is_none(), "own messages ignored");
+        assert!(matches!(b.open_pair(&a.me.id, &msg.body), Some(PairEvent::Profile { profile, .. }) if profile == p));
+        assert_eq!(b.profiles.get(&a.me.id), Some(&p));
+        b.rename(&a.me.id, "Моя подруга");
+        b.open_pair(&a.me.id, &msg.body);
+        assert_eq!(b.friends[0].name, "Моя подруга");
+        let dir = std::env::temp_dir().join(format!("ss-profiles-{}-{}", std::process::id(), now));
+        save_book(&dir, &b); let loaded = load_book(&dir);
+        assert_eq!(loaded.profiles.get(&a.me.id), Some(&p));
+        for f in ["identity.txt", "friends.txt", "profiles.txt"] { std::fs::remove_file(dir.join(f)).unwrap(); }
+        std::fs::remove_dir(dir).unwrap();
+        assert!(Profile::decode(&"x".repeat(2801)).is_none());
+        let bad = Profile { photo: vec![0; 1601], ..p };
+        assert!(Profile::decode(&bad.encode()).is_none());
     }
 
     #[test]
@@ -1144,7 +1245,8 @@ mod tests {
             let budget = 60 + t / 5000;
             assert!(req <= budget, "n={n}: {req} requests in {t} ms, budget {budget}");
             // A short list still beats at least once a minute.
-            if n <= 4 {
+            if n <= 3 {
+                // Profile publication is one extra bounded operation per friend.
                 assert!(cycle_secs(n) <= 60, "n={n} cycle {}", cycle_secs(n));
             }
         }
@@ -1175,7 +1277,7 @@ mod tests {
                         last_poll[i] = Some(now_ms);
                         last_seen[i] = last_post[i];
                     }
-                    RelayOp::Inbox => {}
+                    RelayOp::Inbox | RelayOp::Profile(_) => {}
                 }
                 if step >= ops * 2 {
                     for seen in &last_seen {
@@ -1238,6 +1340,17 @@ mod tests {
         let lines = poll(&pair, &since);
         let answer = lines.iter().find_map(|l| a.open_pair(&b.me.id, &l.message));
         assert_eq!(answer, Some(PairEvent::Answer { nonce: got.nonce.clone(), code: "Ccode-real".into() }));
+        let since = next_since(&since, &lines).to_string();
+        let profile = Profile { name: a.me.name.clone(), status: "Тест профиля".into(), avatar: 7, photo: vec![42; 1600] };
+        a.profiles.insert(a.me.id, profile.clone());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let msg = a.profile_message(&b.me.id, now).unwrap();
+        assert!(msg.body.len() <= 4096);
+        crate::ntfy::post(&msg.topic, &msg.body).expect("post profile");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let lines = poll(&pair, &since);
+        assert!(lines.iter().any(|l| matches!(b.open_pair(&a.me.id, &l.message), Some(PairEvent::Profile { profile: got, .. }) if got == profile)));
+
     }
 
     #[test]

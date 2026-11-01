@@ -121,20 +121,20 @@ impl Palette {
                 glass,
                 anim: look.anim,
                 accent,
-                bg: rgb(0x1b2838),
-                bg2: rgb(0x141d2a),
-                side: rgb(0x10161f),
-                border: rgb(0x2f4259),
-                card: rgb(0x1f2e42),
-                card_hover: rgb(0x293b52),
-                field: rgb(0x142031),
-                text: rgb(0xe9eff7),
-                muted: rgb(0x93a5bc),
+                bg: rgb(0x1c1d20),
+                bg2: rgb(0x1c1d20),
+                side: rgb(0x141518),
+                border: rgb(0x33353b),
+                card: rgb(0x242529),
+                card_hover: rgb(0x2c2d33),
+                field: rgb(0x191a1e),
+                text: rgb(0xecedef),
+                muted: rgb(0xa0a3ad),
                 green: rgb(0x3ecf8e),
                 yellow: rgb(0xf0b43c),
                 red: rgb(0xf0605f),
-                tile2: rgb(0x2b3d55),
-                widget_hover: rgb(0x34496a),
+                tile2: rgb(0x303138),
+                widget_hover: rgb(0x363840),
             }
         };
         if glass {
@@ -262,7 +262,7 @@ fn apply_theme(ctx: &egui::Context, look: lg::Look, glass: bool) {
         s.visuals = if look.light { egui::Visuals::light() } else { egui::Visuals::dark() };
         let v = &mut s.visuals;
         v.panel_fill = pl.bg;
-        v.window_fill = if glass { rgb(0x1f2e42) } else { pl.card };
+        v.window_fill = if glass { rgb(0x242529) } else { pl.card };
         v.extreme_bg_color = pl.field;
         v.override_text_color = Some(pl.text);
         v.selection.bg_fill = pl.accent;
@@ -833,6 +833,7 @@ enum Page {
     Join,
     /// "Друзья": add once, then invite onto a stream.
     Friends,
+    Profile,
     /// "Настройки": look and the self-test entry.
     Settings,
     /// "О программе".
@@ -957,6 +958,7 @@ enum FriendNetKind {
     Inbox,
     Pair { id: [u8; 16], since: String },
     Presence,
+    ProfileSent { id: [u8; 16], profile: friends::Profile },
 }
 
 struct FriendNet {
@@ -970,6 +972,12 @@ struct GuiApp {
     asked_seen: bool,
     /// Settings tab: 0 quality of the stream, 1 look, 2 checks.
     settings_tab: u32,
+    profile_draft: friends::Profile,
+    profile_sent: HashMap<[u8; 16], friends::Profile>,
+    profile_error: Option<String>,
+    friend_search: String,
+    online_only: bool,
+    viewed_profile: Option<[u8; 16]>,
     monitors: Vec<String>,
     /// Position and size of every monitor on the desktop (for the picker's pictures).
     rects: Vec<(i32, i32, u32, u32)>,
@@ -1122,6 +1130,12 @@ impl GuiApp {
         GuiApp {
             page: if first_run { Page::Welcome } else { Page::Friends },
             settings_tab: 0,
+            profile_draft: Default::default(),
+            profile_sent: HashMap::new(),
+            profile_error: None,
+            friend_search: String::new(),
+            online_only: false,
+            viewed_profile: None,
             asked_seen: false,
             monitors,
             rects: mons.iter().map(|m| (m.left, m.top, m.width, m.height)).collect(),
@@ -1352,6 +1366,7 @@ impl GuiApp {
             Page::Pads => 40,
             Page::Control => 41,
             Page::Friends => 50,
+            Page::Profile => 51,
         }
     }
 }
@@ -1473,7 +1488,7 @@ impl eframe::App for GuiApp {
                     self.status_bar(ui);
                 });
             egui::Panel::left("side")
-                .exact_size(236.0)
+                .exact_size(216.0)
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(egui::Frame::new().fill(c_side()).inner_margin(Margin { left: 16, right: 16, top: 20, bottom: 14 }))
@@ -1482,6 +1497,19 @@ impl eframe::App for GuiApp {
                     ui.painter().vline(r.right() + 16.0 - 0.5, ui.ctx().content_rect().y_range(), Stroke::new(1.0, c_border()));
                     self.sidebar(ui);
                 });
+        }
+        if let Some(id) = self.viewed_profile {
+            let profile = self.book.profiles.get(&id).cloned().unwrap_or_default();
+            let name = if profile.name.is_empty() { self.book.friends.iter().find(|f| f.id == id).map(|f| f.name.clone()).unwrap_or_default() } else { profile.name.clone() };
+            let online = friends::is_online(self.friend_last_seen.get(&id).copied(), unix_now(), self.book.friends.len());
+            let mut open = true;
+            egui::Window::new("Профиль друга").collapsible(false).resizable(false).open(&mut open).show(ui.ctx(), |ui| {
+                crate::profileui::avatar(ui, &profile, id, 88.0);
+                ui.heading(name);
+                ui.label(if online { "● В сети" } else { "○ Не в сети" });
+                if !profile.status.is_empty() { ui.label(&profile.status); }
+            });
+            if !open { self.viewed_profile = None; }
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             page_bg(ui.painter(), ui.max_rect());
@@ -1504,7 +1532,7 @@ impl eframe::App for GuiApp {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 // A centred column, at most 800 px wide, with air around it.
                 let avail = ui.available_width();
-                let w = (avail - 2.0 * 32.0).clamp(300.0, 800.0);
+                let w = (avail - 2.0 * 24.0).clamp(280.0, 1000.0);
                 let left = ((avail - w) / 2.0).max(0.0);
                 let sp = ui.spacing().item_spacing;
                 ui.add_space(24.0);
@@ -1530,6 +1558,7 @@ impl eframe::App for GuiApp {
                             Page::Pads => self.pads_page(ui),
                             Page::Control => self.control_page(ui),
                             Page::Friends => self.friends_page(ui),
+                            Page::Profile => self.profile_page(ui),
                         }
                         ui.add_space(24.0);
                     });
@@ -1657,7 +1686,7 @@ impl GuiApp {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.label(RichText::new("screenshare").font(bold(17.0)));
-                ui.label(RichText::new("напрямую, без серверов").color(c_muted()).size(11.5));
+                ui.label(RichText::new("Экран · звук · друзья").color(c_muted()).size(11.5));
             });
         });
         ui.add_space(24.0);
@@ -1697,14 +1726,30 @@ impl GuiApp {
         // Remote control lives here, under the two main items: the switch and a status line, the rest on its own page.
         // Whatever does not fit the height at the smallest window size scrolls.
         ui.add_space(10.0);
-        let room = (ui.available_height() - (2.0 * 42.0 + 4.0 + 8.0)).max(60.0);
+        let room = (ui.available_height() - (2.0 * 42.0 + 4.0 + 8.0 + 88.0)).max(60.0);
         let mut open = false;
-        egui::ScrollArea::vertical().max_height(room).auto_shrink([false, true]).show(ui, |ui| open = self.side_control(ui));
+        egui::ScrollArea::vertical().max_height(room).auto_shrink([false, true]).show(ui, |ui| {
+            egui::CollapsingHeader::new("Управление зрителя").default_open(false).show(ui, |ui| open = self.side_control(ui));
+        });
         if open {
             self.page = Page::Control;
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
+            let me = self.book.profiles.get(&self.book.me.id).cloned().unwrap_or_default();
+            let mut open = false;
+            egui::Frame::new().fill(c_field()).corner_radius(10).inner_margin(10).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    open |= crate::profileui::avatar(ui, &me, self.book.me.id, 36.0).clicked();
+                    ui.vertical(|ui| {
+                        ui.set_width(110.0);
+                        open |= ui.add(egui::Label::new(RichText::new(&self.book.me.name).font(bold(14.0))).truncate().sense(Sense::click())).on_hover_text("Изменить профиль").clicked();
+                        ui.label(RichText::new("● В сети").color(c_green()).size(11.5));
+                    });
+                });
+            });
+            if open { self.open_profile(); }
             if nav_item(ui, Ico::Info, "О программе", self.page == Page::About, None) {
                 self.page = Page::About;
             }
@@ -2052,6 +2097,9 @@ impl GuiApp {
                 for line in &lines {
                     let Some(ev) = self.book.open_pair(&id, &line.message) else { continue };
                     match ev {
+                        PairEvent::Profile { .. } => {
+                            friends::save_book(&friends::profile_dir(), &self.book);
+                        }
                         PairEvent::Presence { unix, .. } => {
                             self.friend_last_seen.insert(id, unix);
                         }
@@ -2077,6 +2125,7 @@ impl GuiApp {
                 }
             }
             FriendNetKind::Presence => {}
+            FriendNetKind::ProfileSent { id, profile } => { self.profile_sent.insert(id, profile); }
         }
     }
 
@@ -2127,10 +2176,14 @@ impl GuiApp {
         if self.friend_poll_last.is_some_and(|t| t.elapsed().as_millis() < gap as u128) {
             return;
         }
-        self.friend_poll_last = Some(now);
-
         let op = friends::relay_op(n, self.friend_poll_i);
         self.friend_poll_i = self.friend_poll_i.wrapping_add(1);
+        if let friends::RelayOp::Profile(i) = op {
+            if self.profile_sent.get(&self.book.friends[i].id) == Some(&self.book.own_profile()) {
+                return; // No network slot consumed for an unchanged profile.
+            }
+        }
+        self.friend_poll_last = Some(now);
         if op == friends::RelayOp::Inbox {
             let topic = self.book.inbox_topic();
             let since = self.friend_cursors.inbox.clone();
@@ -2145,13 +2198,19 @@ impl GuiApp {
             self.spawn_friend_get(FriendNetKind::Pair { id, since: since.clone() }, topic, since);
             return;
         }
-        let friends::RelayOp::Presence(i) = op else { return };
+        let (i, profile) = match op {
+            friends::RelayOp::Presence(i) => (i, false),
+            friends::RelayOp::Profile(i) => (i, true),
+            _ => return,
+        };
         let id = ids[i];
-        if let Some(msg) = self.book.presence(&id, unix_now()) {
+        let msg = if profile { self.book.profile_message(&id, unix_now()) } else { self.book.presence(&id, unix_now()) };
+        if let Some(msg) = msg {
+            let kind = if profile { FriendNetKind::ProfileSent { id, profile: self.book.own_profile() } } else { FriendNetKind::Presence };
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
                 let body = crate::ntfy::post(&msg.topic, &msg.body).map(|_| String::new()).map_err(|e| format!("{e:#}"));
-                let _ = tx.send(FriendNet { kind: FriendNetKind::Presence, body });
+                let _ = tx.send(FriendNet { kind, body });
             });
             self.friend_net = Some(rx);
         }
@@ -2167,6 +2226,12 @@ impl GuiApp {
         ui.add_space(12.0);
         if let Some(e) = &self.friend_error { error_text(ui, e); }
         if let Some(ok) = &self.friend_ok { ui.label(RichText::new(ok).color(c_green()).size(13.0)); }
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.online_only, false, "Все");
+            ui.selectable_value(&mut self.online_only, true, "В сети");
+            ui.add(egui::TextEdit::singleline(&mut self.friend_search).hint_text("Поиск друзей").desired_width(ui.available_width()));
+        });
+        ui.add_space(10.0);
         if self.book.friends.is_empty() {
             section(ui, |ui| {
                 ui.label(RichText::new("Пока никого нет").font(bold(16.0)));
@@ -2189,56 +2254,45 @@ impl GuiApp {
                 })
                 .collect();
             rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+            let query = self.friend_search.trim().to_lowercase();
+            rows.retain(|(_, name, online)| (!self.online_only || *online) && name.to_lowercase().contains(&query));
             let mut to_remove: Option<[u8; 16]> = None;
             let mut to_invite: Option<[u8; 16]> = None;
             section(ui, |ui| {
                 ui.label(RichText::new(format!("Друзья ({})", rows.len())).font(bold(16.0)));
                 ui.add_space(4.0);
+                if rows.is_empty() { ui.label(RichText::new("Никого не найдено").color(c_muted())); }
                 for (id, name, online) in &rows {
-                    egui::Frame::new()
-                        .fill(if *online { c_green().gamma_multiply(0.08) } else { c_field() })
-                        .stroke(Stroke::new(1.0, if *online { c_green().gamma_multiply(0.3) } else { c_border() }))
-                        .corner_radius(12)
-                        .inner_margin(Margin::same(12))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-                                ui.painter().circle_filled(r.center(), 5.0, if *online { c_green() } else { c_muted() });
-                                ui.label(RichText::new(name).font(bold(15.0)));
-                                ui.label(
-                                    RichText::new(if *online { "в сети" } else { "не в сети" })
-                                        .color(if *online { c_green() } else { c_muted() })
-                                        .size(12.0),
-                                );
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("×").on_hover_text("Удалить").clicked() {
-                                        to_remove = Some(*id);
-                                    }
-                                    if ui.button("имя").on_hover_text("Переименовать").clicked() {
-                                        self.friend_rename_id = Some(*id);
-                                        self.friend_rename_input = name.clone();
-                                    }
+                    let profile = self.book.profiles.get(id).cloned().unwrap_or_default();
+                    egui::Frame::new().fill(c_field()).corner_radius(10).inner_margin(12).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            if crate::profileui::avatar(ui, &profile, id, 44.0).clicked() { self.viewed_profile = Some(*id); }
+                            let info_w = (ui.available_width() - 170.0).max(100.0);
+                            ui.allocate_ui_with_layout(Vec2::new(info_w, 44.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.set_min_width(info_w);
+                                ui.set_max_width(info_w);
+                                ui.add(egui::Label::new(RichText::new(name).font(bold(15.0))).truncate()).on_hover_text(name);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(if *online { "● В сети" } else { "○ Не в сети" }).color(if *online { c_green() } else { c_muted() }).size(12.0));
+                                    if !profile.status.is_empty() { ui.add(egui::Label::new(RichText::new(&profile.status).color(c_muted()).size(12.0)).truncate()).on_hover_text(&profile.status); }
                                 });
                             });
+                            if ui.button("Пригласить").on_hover_text("Пригласить посмотреть вашу трансляцию").clicked() { to_invite = Some(*id); }
+                            ui.menu_button("···", |ui| {
+                                if ui.button("Профиль").clicked() { self.viewed_profile = Some(*id); ui.close(); }
+                                if ui.button("Переименовать у себя").clicked() { self.friend_rename_id = Some(*id); self.friend_rename_input = name.clone(); ui.close(); }
+                                if ui.button("Убрать из друзей").clicked() { to_remove = Some(*id); ui.close(); }
+                            });
                         });
-                    ui.add_space(4.0);
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("Пригласить на трансляцию").size(13.0))
-                                .fill(c_accent().gamma_multiply(0.2))
-                                .stroke(Stroke::new(1.0, c_accent().gamma_multiply(0.4)))
-                                .corner_radius(8),
-                        )
-                        .clicked()
-                    {
-                        to_invite = Some(*id);
-                    }
-                    ui.add_space(8.0);
+                    });
+                    ui.add_space(6.0);
                 }
             });
             if let Some(id) = to_remove {
                 self.book.remove(&id);
+                self.profile_sent.remove(&id);
+                if self.viewed_profile == Some(id) { self.viewed_profile = None; }
                 self.friend_last_seen.remove(&id);
                 self.friend_cursors.forget(&id);
                 friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
@@ -2333,6 +2387,70 @@ impl GuiApp {
                 });
             });
         }
+    }
+
+    fn open_profile(&mut self) {
+        self.profile_draft = self.book.profiles.get(&self.book.me.id).cloned().unwrap_or_default();
+        self.profile_draft.name = self.book.me.name.clone();
+        self.profile_error = None;
+        self.page = Page::Profile;
+    }
+
+    fn profile_page(&mut self, ui: &mut egui::Ui) {
+        page_head(ui, Ico::Friends, "Мой профиль", "Так вас видят друзья");
+        section(ui, |ui| {
+            ui.horizontal(|ui| {
+                crate::profileui::avatar(ui, &self.profile_draft, "my-profile-preview", 88.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Аватарка").font(bold(16.0)));
+                    if ui.button("Выбрать фото…").clicked() {
+                        match crate::profileui::choose_photo(self.hwnd) {
+                            Ok(Some(photo)) => { self.profile_draft.photo = photo; self.profile_error = None; }
+                            Ok(None) => {}
+                            Err(e) => self.profile_error = Some(e),
+                        }
+                    }
+                    ui.label(RichText::new("Или выберите кота ниже").color(c_muted()).size(12.0));
+                });
+            });
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                for i in 0..crate::stickers::count() {
+                    let p = friends::Profile { avatar: i as u8, ..Default::default() };
+                    if crate::profileui::avatar(ui, &p, ("avatar-choice", i), 40.0).on_hover_text(crate::stickers::name(i)).clicked() {
+                        self.profile_draft.avatar = i as u8; self.profile_draft.photo.clear(); self.profile_error = None;
+                    }
+                }
+            });
+            ui.add_space(16.0);
+            ui.label("Имя");
+            ui.add(egui::TextEdit::singleline(&mut self.profile_draft.name).char_limit(40).desired_width(f32::INFINITY));
+            ui.add_space(10.0);
+            ui.label("Статус");
+            ui.add(egui::TextEdit::singleline(&mut self.profile_draft.status).char_limit(64).hint_text("Например: смотрим кино").desired_width(f32::INFINITY));
+            ui.label(RichText::new("Доступность «В сети» определяется автоматически.").color(c_muted()).size(12.0));
+            if let Some(e) = &self.profile_error { error_text(ui, e); }
+        });
+        ui.columns(2, |cols| {
+            if big_button(&mut cols[0], "Сохранить", c_accent(), !self.profile_draft.name.trim().is_empty()) {
+                let mut updated = self.book.clone();
+                updated.set_my_name(&self.profile_draft.name);
+                let mut profile = self.profile_draft.clone();
+                profile.name = updated.me.name.clone();
+                profile.status = friends::clean_status(&profile.status);
+                updated.profiles.insert(updated.me.id, profile);
+                match friends::save_book_checked(&friends::profile_dir(), &updated) {
+                    Ok(()) => {
+                        self.book = updated;
+                        self.friend_ok = Some("Профиль сохранён. Друзья получат обновление при следующем обмене.".into());
+                        self.friend_poll_i = 0;
+                        self.page = Page::Friends;
+                    }
+                    Err(e) => self.profile_error = Some(format!("Не удалось сохранить профиль: {e}")),
+                }
+            }
+            if big_button(&mut cols[1], "Отмена", c_card_hover(), true) { self.page = Page::Friends; }
+        });
     }
 
     /// Shown on every page, same idea as the "viewer asks for control" card.
@@ -2651,19 +2769,8 @@ fn big_button_i(ui: &mut egui::Ui, ico: Option<Ico>, text: &str, fill: Color32, 
         p.rect_stroke(rect, 12.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
         text_color = if enabled { c_text() } else { c_muted().gamma_multiply(0.7) };
     } else if enabled {
-        let k = if down { 0.0 } else { 1.0 };
-        if !pal().light {
-            glow(p, rect, 12, fill, k * (0.20 + 0.28 * t), 22, 4);
-        } else {
-            glow(p, rect, 12, fill, k * (0.18 + 0.18 * t), 14, 3);
-        }
-        let (top, bot) = if down {
-            (fill.lerp_to_gamma(Color32::BLACK, 0.12), fill.lerp_to_gamma(Color32::BLACK, 0.26))
-        } else {
-            (fill.lerp_to_gamma(Color32::WHITE, 0.14 + 0.10 * t), fill.lerp_to_gamma(Color32::BLACK, 0.18 - 0.06 * t))
-        };
-        grad_rect(p, rect, 12.0, top, bot);
-        p.rect_stroke(rect, 12.0, Stroke::new(1.0, Color32::from_white_alpha(if down { 18 } else { 42 })), egui::StrokeKind::Inside);
+        let flat = if down { fill.lerp_to_gamma(Color32::BLACK, 0.12) } else { fill.lerp_to_gamma(Color32::WHITE, 0.08 * t) };
+        p.rect_filled(rect, 9.0, flat);
         text_color = on_fill(fill);
     } else {
         p.rect_filled(rect, 12.0, fill.gamma_multiply(0.35));
@@ -2695,16 +2802,14 @@ fn crumb(ui: &mut egui::Ui, label: &str) -> bool {
     r.clicked()
 }
 
-/// Header of a page: a rounded gradient icon tile, the title and a one-line subtitle.
+/// Header of a page: a flat icon tile, the title and a one-line subtitle.
 fn page_head(ui: &mut egui::Ui, ico: Ico, t: &str, sub: &str) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 16.0;
         let (r, _) = ui.allocate_exact_size(Vec2::splat(54.0), Sense::hover());
         let p = ui.painter();
         let a = c_accent();
-        glow(p, r, 15, a, if pal().light { 0.22 } else { 0.30 }, 20, 4);
-        grad_rect(p, r, 15.0, a.lerp_to_gamma(Color32::WHITE, 0.18), a.lerp_to_gamma(Color32::BLACK, 0.2));
-        p.rect_stroke(r, 15.0, Stroke::new(1.0, Color32::from_white_alpha(40)), egui::StrokeKind::Inside);
+        p.rect_filled(r, 12.0, a);
         draw_ico(p, ico, r.center(), 26.0, on_fill(a));
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 3.0;
