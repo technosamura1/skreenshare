@@ -1,4 +1,4 @@
-//! The HTTP side of "Простое подключение (beta)": post/poll a topic on an ntfy server (default https://ntfy.sh,
+//! The HTTP side of "Простое подключение (beta)": post/poll a topic on an ntfy server (default https://ntfy-me.com,
 //! no account; override with the SCREENSHARE_RELAY environment variable, e.g. a self-hosted ntfy).
 //! Uses curl.exe, which ships with Windows 10 (1803+) / 11, so no HTTP/TLS stack has to be linked in.
 //! NOT covered by the Linux simulation tests (needs the real network and Windows).
@@ -33,9 +33,17 @@ fn base() -> String {
     std::env::var("SCREENSHARE_RELAY")
         .ok()
         .filter(|s| s.starts_with("https://") || s.starts_with("http://"))
-        .unwrap_or_else(|| "https://ntfy.sh".into())
+        .unwrap_or_else(|| "https://ntfy-me.com".into())
         .trim_end_matches('/')
         .to_string()
+}
+
+/// Message IDs are local to a relay. Never reuse cursors from another server.
+pub fn cursor_dir() -> std::path::PathBuf {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(base().as_bytes());
+    let key: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    crate::friends::profile_dir().join("relay-state").join(key)
 }
 
 fn curl() -> String {

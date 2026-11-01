@@ -1052,6 +1052,7 @@ struct GuiApp {
     friend_cursors: friends::Cursors,
     /// Pending invitations already announced with a taskbar flash (a new one flashes again).
     friend_invites_flashed: usize,
+    presence_attempt: HashMap<[u8; 16], Instant>,
     friend_last_seen: HashMap<[u8; 16], u64>,
     /// Invites waiting for «Смотреть». A second one must not erase the first: the relay cursor
     /// already moved past both, so the overwritten invite would never come back.
@@ -1190,8 +1191,9 @@ impl GuiApp {
             friend_poll_i: 0,
             friend_net: None,
             friend_post: None,
-            friend_cursors: friends::load_cursors(&friends::profile_dir()),
+            friend_cursors: friends::load_cursors(&crate::ntfy::cursor_dir()),
             friend_invites_flashed: 0,
+            presence_attempt: HashMap::new(),
             friend_last_seen: HashMap::new(),
             friend_pending_invites: Vec::new(),
             watch_requests: Vec::new(),
@@ -2110,7 +2112,7 @@ impl GuiApp {
                 let next = friends::next_since(&self.friend_cursors.inbox, &lines).to_string();
                 if next != self.friend_cursors.inbox {
                     self.friend_cursors.inbox = next;
-                    friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
+                    friends::save_cursors(&crate::ntfy::cursor_dir(), &self.friend_cursors);
                 }
             }
             FriendNetKind::Pair { id, since } => {
@@ -2155,7 +2157,7 @@ impl GuiApp {
                 let new_since = friends::next_since(&since, &lines).to_string();
                 if new_since != since && self.book.pair_topic(&id).is_some() {
                     self.friend_cursors.set_pair(id, &new_since);
-                    friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
+                    friends::save_cursors(&crate::ntfy::cursor_dir(), &self.friend_cursors);
                 }
             }
             FriendNetKind::Presence => {}
@@ -2167,6 +2169,7 @@ impl GuiApp {
     /// once and poll it quickly for 90 s, so both sides see each other in seconds, not after a full cycle.
     fn friend_greet(&mut self, id: [u8; 16], hello: Option<friends::OutMsg>) {
         let Some(presence) = self.book.presence(&id, unix_now()) else { return };
+        self.presence_attempt.insert(id, Instant::now());
         let ours = hello.is_some();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -2217,6 +2220,11 @@ impl GuiApp {
             if self.profile_sent.get(&self.book.friends[i].id) == Some(&self.book.own_profile()) {
                 return; // No network slot consumed for an unchanged profile.
             }
+        }
+        if let friends::RelayOp::Presence(i) = op {
+            let id = self.book.friends[i].id;
+            if !friends::presence_due(self.presence_attempt.get(&id).map(|t| t.elapsed().as_secs()), n) { return; }
+            self.presence_attempt.insert(id, now);
         }
         self.friend_poll_last = Some(now);
         if op == friends::RelayOp::Inbox {
@@ -2333,7 +2341,7 @@ impl GuiApp {
                 if self.viewed_profile == Some(id) { self.viewed_profile = None; }
                 self.friend_last_seen.remove(&id);
                 self.friend_cursors.forget(&id);
-                friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
+                friends::save_cursors(&crate::ntfy::cursor_dir(), &self.friend_cursors);
                 self.friend_rush_ids.remove(&id);
                 self.friend_poll_i = 0;
                 if self.friend_rename_id == Some(id) {
@@ -2391,7 +2399,7 @@ impl GuiApp {
                     Ok(msg) => {
                         if let Some((id, _)) = friends::parse_code(&raw) {
                             self.friend_cursors.forget(&id);
-                            friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
+                            friends::save_cursors(&crate::ntfy::cursor_dir(), &self.friend_cursors);
                             self.friend_last_seen.remove(&id);
                         }
                         self.friend_poll_i = 0;
@@ -3640,7 +3648,7 @@ impl GuiApp {
             ui.checkbox(&mut self.easy, "Простое подключение (beta): один короткий код вместо двух длинных");
             if self.easy {
                 ui.label(
-                    RichText::new("Коды обмениваются через публичный сервер ntfy.sh в зашифрованном виде. Обычные коды тоже останутся — на случай, если не сработает.")
+                    RichText::new("Коды обмениваются через публичный сервер ntfy-me.com в зашифрованном виде. Обычные коды тоже останутся — на случай, если не сработает.")
                         .color(c_muted())
                         .size(12.5),
                 );
@@ -3781,7 +3789,7 @@ impl GuiApp {
             ui.add(egui::Label::new(
                 RichText::new(
                     "Видео и звук идут по прямому соединению между транслирующим и зрителем, без промежуточных серверов. \
-                     Единственное, что может проходить через сервер, — короткий код в режиме «простое подключение (beta)»: он передаётся в зашифрованном виде через публичный сервер ntfy.sh.",
+                     Приглашения, запросы трансляции, профили и статусы друзей передаются в зашифрованном виде через бесплатный публичный сервер ntfy-me.com. Сервер видит IP-адреса и время запросов. Для друзей нужна одинаковая новая версия приложения.",
                 )
                 .color(c_muted())
                 .size(13.5),

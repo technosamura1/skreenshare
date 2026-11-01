@@ -370,7 +370,17 @@ pub fn is_online(last: Option<u64>, now: u64, n_friends: usize) -> bool {
 }
 
 pub fn online_ttl_secs(n_friends: usize) -> u64 {
-    cycle_secs(n_friends).saturating_mul(2).saturating_add(15)
+    presence_interval_secs(n_friends).saturating_mul(2).saturating_add(cycle_secs(n_friends)).saturating_add(15)
+}
+
+/// Limit steady-state heartbeats to at most 480 posts/day per running launcher,
+/// reserving the public relay budget for actual invitations. Not a delivery quota.
+pub fn presence_interval_secs(n_friends: usize) -> u64 {
+    180 * n_friends.max(1) as u64
+}
+
+pub fn presence_due(last_elapsed_secs: Option<u64>, n_friends: usize) -> bool {
+    last_elapsed_secs.is_none_or(|t| t >= presence_interval_secs(n_friends))
 }
 
 /// Seconds one full pass takes (inbox poll + a poll and a presence post per friend), never faster
@@ -1261,6 +1271,19 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_budget_leaves_room_for_invitations() {
+        for n in 1..=MAX_FRIENDS {
+            let interval = presence_interval_secs(n);
+            let posts = n as u64 * (86400 / interval + 1);
+            assert!(posts <= 480 + n as u64);
+            assert!(presence_due(None, n));
+            assert!(!presence_due(Some(interval - 1), n));
+            assert!(presence_due(Some(interval), n));
+            assert!(online_ttl_secs(n) > interval * 2);
+        }
+    }
+
+    #[test]
     fn polling_stays_inside_the_relay_limit() {
         for n in 0..=12 {
             let gap = relay_gap_ms(n);
@@ -1294,6 +1317,7 @@ mod tests {
                 now_ms += poll_gap_ms(n, step < ops * 6) + 200;
                 match relay_op(n, step) {
                     RelayOp::Presence(i) => {
+                        if !presence_due(last_post[i].map(|t| (now_ms - t) / 1000), n) { continue; }
                         if let Some(prev) = last_post[i] {
                             assert!(now_ms - prev < online_ttl_secs(n) * 1000);
                         }
@@ -1319,7 +1343,7 @@ mod tests {
         assert_eq!(relay_op(0, usize::MAX), RelayOp::Inbox);
     }
 
-    /// Two fresh profiles over the real ntfy.sh (needs the internet): add, hello, presence both ways,
+    /// Two fresh profiles over the configured public relay (needs the internet): add, hello, presence both ways,
     /// invite, answer — the same calls the window makes. `cargo test -- --ignored real_relay`.
     #[test]
     #[ignore]
@@ -1379,6 +1403,12 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(2));
         let lines = poll(&pair, &since);
         assert!(lines.iter().any(|l| matches!(b.open_pair(&a.me.id, &l.message), Some(PairEvent::Profile { profile: got, .. }) if got == profile)));
+        let since = next_since(&since, &lines).to_string();
+        let (request, nonce) = b.request_watch(&a.me.id, now).unwrap();
+        crate::ntfy::post(&request.topic, &request.body).expect("post watch request");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let lines = poll(&pair, &since);
+        assert!(lines.iter().any(|l| matches!(a.open_pair(&b.me.id, &l.message), Some(PairEvent::WatchRequest { nonce: got, .. }) if got == nonce)));
 
     }
 
