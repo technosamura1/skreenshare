@@ -185,6 +185,20 @@ pub fn draw_letterboxed(
     if dst.len() < stride * (oh - 1) + ow * 4 {
         return Err("буфер кодера слишком мал".into());
     }
+    // Common 60/144 FPS monitor path: same-size BGRA is a direct copy.
+    // Avoid clearing and re-touching every row when there are no black bars.
+    if (sw as usize, sh as usize) == (ow, oh) && (fw, fh) == (ow, oh) {
+        let bytes = ow * 4;
+        if stride == bytes {
+            dst[..bytes * oh].copy_from_slice(&src[..bytes * oh]);
+        } else {
+            for row in 0..oh {
+                dst[row * stride..row * stride + bytes]
+                    .copy_from_slice(&src[row * bytes..(row + 1) * bytes]);
+            }
+        }
+        return Ok(());
+    }
     for row in 0..oh {
         let line = &mut dst[row * stride..row * stride + ow * 4];
         if row < y || row >= y + fh {
@@ -239,6 +253,29 @@ mod tests {
         }
         assert_eq!(SourceReq::from_choice(Choice::Screen, 1), SourceReq::Monitor(1));
         assert_eq!(SourceReq::from_choice(Choice::Window(7), 1), SourceReq::Window(7));
+    }
+
+    #[test]
+    fn identical_monitor_frame_copies_without_scaling() {
+        let input: Vec<u8> = (0u8..48).collect(); // 4x3 BGRA
+        let mut dst = vec![255; 4 * 3 * 4];
+        let mut scratch = Vec::new();
+        draw_letterboxed(&input, (4, 3), &mut dst, 16, (4, 3), &mut scratch,
+            |_, _, _, _, _, _| panic!("matching canvas must not scale")).unwrap();
+        assert_eq!(dst, input);
+        assert!(scratch.is_empty());
+    }
+
+    #[test]
+    fn matching_monitor_frame_respects_padded_encoder_stride() {
+        let input: Vec<u8> = (0u8..32).collect(); // 4x2 BGRA
+        let mut dst = vec![255; 40];
+        let mut scratch = Vec::new();
+        draw_letterboxed(&input, (4, 2), &mut dst, 24, (4, 2), &mut scratch,
+            |_, _, _, _, _, _| panic!("matching canvas must not scale")).unwrap();
+        assert_eq!(&dst[..16], &input[..16]);
+        assert_eq!(&dst[24..40], &input[16..32]);
+        assert_eq!(&dst[16..24], &[255; 8]);
     }
 
     #[test]
