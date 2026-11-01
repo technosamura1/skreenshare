@@ -1056,6 +1056,8 @@ struct GuiApp {
     /// Invites waiting for «Смотреть». A second one must not erase the first: the relay cursor
     /// already moved past both, so the overwritten invite would never come back.
     friend_pending_invites: Vec<(friends::Invite, [u8; 16])>,
+    watch_requests: Vec<([u8; 16], u64, String)>,
+    watch_sent: HashMap<[u8; 16], (String, Instant)>,
     /// Offer we accepted: (friend, nonce). The viewer's C… code is posted back once the client prints it.
     friend_answer: Option<([u8; 16], String)>,
     /// After adding or inviting a friend, speed up the entire fair cycle.
@@ -1191,6 +1193,8 @@ impl GuiApp {
             friend_invites_flashed: 0,
             friend_last_seen: HashMap::new(),
             friend_pending_invites: Vec::new(),
+            watch_requests: Vec::new(),
+            watch_sent: HashMap::new(),
             friend_answer: None,
             friend_rush_ids: HashMap::new(),
             friend_rename_input: String::new(),
@@ -1536,6 +1540,7 @@ impl eframe::App for GuiApp {
                         }
                     });
                 }
+                self.watch_request_card(ui);
                 self.friend_invite_card(ui);
             });
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -1584,7 +1589,7 @@ impl GuiApp {
         let asked = self.host.as_ref().is_some_and(|s| !s.ended && s.ctrl.is_some_and(|c| c.asked && !c.on));
         let flash_ask = asked && !self.asked_seen;
         self.asked_seen = asked;
-        let invites = self.friend_pending_invites.len();
+        let invites = self.friend_pending_invites.len() + self.watch_requests.len();
         let flash_invite = invites > self.friend_invites_flashed;
         self.friend_invites_flashed = invites;
         if flash_ask || flash_invite {
@@ -2107,6 +2112,13 @@ impl GuiApp {
                 for line in &lines {
                     let Some(ev) = self.book.open_pair(&id, &line.message) else { continue };
                     match ev {
+                        PairEvent::WatchRequest { unix, nonce } => {
+                            if friends::invite_fresh(unix, now) && !self.watch_requests.iter().any(|(fid, _, n)| *fid == id && *n == nonce) {
+                                // One outstanding request per friend, bounded by the friend list.
+                                self.watch_requests.retain(|(fid, _, _)| *fid != id);
+                                self.watch_requests.push((id, unix, nonce));
+                            }
+                        }
                         PairEvent::Profile { .. } => {
                             friends::save_book(&friends::profile_dir(), &self.book);
                         }
@@ -2114,6 +2126,7 @@ impl GuiApp {
                             self.friend_last_seen.insert(id, unix);
                         }
                         PairEvent::Invite(inv) => {
+                            self.watch_sent.remove(&id);
                             if friends::invite_fresh(inv.unix, now)
                                 && !self.friend_pending_invites.iter().any(|(i, fid)| i.nonce == inv.nonce && *fid == id)
                             {
@@ -2125,7 +2138,12 @@ impl GuiApp {
                                 s.proc.send(&code);
                             }
                         }
-                        PairEvent::Decline { .. } => {}
+                        PairEvent::Decline { nonce } => {
+                            if self.watch_sent.get(&id).is_some_and(|(n, _)| *n == nonce) {
+                                self.watch_sent.remove(&id);
+                                self.friend_ok = Some("Друг пока не готов транслировать.".into());
+                            }
+                        }
                     }
                 }
                 let new_since = friends::next_since(&since, &lines).to_string();
@@ -2234,7 +2252,7 @@ impl GuiApp {
                 if !self.host.as_ref().is_some_and(Session::active) { self.host = None; self.broadcast_target = None; self.manual_broadcast = false; }
                 self.page = Page::Host;
             }
-            if big_button_i(&mut cols[1], Some(Ico::Eye), "Смотреть по коду", c_card_hover(), true) { self.page = Page::Join; }
+            if big_button_i(&mut cols[1], Some(Ico::Eye), "Смотреть", c_card_hover(), true) { self.page = Page::Join; }
         });
         ui.add_space(12.0);
         if let Some(e) = &self.friend_error { error_text(ui, e); }
@@ -2302,6 +2320,8 @@ impl GuiApp {
             });
             if let Some(id) = to_remove {
                 self.book.remove(&id);
+                self.watch_sent.remove(&id);
+                self.watch_requests.retain(|(fid, _, _)| *fid != id);
                 self.profile_sent.remove(&id);
                 if self.viewed_profile == Some(id) { self.viewed_profile = None; }
                 self.friend_last_seen.remove(&id);
@@ -4214,6 +4234,63 @@ impl GuiApp {
         }
     }
 
+    fn watch_friend_picker(&mut self, ui: &mut egui::Ui) {
+        ui.add(egui::TextEdit::singleline(&mut self.friend_search).hint_text("Найти друга").desired_width(f32::INFINITY));
+        if let Some(e) = &self.friend_error { error_text(ui, e); }
+        if let Some(ok) = &self.friend_ok { ui.label(RichText::new(ok).color(c_muted())); }
+        if self.book.friends.is_empty() {
+            ui.label("Добавьте друга, чтобы запросить трансляцию без кодов.");
+            if ui.button("К друзьям").clicked() { self.page = Page::Friends; }
+        }
+        let query = self.friend_search.trim().to_lowercase();
+        let peers = self.book.friends.clone();
+        let mut request = None;
+        for f in peers.iter().filter(|f| f.name.to_lowercase().contains(&query)) {
+            let profile = self.book.profiles.get(&f.id).cloned().unwrap_or_default();
+            let sent = self.watch_sent.get(&f.id).is_some_and(|(_, t)| t.elapsed() < Duration::from_secs(30));
+            section(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    crate::profileui::avatar(ui, &profile, ("watch", f.id), 40.0);
+                    ui.label(RichText::new(&f.name).font(bold(15.0)));
+                    if ui.add_enabled(!sent && self.friend_post.is_none(), egui::Button::new(if sent { "Запрос отправлен" } else { "Попросить трансляцию" })).clicked() { request = Some(f.id); }
+                });
+            });
+        }
+        if let Some(id) = request {
+            if let Some((msg, nonce)) = self.book.request_watch(&id, unix_now()) {
+                self.watch_sent.insert(id, (nonce, Instant::now()));
+                self.friend_error = None;
+                self.spawn_friend_post(msg.topic, msg.body, "Запрос отправлен. Друг выберет экран и пришлёт приглашение.".into());
+            }
+        }
+        ui.label(RichText::new("Друг сам подтвердит запуск и выберет, что показать. Для запросов нужна новая версия у обоих.").color(c_muted()).size(12.0));
+        ui.add_space(12.0);
+    }
+
+    fn watch_request_card(&mut self, ui: &mut egui::Ui) {
+        let now = unix_now();
+        self.watch_requests.retain(|(_, t, _)| friends::invite_fresh(*t, now));
+        let Some((id, _, nonce)) = self.watch_requests.first().cloned() else { return };
+        let name = self.book.friends.iter().find(|f| f.id == id).map(|f| f.name.clone()).unwrap_or_else(|| "Друг".into());
+        let busy = self.host.as_ref().is_some_and(Session::active) || self.join.as_ref().is_some_and(Session::active) || self.test.is_some();
+        let mut accept = false; let mut decline = false;
+        egui::Frame::new().fill(c_card()).stroke(Stroke::new(1.0, c_accent())).corner_radius(12).inner_margin(14).show(ui, |ui| {
+            ui.label(RichText::new(format!("{name} просит вас начать трансляцию")).font(bold(16.0)));
+            ui.label(if busy { "Завершите текущую сессию, чтобы выбрать экран." } else { "Вы сами выберете экран или окно. Передача начнётся только после подтверждения." });
+            ui.horizontal_wrapped(|ui| {
+                accept = ui.add_enabled(!busy, egui::Button::new("Выбрать экран")).clicked();
+                decline = ui.button("Отклонить").clicked();
+            });
+        });
+        if accept {
+            self.invite_friend(ui.ctx(), id);
+            self.watch_requests.retain(|(fid, _, n)| !(*fid == id && *n == nonce));
+        } else if decline {
+            if let Some(msg) = self.book.decline(&id, &nonce) { self.spawn_friend_post(msg.topic, msg.body, "Запрос отклонён.".into()); }
+            self.watch_requests.retain(|(fid, _, n)| !(*fid == id && *n == nonce));
+        }
+    }
+
     fn join_page(&mut self, ui: &mut egui::Ui) {
         if let Some(b) = self.tab_busy(lg::Tab::Join) {
             page_head(ui, Ico::Eye, "Смотреть", "Сейчас занято другим");
@@ -4221,7 +4298,7 @@ impl GuiApp {
             return;
         }
         let live = self.join.as_ref().is_some_and(|s| s.connected && s.active());
-        page_head(ui, Ico::Eye, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Примите приглашение друга или введите код трансляции" });
+        page_head(ui, Ico::Eye, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Выберите друга и попросите его начать трансляцию" });
 
         if let Some(s) = &mut self.join {
             if s.connected && !s.ended {
@@ -4287,6 +4364,16 @@ impl GuiApp {
             }
             return;
         }
+        if self.join.is_none() {
+            self.watch_friend_picker(ui);
+            egui::CollapsingHeader::new("Подключение по коду — дополнительный способ")
+                .id_salt("watch-code-fallback").default_open(false).show(ui, |ui| self.join_code_form(ui));
+            return;
+        }
+        self.join_code_form(ui);
+    }
+
+    fn join_code_form(&mut self, ui: &mut egui::Ui) {
         let have_reply = self.join.as_ref().is_some_and(|s| s.code.is_some());
         if !have_reply {
             section(ui, |ui| {

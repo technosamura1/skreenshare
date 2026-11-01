@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 /// Same alphabet as the short room codes, so a code can be read aloud if it has to be.
 const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
+pub const KIND_WATCH: u8 = b'W';
 pub const KIND_PROFILE: u8 = b'U';
 pub const KIND_HELLO: u8 = b'H';
 pub const KIND_PRESENCE: u8 = b'P';
@@ -86,6 +87,7 @@ pub enum PairEvent {
     Presence { unix: u64, name: String },
     Profile { unix: u64, profile: Profile },
     Invite(Invite),
+    WatchRequest { unix: u64, nonce: String },
     Answer { nonce: String, code: String },
     Decline { nonce: String },
 }
@@ -266,6 +268,13 @@ impl Book {
         profile.name = self.me.name.clone();
         profile
     }
+    /// Request consent to a broadcast; never carries an offer or starts capture.
+    pub fn request_watch(&self, id: &[u8; 16], unix: u64) -> Option<(OutMsg, String)> {
+        let mut nonce = [0u8; 8]; getrandom::fill(&mut nonce).expect("rng");
+        let nonce = hex(&nonce);
+        Some((self.pair_line(id, KIND_WATCH, &format!("{unix}\n{nonce}"))?, nonce))
+    }
+
     pub fn profile_message(&self, id: &[u8; 16], unix: u64) -> Option<OutMsg> {
         let profile = self.own_profile();
         self.pair_line(id, KIND_PROFILE, &format!("{unix}\n{}", profile.encode()))
@@ -672,6 +681,11 @@ fn parse_hello(body: &str) -> Option<([u8; 16], [u8; 32], [u8; 32], String)> {
 
 fn parse_pair(kind: u8, body: &str) -> Option<PairEvent> {
     match kind {
+        KIND_WATCH => {
+            let (unix, nonce) = body.split_once('\n')?;
+            if nonce.len() != 16 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+            Some(PairEvent::WatchRequest { unix: unix.parse().ok()?, nonce: nonce.to_ascii_lowercase() })
+        }
         KIND_PROFILE => {
             let (unix, payload) = body.split_once('\n')?;
             Some(PairEvent::Profile { unix: unix.parse().ok()?, profile: Profile::decode(payload)? })
@@ -752,7 +766,7 @@ impl Channel {
     }
 
     fn open_any(&self, message: &str) -> Option<(u8, String)> {
-        for k in [KIND_PROFILE, KIND_PRESENCE, KIND_INVITE, KIND_ANSWER, KIND_DECLINE, KIND_HELLO] {
+        for k in [KIND_WATCH, KIND_PROFILE, KIND_PRESENCE, KIND_INVITE, KIND_ANSWER, KIND_DECLINE, KIND_HELLO] {
             if let Some(body) = self.open(k, message) {
                 return Some((k, body));
             }
@@ -928,6 +942,21 @@ mod tests {
         let mut key = [n.wrapping_add(9); 32];
         key[0] = n;
         Book::new(Identity { id, key, name: name.into() })
+    }
+
+    #[test]
+    fn watch_requests_are_authenticated_and_separate_from_offers() {
+        let mut a = fixed(62, "Зритель"); let mut b = fixed(63, "Хост");
+        let hello = a.add(&b.code()).unwrap(); b.take_hellos(&[hello.body]);
+        let (msg, nonce) = a.request_watch(&b.me.id, 1000).unwrap();
+        assert!(matches!(b.open_pair(&a.me.id, &msg.body), Some(PairEvent::WatchRequest { unix: 1000, nonce: got }) if got == nonce));
+        assert!(a.open_pair(&b.me.id, &msg.body).is_none());
+        let channel = pair_channel(&a.me.id, &b.me.id, &a.friends[0].pair);
+        assert!(channel.open(KIND_INVITE, &msg.body).is_none());
+        assert!(parse_pair(KIND_WATCH, "1000\nnot-a-valid-nonce").is_none());
+        let (_, other) = a.request_watch(&b.me.id, 1000).unwrap(); assert_ne!(other, nonce);
+        let decline = b.decline(&a.me.id, &nonce).unwrap();
+        assert!(matches!(a.open_pair(&b.me.id, &decline.body), Some(PairEvent::Decline { nonce: got }) if got == nonce));
     }
 
     #[test]
