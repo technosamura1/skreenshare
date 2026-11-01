@@ -26,6 +26,7 @@ pub struct AnnotView {
     pub capture_safe: Arc<AtomicBool>,
     /// Acknowledgement from the draw thread that the overlay is hidden.
     pub paused: Arc<AtomicBool>,
+    pub finished: Arc<AtomicBool>,
     got_any: AtomicBool,
 }
 
@@ -38,16 +39,23 @@ impl AnnotView {
         // Fail closed until the capture backend has been selected.
         let capture_safe = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let exited = finished.clone();
+        let worker_finished = finished.clone();
         let (b, s, e, c, p) = (board.clone(), stop.clone(), enabled.clone(), capture_safe.clone(), paused.clone());
-        std::thread::Builder::new()
+        let _ = std::thread::Builder::new()
             .name("annot-view".into())
             .spawn(move || {
+                let _finished = WorkerExit(worker_finished);
                 if let Err(err) = run(&b, &s, &e, &c, &p, &region, input.as_deref()) {
                     crate::net::conn_log(&format!("указка: окно не создано: {err}"));
                 }
             })
-            .ok();
-        AnnotView { board, stop, enabled, capture_safe, paused, got_any: AtomicBool::new(false) }
+            .map_err(|err| {
+                exited.store(true, Ordering::Release);
+                crate::net::conn_log(&format!("указка: поток не запущен: {err}"));
+            });
+        AnnotView { board, stop, enabled, capture_safe, paused, finished, got_any: AtomicBool::new(false) }
     }
 
     pub fn on_packet(&self, body: &[u8]) {
@@ -77,9 +85,28 @@ pub fn load_enabled() -> bool {
 struct Gfx {
     rt: ID2D1DCRenderTarget,
     text: IDWriteTextFormat,
-    dc: HDC,
-    bmp: HBITMAP,
+    surface: GdiSurface,
     cap: (i32, i32),
+}
+
+// Owning guards also run on draw errors and when a larger surface replaces the old one.
+struct WorkerExit(Arc<AtomicBool>);
+impl Drop for WorkerExit {
+    fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+}
+struct OverlayWindow(HWND);
+impl Drop for OverlayWindow {
+    fn drop(&mut self) { unsafe { let _ = DestroyWindow(self.0); } }
+}
+struct GdiSurface { dc: HDC, bmp: HBITMAP, previous: HGDIOBJ }
+impl Drop for GdiSurface {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.previous.is_invalid() { SelectObject(self.dc, self.previous); }
+            if !self.bmp.is_invalid() { let _ = DeleteObject(self.bmp.into()); }
+            if !self.dc.is_invalid() { let _ = DeleteDC(self.dc); }
+        }
+    }
 }
 
 const PAD: i32 = 8;
@@ -136,6 +163,7 @@ fn run(
         }
         h
     };
+    let _window = OverlayWindow(hwnd);
     if !affinity_ok {
         crate::net::conn_log("указка/стикеры скрыты: Windows не подтвердила исключение окна из захвата");
     }
@@ -243,7 +271,7 @@ fn run(
                 None,
                 Some(&POINT { x: l, y: t }),
                 Some(&SIZE { cx: w, cy: h }),
-                Some(g.dc),
+                Some(g.surface.dc),
                 Some(&POINT { x: 0, y: 0 }),
                 COLORREF(0),
                 Some(&blend),
@@ -259,13 +287,6 @@ fn run(
         // Next frame with the screen's own refresh (60/144 Hz): a plain sleep is 15.6 ms steps on Windows.
         if unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
             std::thread::sleep(Duration::from_millis(4));
-        }
-    }
-    unsafe {
-        let _ = DestroyWindow(hwnd);
-        if let Some(g) = gfx {
-            let _ = DeleteDC(g.dc);
-            let _ = DeleteObject(g.bmp.into());
         }
     }
     Ok(())
@@ -293,6 +314,8 @@ fn make_gfx(w: i32, h: i32) -> Result<Gfx> {
         text.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
         text.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
         let dc = CreateCompatibleDC(None);
+        if dc.is_invalid() { return Err(windows::core::Error::from_thread()); }
+        let mut surface = GdiSurface { dc, bmp: HBITMAP::default(), previous: HGDIOBJ::default() };
         let bi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -307,15 +330,17 @@ fn make_gfx(w: i32, h: i32) -> Result<Gfx> {
         };
         let mut bits = std::ptr::null_mut();
         let bmp = CreateDIBSection(Some(dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0)?;
-        SelectObject(dc, bmp.into());
-        Ok(Gfx { rt, text, dc, bmp, cap: (w, h) })
+        surface.bmp = bmp;
+        surface.previous = SelectObject(dc, bmp.into());
+        if surface.previous.is_invalid() { return Err(windows::core::Error::from_thread()); }
+        Ok(Gfx { rt, text, surface, cap: (w, h) })
     }
 }
 
 fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, items: &[(usize, (f32, f32), f32, f32, Duration)], banner: Option<(f32, f32)>) -> Result<()> {
     let rt = &g.rt;
     unsafe {
-        rt.BindDC(g.dc, &RECT { left: 0, top: 0, right: w, bottom: h })?;
+        rt.BindDC(g.surface.dc, &RECT { left: 0, top: 0, right: w, bottom: h })?;
         rt.BeginDraw();
         rt.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
         let (ox, oy) = (l as f32, t as f32);
@@ -385,4 +410,51 @@ pub fn demo(region: Region) {
         std::thread::sleep(Duration::from_millis(10));
     }
     std::thread::sleep(annot::REACTION_LIFE);
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[test]
+    fn surfaces_are_released_after_resize_and_error() {
+        // Warm up factories/font caches before measuring native GDI ownership.
+        drop(make_gfx(32, 32).unwrap());
+        unsafe {
+            use windows::Win32::System::Threading::{GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS};
+            let before = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+            let result = (|| -> Result<()> {
+                let mut gfx = make_gfx(32, 32)?;
+                for i in 0..32 { gfx = make_gfx(64 + i, 64 + i)?; }
+                std::hint::black_box(&gfx);
+                Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)))
+            })();
+            assert!(result.is_err());
+            let after = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+            assert!(after <= before + 2, "GDI resources leaked: {before} -> {after}");
+        }
+    }
+    #[test]
+    fn overlay_window_is_destroyed_on_error_return() {
+        unsafe {
+            let h = CreateWindowExW(WS_EX_TOOLWINDOW, w!("STATIC"), w!("overlay cleanup test"), WS_POPUP,
+                0, 0, 1, 1, None, None, None, None).unwrap();
+            assert!(IsWindow(Some(h)).as_bool());
+            let result = (|| -> Result<()> {
+                let _window = OverlayWindow(h);
+                Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)))
+            })();
+            assert!(result.is_err());
+            assert!(!IsWindow(Some(h)).as_bool());
+        }
+    }
+    #[test]
+    fn worker_acknowledges_exit_during_unwind() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _exit = WorkerExit(flag);
+            panic!("simulated draw failure");
+        });
+        assert!(finished.load(Ordering::Acquire));
+    }
 }
