@@ -222,13 +222,13 @@ enum Cap {
 
 /// Prevent Desktop Duplication from seeing the host overlay, including the control-request banner.
 /// Wait for the overlay thread's acknowledgement, not an arbitrary sleep: drawing can be delayed.
-fn sync_annotation_capture(cap: &Cap, capture_safe: &AtomicBool, paused: &AtomicBool) -> Result<()> {
+fn sync_annotation_capture(cap: &Cap, capture_safe: &AtomicBool, paused: &AtomicBool, finished: &AtomicBool) -> Result<()> {
     let safe = matches!(cap, Cap::Window(_) | Cap::Monitor(_));
     paused.store(false, Ordering::SeqCst);
     capture_safe.store(safe, Ordering::SeqCst);
     if !safe {
         let start = Instant::now();
-        while !paused.load(Ordering::Acquire) {
+        while !paused.load(Ordering::Acquire) && !finished.load(Ordering::Acquire) {
             if start.elapsed() > Duration::from_secs(2) {
                 bail!("не удалось скрыть указку и стикеры до включения Desktop Duplication");
             }
@@ -478,6 +478,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     // Control receiver owns annot_view; the capture loop needs the same safety/acknowledgement flags.
     let annot_capture_safe = annot_view.capture_safe.clone();
     let annot_paused = annot_view.paused.clone();
+    let annot_finished = annot_view.finished.clone();
     let (nack_tx, nack_rx) = mpsc::channel::<(u32, Vec<u16>)>();
     let (rep_tx, rep_rx) = mpsc::channel::<crate::ratectl::ReportDelta>();
 
@@ -663,7 +664,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             open_screen(&monitor)?
         }
     };
-    sync_annotation_capture(&cap, &annot_capture_safe, &annot_paused)?;
+    sync_annotation_capture(&cap, &annot_capture_safe, &annot_paused, &annot_finished)?;
     // The window whose process is the sound source (None while a whole screen is shown).
     let mut audio_window = match &cap {
         Cap::Window(_) => o.window,
@@ -820,7 +821,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     format!("Захват окна «{}» не удался", crate::source::ellipsize(&title, 40))
                 };
                 let next_cap = fall_back_to_screen(&why, &monitor)?;
-                sync_annotation_capture(&next_cap, &annot_capture_safe, &annot_paused)?;
+                sync_annotation_capture(&next_cap, &annot_capture_safe, &annot_paused, &annot_finished)?;
                 cap = next_cap;
                 audio_window = None; // back to the system sound without Discord
                 audio_dirty = true;
@@ -846,7 +847,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             match open_requested(req, &monitor, matches!(cap, Cap::Screen(_) | Cap::Monitor(_))) {
                 Ok(Some(n)) => {
                     // Hide the overlay and wait for the paint thread before an unsafe capture takes over.
-                    if let Err(e) = sync_annotation_capture(&n.cap, &annot_capture_safe, &annot_paused) {
+                    if let Err(e) = sync_annotation_capture(&n.cap, &annot_capture_safe, &annot_paused, &annot_finished) {
                         // The requested backend is not safe to activate. Keep the old capture,
                         // restoring its overlay policy rather than ending the running stream.
                         annot_capture_safe.store(matches!(cap, Cap::Window(_) | Cap::Monitor(_)), Ordering::SeqCst);
@@ -994,7 +995,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             let glitches = crate::audio::CAPTURE_GLITCHES.load(Ordering::Relaxed);
             let skipped = sh.skipped_busy.load(Ordering::Relaxed);
             ui::stat(&format!(
-                "{enc_short} · {:.0} кадров/с (экран обновился {:.0}/с, отложено из-за сети {}) · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · подготовка {:.1}/{:.1} мс, кодирование {:.1}/{:.1} мс (ср/макс) · звук {}{}",
+                "{enc_short} · {:.0} кадров/с (получено из захвата {:.0}/с, отложено из-за сети {}) · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · подготовка {:.1}/{:.1} мс, кодирование {:.1}/{:.1} мс (ср/макс) · звук {}{}",
                 stat_frames as f64 / secs,
                 stat_updates as f64 / secs,
                 skipped - stat_skipped0,
@@ -1009,6 +1010,8 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 if sh.peer_opus.load(Ordering::Relaxed) { "Opus" } else { "обычный" },
                 if glitches > 0 { format!(" · пропуски в захвате звука: {glitches}") } else { String::new() },
             ));
+            let backend = match &cap { Cap::Screen(_) => "Desktop Duplication", Cap::Window(_) => "WGC window", Cap::Monitor(_) => "WGC monitor" };
+            ui::diag(&format!("Захват: {backend}; очередь отправки: {} кадров", sh.backlog.load(Ordering::Relaxed)));
             stat_resent0 = resent;
             stat_updates = 0;
             stat_skipped0 = skipped;

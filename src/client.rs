@@ -1824,6 +1824,8 @@ impl App {
         let (pw, ph) = (p.w as usize, p.h as usize);
         if pw == 0 || p.px.len() < pw * ph {
             buf.fill(0);
+        } else if pw == ww && ph == wh {
+            buf.copy_from_slice(&p.px[..pw * ph]);
         } else if !crate::scale::matches_window(pw, ph, ww, wh) {
             // The window was resized and the decoder has not caught up yet: stretch smoothly instead of black bars.
             crate::scale::blit_fit(&mut buf, ww, wh, &p.px, pw, ph);
