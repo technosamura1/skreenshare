@@ -33,6 +33,18 @@ mod easy;
 #[path = "../../../src/friends.rs"]
 #[allow(dead_code)]
 mod friends;
+// The simulator reuses the production packet code, which now depends on authenticated
+// encryption. Compile the real crypto module instead of replacing it with fake encryption.
+#[path = "../../../src/crypto.rs"]
+#[allow(dead_code)]
+mod crypto;
+// The host GUI owns a runtime-delivered friend key; the standalone simulator has no UI.
+// Its own tests install keys explicitly through net::install_session_key/media_key.
+mod ui {
+    pub fn take_media_pair() -> Option<[u8; 32]> {
+        None
+    }
+}
 #[path = "../../../src/viewperf.rs"]
 #[allow(dead_code)]
 mod viewperf;
