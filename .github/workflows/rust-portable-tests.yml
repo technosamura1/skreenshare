@@ -1,0 +1,19 @@
+name: Rust portable regression tests
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "tools/lossim/**"
+      - "vendor/opus/**"
+      - ".github/workflows/rust-portable-tests.yml"
+  workflow_dispatch:
+
+jobs:
+  portable-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run portable Rust regression suite
+        run: cargo test --manifest-path tools/lossim/Cargo.toml --locked
