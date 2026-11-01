@@ -254,6 +254,7 @@ fn open_screen(monitor: &MonitorInfo) -> Result<Cap> {
             Err(e) => crate::net::conn_log(&format!("захват экрана через Windows Graphics Capture не вышел ({e:#}); Desktop Duplication")),
         }
     }
+    crate::net::conn_log("захват экрана: Desktop Duplication (оверлей будет скрыт)");
     Ok(Cap::Screen(Capturer::new(monitor)?))
 }
 
@@ -690,7 +691,11 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     let mut fid = 0u32;
     let mut stat_t = Instant::now();
     let mut stat_frames = 0u32;
-    let mut stat_enc = Duration::ZERO;
+    // Measure the expensive host-side stages separately, to diagnose 60/144 FPS limits.
+    let mut stat_prep = Duration::ZERO;
+    let mut stat_encode = Duration::ZERO;
+    let mut stat_prep_peak = Duration::ZERO;
+    let mut stat_encode_peak = Duration::ZERO;
     let mut stat_bytes0 = 0u64;
     let mut flash = crate::avsync::FlashEdge::default();
     let mut rc = if o.auto_bitrate {
@@ -841,7 +846,13 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             match open_requested(req, &monitor, matches!(cap, Cap::Screen(_) | Cap::Monitor(_))) {
                 Ok(Some(n)) => {
                     // Hide the overlay and wait for the paint thread before an unsafe capture takes over.
-                    sync_annotation_capture(&n.cap, &annot_capture_safe, &annot_paused)?;
+                    if let Err(e) = sync_annotation_capture(&n.cap, &annot_capture_safe, &annot_paused) {
+                        // The requested backend is not safe to activate. Keep the old capture,
+                        // restoring its overlay policy rather than ending the running stream.
+                        annot_capture_safe.store(matches!(cap, Cap::Window(_) | Cap::Monitor(_)), Ordering::SeqCst);
+                        ui::source_status(&format!("Переключение отменено: {e:#}"), true);
+                        continue;
+                    }
                     // The old capture is released only now, after the new one works.
                     cap = n.cap;
                     window_title = n.title;
@@ -948,6 +959,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         {
             crate::avsync::log("host_video", crate::avsync::now_us());
         }
+        let prep_time = t0.elapsed();
+        stat_prep += prep_time;
+        stat_prep_peak = stat_prep_peak.max(prep_time);
+        let encode_started = Instant::now();
         let key_now = force_key;
         e.encode(key_now, |data, key| {
             sh.backlog.fetch_add(1, Ordering::Relaxed);
@@ -959,7 +974,9 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 sh.keyreq.store(true, Ordering::Relaxed);
             }
         })?;
-        stat_enc += t0.elapsed();
+        let encode_time = encode_started.elapsed();
+        stat_encode += encode_time;
+        stat_encode_peak = stat_encode_peak.max(encode_time);
         if key_now {
             gate.note_key(Instant::now());
         }
@@ -977,7 +994,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             let glitches = crate::audio::CAPTURE_GLITCHES.load(Ordering::Relaxed);
             let skipped = sh.skipped_busy.load(Ordering::Relaxed);
             ui::stat(&format!(
-                "{enc_short} · {:.0} кадров/с (экран обновился {:.0}/с, отложено из-за сети {}) · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · кодирование {:.1} мс · звук {}{}",
+                "{enc_short} · {:.0} кадров/с (экран обновился {:.0}/с, отложено из-за сети {}) · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · подготовка {:.1}/{:.1} мс, кодирование {:.1}/{:.1} мс (ср/макс) · звук {}{}",
                 stat_frames as f64 / secs,
                 stat_updates as f64 / secs,
                 skipped - stat_skipped0,
@@ -985,7 +1002,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 rc.cur,
                 loss * 100.0,
                 resent - stat_resent0,
-                if stat_frames > 0 { stat_enc.as_secs_f64() * 1000.0 / stat_frames as f64 } else { 0.0 },
+                if stat_frames > 0 { stat_prep.as_secs_f64() * 1000.0 / stat_frames as f64 } else { 0.0 },
+                stat_prep_peak.as_secs_f64() * 1000.0,
+                if stat_frames > 0 { stat_encode.as_secs_f64() * 1000.0 / stat_frames as f64 } else { 0.0 },
+                stat_encode_peak.as_secs_f64() * 1000.0,
                 if sh.peer_opus.load(Ordering::Relaxed) { "Opus" } else { "обычный" },
                 if glitches > 0 { format!(" · пропуски в захвате звука: {glitches}") } else { String::new() },
             ));
@@ -994,7 +1014,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             stat_skipped0 = skipped;
             stat_t = Instant::now();
             stat_frames = 0;
-            stat_enc = Duration::ZERO;
+            stat_prep = Duration::ZERO;
+            stat_encode = Duration::ZERO;
+            stat_prep_peak = Duration::ZERO;
+            stat_encode_peak = Duration::ZERO;
             stat_bytes0 = bytes;
         }
     }
