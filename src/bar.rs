@@ -20,6 +20,7 @@ pub enum Hit {
     React(usize),
     /// The button that opens the sticker picker.
     More,
+    Laser,
     /// A sticker in the open picker (its number in stickers.rs).
     Pick(usize),
 }
@@ -37,10 +38,10 @@ const MIN_TRACK: i32 = 40;
 /// Remote-control button: icon + count + label, or icon + count only in a narrow window.
 const CTL_W: i32 = 150;
 const CTL_W_COMPACT: i32 = 76;
-/// Reaction stickers right of the volume: 4 quick ones + the picker button, and the space between them.
+/// Reaction stickers right of the volume: 4 quick ones + laser + the picker button, and the space between them.
 const RBTN: i32 = 40;
 const RGAP: i32 = 2;
-const RN: i32 = 5;
+const RN: i32 = 6;
 const REACT_W: i32 = RN * RBTN + (RN - 1) * RGAP;
 /// The sticker picker above the bar: columns, cell size, sticker size, padding.
 const PICK_COLS: i32 = 6;
@@ -200,7 +201,7 @@ impl Bar {
             return Hit::Control;
         }
         if let Some(i) = (0..RN as usize).find(|&i| self.react && inside(self.react_rect(i))) {
-            return if i == RN as usize - 1 { Hit::More } else { Hit::React(i) };
+            return match i { 4 => Hit::Laser, 5 => Hit::More, _ => Hit::React(i) };
         }
         let (x0, x1, yc) = self.track();
         let pad = 10 * self.s;
@@ -232,6 +233,7 @@ pub struct State {
     pub armed: Option<usize>,
     /// The sticker picker is open.
     pub picker: bool,
+    pub laser: bool,
     /// The quick stickers (numbers in stickers.rs), left to right.
     pub favs: [usize; 4],
 }
@@ -506,6 +508,12 @@ pub fn draw(buf: &mut [u32], w: i32, h: i32, b: &Bar, st: &State) {
             let img = crate::stickers::get(id, size, t);
             crate::stickers::blit(c.buf, c.w, c.h, r.0 + r.2 / 2, r.1 + r.3 / 2, size, &img, c.k);
         }
+        let lr = b.react_rect(4);
+        if st.laser { c.round(lr.0, lr.1, lr.2, lr.3, 12 * s, ACCENT, 0.55); }
+        else { hov(&mut c, lr, st.hover == Hit::Laser); }
+        let (lx, ly) = (lr.0 + lr.2 / 2, lr.1 + lr.3 / 2);
+        c.disc(lx, ly, 9.0 * s as f32, RED, 0.25);
+        c.disc(lx, ly, 4.0 * s as f32, RED, 1.0);
         let r = b.react_rect(RN as usize - 1);
         if st.picker {
             c.round(r.0, r.1, r.2, r.3, 12 * s, ACCENT, 0.55);
@@ -625,7 +633,7 @@ mod tests {
     use super::*;
 
     fn st() -> State {
-        State { level: 0.75, muted: false, has_audio: true, net: Some(0), fullscreen: false, hover: Hit::Outside, opacity: 1.0, time: 0.4, ctl: None, armed: None, picker: false, favs: crate::stickers::FAVORITES }
+        State { level: 0.75, muted: false, has_audio: true, net: Some(0), fullscreen: false, hover: Hit::Outside, opacity: 1.0, time: 0.4, ctl: None, armed: None, picker: false, laser: false, favs: crate::stickers::FAVORITES }
     }
 
     #[test]
@@ -704,9 +712,9 @@ mod tests {
             assert!(b.react);
             let (_, x1, _) = b.track();
             assert!(b.text_x() > x1);
-            for i in 0..5 {
+            for i in 0..6 {
                 let r = b.react_rect(i);
-                assert_eq!(b.hit(r.0 + r.2 / 2, r.1 + r.3 / 2), if i == 4 { Hit::More } else { Hit::React(i) });
+                assert_eq!(b.hit(r.0 + r.2 / 2, r.1 + r.3 / 2), match i { 4 => Hit::Laser, 5 => Hit::More, _ => Hit::React(i) });
                 assert!(r.0 >= b.text_x() + TEXT_W);
                 assert!(r.0 + r.2 <= if ctl { b.ctl_rect().0 } else { b.lamp_left() });
             }

@@ -215,37 +215,38 @@ fn start_audio(make_sink: &dyn Fn() -> AudioSink, want: AudioPlan, fallback: Aud
 enum Cap {
     Screen(Capturer),
     Window(Box<WindowCapturer>),
-    /// The whole monitor through Windows Graphics Capture: used while the viewer's laser pointer and stickers are
-    /// shown here, because Desktop Duplication would put them into the stream (it ignores WDA_EXCLUDEFROMCAPTURE).
+    /// Whole monitor through WGC on systems with border control. DDA uses its own exclusion flag.
     Monitor(Box<WindowCapturer>),
 }
 
 /// Prevent Desktop Duplication from seeing the host overlay, including the control-request banner.
 /// Wait for the overlay thread's acknowledgement, not an arbitrary sleep: drawing can be delayed.
-fn sync_annotation_capture(cap: &Cap, capture_safe: &AtomicBool, paused: &AtomicBool) -> Result<()> {
-    let safe = matches!(cap, Cap::Window(_) | Cap::Monitor(_));
+fn sync_annotation_capture(cap: &Cap, capture_safe: &AtomicBool, paused: &AtomicBool,
+    exclusion: &Mutex<Option<crate::captureexclude::Exclusion>>) -> Result<()> {
+    // Pause before EVERY backend transition; confirmation must match the actual backend.
     paused.store(false, Ordering::SeqCst);
-    capture_safe.store(safe, Ordering::SeqCst);
-    if !safe {
-        let start = Instant::now();
-        while !paused.load(Ordering::Acquire) {
-            if start.elapsed() > Duration::from_secs(2) {
-                bail!("не удалось скрыть указку и стикеры до включения Desktop Duplication");
-            }
-            std::thread::sleep(Duration::from_millis(2));
+    capture_safe.store(false, Ordering::SeqCst);
+    let start = Instant::now();
+    while !paused.load(Ordering::Acquire) {
+        if start.elapsed() > Duration::from_secs(2) {
+            bail!("не удалось дождаться скрытия указки и стикеров перед переключением захвата");
         }
-        crate::net::conn_log("Desktop Duplication: оверлей скрыт до начала захвата");
+        std::thread::sleep(Duration::from_millis(2));
     }
+    let dda = matches!(cap, Cap::Screen(_));
+    let safe = crate::captureexclude::allows(*exclusion.lock().unwrap(), dda);
+    capture_safe.store(safe, Ordering::SeqCst);
+    crate::net::conn_log(&format!("оверлей: backend={}, разрешён={safe}", if dda { "DDA" } else { "WGC" }));
     Ok(())
 }
 
 /// The whole monitor: through Windows Graphics Capture when the pointer/sticker overlay is on (so it
 /// stays out of the stream), else (or when that fails) Desktop Duplication as always.
 fn open_screen(monitor: &MonitorInfo) -> Result<Cap> {
-    // Desktop Duplication leaves such windows out only on some Windows builds (yes on 11 build 26300 here; a friend
-    // still saw the stickers in his stream with it), so it is never trusted with them. SS_CAPTURE=dd forces it.
+    // Windows 10 client builds cannot disable the WGC border. Prefer DDA there;
+    // its overlay exclusion is verified separately through WCA_EXCLUDED_FROM_DDA.
     let forced = std::env::var("SS_CAPTURE").unwrap_or_default();
-    if crate::annotview::load_enabled() && forced != "dd" {
+    if crate::captureexclude::use_wgc_monitor(crate::glass::build_number(), crate::annotview::load_enabled(), &forced) {
         match WindowCapturer::new_monitor(monitor.left + monitor.width as i32 / 2, monitor.top + monitor.height as i32 / 2) {
             Ok(w) => {
                 crate::net::conn_log("захват экрана: Windows Graphics Capture (указка и стикеры не попадают в трансляцию)");
@@ -254,7 +255,7 @@ fn open_screen(monitor: &MonitorInfo) -> Result<Cap> {
             Err(e) => crate::net::conn_log(&format!("захват экрана через Windows Graphics Capture не вышел ({e:#}); Desktop Duplication")),
         }
     }
-    crate::net::conn_log("захват экрана: Desktop Duplication (оверлей будет скрыт)");
+    crate::net::conn_log("захват экрана: Desktop Duplication (без системной рамки; оверлей проверяется отдельно)");
     Ok(Cap::Screen(Capturer::new(monitor)?))
 }
 
@@ -449,6 +450,7 @@ pub fn run(o: HostOpts) -> Result<()> {
 }
 
 fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: MonitorInfo, o: &HostOpts) -> Result<()> {
+    let _awake = crate::keepawake::SessionAwake::acquire()?;
     let sh = Arc::new(Shared {
         running: AtomicBool::new(true),
         keyreq: AtomicBool::new(true),
@@ -478,6 +480,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     // Control receiver owns annot_view; the capture loop needs the same safety/acknowledgement flags.
     let annot_capture_safe = annot_view.capture_safe.clone();
     let annot_paused = annot_view.paused.clone();
+    let annot_exclusion = annot_view.exclusion.clone();
     let (nack_tx, nack_rx) = mpsc::channel::<(u32, Vec<u16>)>();
     let (rep_tx, rep_rx) = mpsc::channel::<crate::ratectl::ReportDelta>();
 
@@ -663,7 +666,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             open_screen(&monitor)?
         }
     };
-    sync_annotation_capture(&cap, &annot_capture_safe, &annot_paused)?;
+    sync_annotation_capture(&cap, &annot_capture_safe, &annot_paused, &annot_exclusion)?;
     // The window whose process is the sound source (None while a whole screen is shown).
     let mut audio_window = match &cap {
         Cap::Window(_) => o.window,
@@ -820,7 +823,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     format!("Захват окна «{}» не удался", crate::source::ellipsize(&title, 40))
                 };
                 let next_cap = fall_back_to_screen(&why, &monitor)?;
-                sync_annotation_capture(&next_cap, &annot_capture_safe, &annot_paused)?;
+                sync_annotation_capture(&next_cap, &annot_capture_safe, &annot_paused, &annot_exclusion)?;
                 cap = next_cap;
                 audio_window = None; // back to the system sound without Discord
                 audio_dirty = true;
@@ -846,10 +849,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             match open_requested(req, &monitor, matches!(cap, Cap::Screen(_) | Cap::Monitor(_))) {
                 Ok(Some(n)) => {
                     // Hide the overlay and wait for the paint thread before an unsafe capture takes over.
-                    if let Err(e) = sync_annotation_capture(&n.cap, &annot_capture_safe, &annot_paused) {
+                    if let Err(e) = sync_annotation_capture(&n.cap, &annot_capture_safe, &annot_paused, &annot_exclusion) {
                         // The requested backend is not safe to activate. Keep the old capture,
                         // restoring its overlay policy rather than ending the running stream.
-                        annot_capture_safe.store(matches!(cap, Cap::Window(_) | Cap::Monitor(_)), Ordering::SeqCst);
+                        annot_capture_safe.store(crate::captureexclude::allows(*annot_exclusion.lock().unwrap(), matches!(cap, Cap::Screen(_))), Ordering::SeqCst);
                         ui::source_status(&format!("Переключение отменено: {e:#}"), true);
                         continue;
                     }

@@ -22,10 +22,11 @@ pub struct AnnotView {
     stop: Arc<AtomicBool>,
     /// The host's "show the viewer's pointer and reactions" switch.
     pub enabled: Arc<AtomicBool>,
-    /// Set by the capture loop. Desktop Duplication must never capture the overlay.
+    /// Set by the capture loop after checking exclusion for the selected backend.
     pub capture_safe: Arc<AtomicBool>,
     /// Acknowledgement from the draw thread that the overlay is hidden.
     pub paused: Arc<AtomicBool>,
+    pub exclusion: Arc<Mutex<Option<crate::captureexclude::Exclusion>>>,
     got_any: AtomicBool,
 }
 
@@ -38,26 +39,28 @@ impl AnnotView {
         // Fail closed until the capture backend has been selected.
         let capture_safe = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
+        let exclusion = Arc::new(Mutex::new(None));
+        let ex = exclusion.clone();
         let (b, s, e, c, p) = (board.clone(), stop.clone(), enabled.clone(), capture_safe.clone(), paused.clone());
         std::thread::Builder::new()
             .name("annot-view".into())
             .spawn(move || {
-                if let Err(err) = run(&b, &s, &e, &c, &p, &region, input.as_deref()) {
+                if let Err(err) = run(&b, &s, &e, &c, &p, &region, input.as_deref(), &ex) {
                     crate::net::conn_log(&format!("указка: окно не создано: {err}"));
+                    c.store(false, Ordering::Release);
+                    p.store(true, Ordering::Release);
                 }
             })
             .ok();
-        AnnotView { board, stop, enabled, capture_safe, paused, got_any: AtomicBool::new(false) }
+        AnnotView { board, stop, enabled, capture_safe, paused, exclusion, got_any: AtomicBool::new(false) }
     }
 
     pub fn on_packet(&self, body: &[u8]) {
-        if !self.enabled.load(Ordering::Relaxed) {
-            return;
-        }
         if let Some(f) = annot::decode(body) {
             if !self.got_any.swap(true, Ordering::Relaxed) {
-                crate::net::conn_log("указка/реакции: первый пакет от зрителя");
+                crate::net::conn_log(&format!("указка/реакции: первый пакет от зрителя, включены={}, разрешён показ={}", self.enabled.load(Ordering::Relaxed), self.capture_safe.load(Ordering::Relaxed)));
             }
+            if !self.enabled.load(Ordering::Relaxed) { return; }
             self.board.lock().unwrap().on_frame(Instant::now(), &f);
         }
     }
@@ -104,10 +107,11 @@ fn run(
     paused: &AtomicBool,
     region: &Mutex<Option<Region>>,
     input: Option<&inputhost::InputHost>,
+    exclusion: &Mutex<Option<crate::captureexclude::Exclusion>>,
 ) -> Result<()> {
     // Explicit screenshot/debug override. Otherwise the overlay stays hidden if Windows
     // does not actually confirm its exclusion affinity.
-    let mut affinity_ok = std::env::var("SS_ANNOT_VISIBLE").is_ok();
+    let debug_visible = std::env::var("SS_ANNOT_VISIBLE").is_ok();
     let hwnd = unsafe {
         let inst = GetModuleHandleW(None)?;
         let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: inst.into(), lpszClassName: w!("ScreenshareAnnot"), ..Default::default() };
@@ -126,19 +130,11 @@ fn run(
             Some(inst.into()),
             None,
         )?;
-        // SS_ANNOT_VISIBLE is only for deliberate screenshot debugging.
-        if !affinity_ok {
-            let r = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE);
-            let mut got = 0u32;
-            let checked = GetWindowDisplayAffinity(h, &mut got);
-            affinity_ok = r.is_ok() && checked.is_ok() && got == WDA_EXCLUDEFROMCAPTURE.0;
-            crate::net::conn_log(&format!("указка: исключение из захвата: {r:?}, проверка {checked:?}, сейчас {got:#x}"));
-        }
+        let mut excluded = crate::captureexclude::apply(h);
+        if debug_visible { excluded = crate::captureexclude::Exclusion { wgc: true, dda: true }; }
+        *exclusion.lock().unwrap() = Some(excluded);
         h
     };
-    if !affinity_ok {
-        crate::net::conn_log("указка/стикеры скрыты: Windows не подтвердила исключение окна из захвата");
-    }
     let mut gfx: Option<Gfx> = None;
     let mut shown = false;
     let mut last_drawn: Option<(Option<(i32, i32)>, usize, bool)> = None;
@@ -156,7 +152,7 @@ fn run(
         let reg = *region.lock().unwrap();
         let asking = input.is_some_and(|i| i.asking(now));
         let mut b = board.lock().unwrap();
-        let can_draw = capture_safe.load(Ordering::Acquire) && affinity_ok;
+        let can_draw = capture_safe.load(Ordering::Acquire);
         let busy = can_draw && ((enabled.load(Ordering::Relaxed) && b.busy(now)) || asking);
         let (Some(reg), true) = (reg, busy) else {
             drop(b);
@@ -363,6 +359,8 @@ fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, 
 pub fn demo(region: Region) {
     let v = AnnotView::spawn(Arc::new(Mutex::new(Some(region))), None);
     v.enabled.store(true, Ordering::Relaxed);
+    // No capture exists in this standalone visual demo.
+    v.capture_safe.store(true, Ordering::Release);
     let mut s = annot::Sender::new(1);
     let t0 = Instant::now();
     let mut next_r = 0;

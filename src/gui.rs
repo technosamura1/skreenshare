@@ -121,20 +121,20 @@ impl Palette {
                 glass,
                 anim: look.anim,
                 accent,
-                bg: rgb(0x1b2838),
-                bg2: rgb(0x141d2a),
-                side: rgb(0x10161f),
-                border: rgb(0x2f4259),
-                card: rgb(0x1f2e42),
-                card_hover: rgb(0x293b52),
-                field: rgb(0x142031),
-                text: rgb(0xe9eff7),
-                muted: rgb(0x93a5bc),
+                bg: rgb(0x1c1d20),
+                bg2: rgb(0x1c1d20),
+                side: rgb(0x141518),
+                border: rgb(0x33353b),
+                card: rgb(0x242529),
+                card_hover: rgb(0x2c2d33),
+                field: rgb(0x191a1e),
+                text: rgb(0xecedef),
+                muted: rgb(0xa0a3ad),
                 green: rgb(0x3ecf8e),
                 yellow: rgb(0xf0b43c),
                 red: rgb(0xf0605f),
-                tile2: rgb(0x2b3d55),
-                widget_hover: rgb(0x34496a),
+                tile2: rgb(0x303138),
+                widget_hover: rgb(0x363840),
             }
         };
         if glass {
@@ -262,7 +262,7 @@ fn apply_theme(ctx: &egui::Context, look: lg::Look, glass: bool) {
         s.visuals = if look.light { egui::Visuals::light() } else { egui::Visuals::dark() };
         let v = &mut s.visuals;
         v.panel_fill = pl.bg;
-        v.window_fill = if glass { rgb(0x1f2e42) } else { pl.card };
+        v.window_fill = if glass { rgb(0x242529) } else { pl.card };
         v.extreme_bg_color = pl.field;
         v.override_text_color = Some(pl.text);
         v.selection.bg_fill = pl.accent;
@@ -833,6 +833,7 @@ enum Page {
     Join,
     /// "Друзья": add once, then invite onto a stream.
     Friends,
+    Profile,
     /// "Настройки": look and the self-test entry.
     Settings,
     /// "О программе".
@@ -957,6 +958,7 @@ enum FriendNetKind {
     Inbox,
     Pair { id: [u8; 16], since: String },
     Presence,
+    ProfileSent { id: [u8; 16], profile: friends::Profile },
 }
 
 struct FriendNet {
@@ -970,6 +972,14 @@ struct GuiApp {
     asked_seen: bool,
     /// Settings tab: 0 quality of the stream, 1 look, 2 checks.
     settings_tab: u32,
+    broadcast_target: Option<[u8; 16]>,
+    manual_broadcast: bool,
+    profile_draft: friends::Profile,
+    profile_sent: HashMap<[u8; 16], friends::Profile>,
+    profile_error: Option<String>,
+    friend_search: String,
+    online_only: bool,
+    viewed_profile: Option<[u8; 16]>,
     monitors: Vec<String>,
     /// Position and size of every monitor on the desktop (for the picker's pictures).
     rects: Vec<(i32, i32, u32, u32)>,
@@ -1042,10 +1052,16 @@ struct GuiApp {
     friend_cursors: friends::Cursors,
     /// Pending invitations already announced with a taskbar flash (a new one flashes again).
     friend_invites_flashed: usize,
+    presence_attempt: HashMap<[u8; 16], Instant>,
     friend_last_seen: HashMap<[u8; 16], u64>,
     /// Invites waiting for «Смотреть». A second one must not erase the first: the relay cursor
     /// already moved past both, so the overwritten invite would never come back.
     friend_pending_invites: Vec<(friends::Invite, [u8; 16])>,
+    watch_requests: friends::WatchInbox,
+    watch_cancel_wait: Option<([u8; 16], String)>,
+    watch_cancel_post: Option<([u8; 16], String, Receiver<Result<(), String>>)>,
+    watch_post: Option<([u8; 16], String)>,
+    watch_sent: HashMap<[u8; 16], (String, Instant)>,
     /// Offer we accepted: (friend, nonce). The viewer's C… code is posted back once the client prints it.
     friend_answer: Option<([u8; 16], String)>,
     /// After adding or inviting a friend, speed up the entire fair cycle.
@@ -1122,6 +1138,14 @@ impl GuiApp {
         GuiApp {
             page: if first_run { Page::Welcome } else { Page::Host },
             settings_tab: 0,
+            broadcast_target: None,
+            manual_broadcast: false,
+            profile_draft: Default::default(),
+            profile_sent: HashMap::new(),
+            profile_error: None,
+            friend_search: String::new(),
+            online_only: false,
+            viewed_profile: None,
             asked_seen: false,
             monitors,
             rects: mons.iter().map(|m| (m.left, m.top, m.width, m.height)).collect(),
@@ -1169,10 +1193,16 @@ impl GuiApp {
             friend_poll_i: 0,
             friend_net: None,
             friend_post: None,
-            friend_cursors: friends::load_cursors(&friends::profile_dir()),
+            friend_cursors: friends::load_cursors(&crate::ntfy::cursor_dir()),
             friend_invites_flashed: 0,
+            presence_attempt: HashMap::new(),
             friend_last_seen: HashMap::new(),
             friend_pending_invites: Vec::new(),
+            watch_requests: friends::WatchInbox::default(),
+            watch_cancel_wait: None,
+            watch_cancel_post: None,
+            watch_post: None,
+            watch_sent: HashMap::new(),
             friend_answer: None,
             friend_rush_ids: HashMap::new(),
             friend_rename_input: String::new(),
@@ -1192,6 +1222,11 @@ impl GuiApp {
         match self.page {
             Page::Host => {
                 self.host = None;
+                self.broadcast_target = None;
+                self.manual_broadcast = false;
+                self.friend_invite_wait.clear();
+                self.friend_invite_since = None;
+                self.friend_invite_autostart = false;
                 self.ctl.allow = false; // consent ends with the session
             }
             Page::Join => self.join = None,
@@ -1352,6 +1387,7 @@ impl GuiApp {
             Page::Pads => 40,
             Page::Control => 41,
             Page::Friends => 50,
+            Page::Profile => 51,
         }
     }
 }
@@ -1473,7 +1509,7 @@ impl eframe::App for GuiApp {
                     self.status_bar(ui);
                 });
             egui::Panel::left("side")
-                .exact_size(236.0)
+                .exact_size(216.0)
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(egui::Frame::new().fill(c_side()).inner_margin(Margin { left: 16, right: 16, top: 20, bottom: 14 }))
@@ -1483,12 +1519,42 @@ impl eframe::App for GuiApp {
                     self.sidebar(ui);
                 });
         }
+        if let Some(id) = self.viewed_profile {
+            let profile = self.book.profiles.get(&id).cloned().unwrap_or_default();
+            let name = if profile.name.is_empty() { self.book.friends.iter().find(|f| f.id == id).map(|f| f.name.clone()).unwrap_or_default() } else { profile.name.clone() };
+            let online = friends::is_online(self.friend_last_seen.get(&id).copied(), unix_now(), self.book.friends.len());
+            let mut open = true;
+            egui::Window::new("Профиль друга").collapsible(false).resizable(false).open(&mut open).show(ui.ctx(), |ui| {
+                crate::profileui::avatar(ui, &profile, id, 88.0);
+                ui.heading(name);
+                ui.label(if online { "● В сети" } else { "○ Не в сети" });
+                if !profile.status.is_empty() { ui.label(&profile.status); }
+            });
+            if !open { self.viewed_profile = None; }
+        }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             page_bg(ui.painter(), ui.max_rect());
+            // Requests remain reachable even when the current page is scrolled down.
+            egui::Frame::new().inner_margin(Margin::symmetric(24, 8)).show(ui, |ui| {
+                self.control_ask(ui);
+                if self.host.as_ref().is_some_and(|s| s.active() && s.ctrl.is_some_and(|c| c.on)) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Зрителю разрешено управление").color(c_yellow()));
+                        if ui.button("Забрать управление").clicked() {
+                            self.ctl.allow = false;
+                            if let Some(s) = &mut self.host {
+                                s.proc.send(&lg::control_line(false, self.ctl.pad, self.ctl.kbm));
+                            }
+                        }
+                    });
+                }
+                self.watch_request_card(ui);
+                self.friend_invite_card(ui);
+            });
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 // A centred column, at most 800 px wide, with air around it.
                 let avail = ui.available_width();
-                let w = (avail - 2.0 * 32.0).clamp(300.0, 800.0);
+                let w = (avail - 2.0 * 24.0).clamp(280.0, 1000.0);
                 let left = ((avail - w) / 2.0).max(0.0);
                 let sp = ui.spacing().item_spacing;
                 ui.add_space(24.0);
@@ -1504,8 +1570,6 @@ impl eframe::App for GuiApp {
                             ui.add_space((1.0 - tr) * 16.0);
                             ui.ctx().request_repaint();
                         }
-                        self.control_ask(ui);
-                        self.friend_invite_card(ui);
                         match self.page {
                             Page::Welcome => self.welcome(ui),
                             Page::Host => self.host_page(ui),
@@ -1516,6 +1580,7 @@ impl eframe::App for GuiApp {
                             Page::Pads => self.pads_page(ui),
                             Page::Control => self.control_page(ui),
                             Page::Friends => self.friends_page(ui),
+                            Page::Profile => self.profile_page(ui),
                         }
                         ui.add_space(24.0);
                     });
@@ -1532,7 +1597,7 @@ impl GuiApp {
         let asked = self.host.as_ref().is_some_and(|s| !s.ended && s.ctrl.is_some_and(|c| c.asked && !c.on));
         let flash_ask = asked && !self.asked_seen;
         self.asked_seen = asked;
-        let invites = self.friend_pending_invites.len();
+        let invites = self.friend_pending_invites.len() + self.watch_requests.pending.len();
         let flash_invite = invites > self.friend_invites_flashed;
         self.friend_invites_flashed = invites;
         if flash_ask || flash_invite {
@@ -1643,7 +1708,7 @@ impl GuiApp {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.label(RichText::new("screenshare").font(bold(17.0)));
-                ui.label(RichText::new("напрямую, без серверов").color(c_muted()).size(11.5));
+                ui.label(RichText::new("Экран · звук · друзья").color(c_muted()).size(11.5));
             });
         });
         ui.add_space(24.0);
@@ -1660,6 +1725,7 @@ impl GuiApp {
         let host_live = dot(&self.host);
         let join_live = dot(&self.join);
         if nav_item(ui, Ico::Monitor, "Транслировать", self.page == Page::Host, host_live) && self.page != Page::Host {
+            if !self.host.as_ref().is_some_and(Session::active) { self.host = None; self.broadcast_target = None; self.manual_broadcast = false; }
             self.windows = wincap::list_windows();
             self.thumbs.last_list = Instant::now();
             self.page = Page::Host;
@@ -1683,14 +1749,30 @@ impl GuiApp {
         // Remote control lives here, under the two main items: the switch and a status line, the rest on its own page.
         // Whatever does not fit the height at the smallest window size scrolls.
         ui.add_space(10.0);
-        let room = (ui.available_height() - (2.0 * 42.0 + 4.0 + 8.0)).max(60.0);
+        let room = (ui.available_height() - (2.0 * 42.0 + 4.0 + 8.0 + 88.0)).max(60.0);
         let mut open = false;
-        egui::ScrollArea::vertical().max_height(room).auto_shrink([false, true]).show(ui, |ui| open = self.side_control(ui));
+        egui::ScrollArea::vertical().max_height(room).auto_shrink([false, true]).show(ui, |ui| {
+            egui::CollapsingHeader::new("Управление зрителя").default_open(false).show(ui, |ui| open = self.side_control(ui));
+        });
         if open {
             self.page = Page::Control;
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
+            let me = self.book.profiles.get(&self.book.me.id).cloned().unwrap_or_default();
+            let mut open = false;
+            egui::Frame::new().fill(c_field()).corner_radius(10).inner_margin(10).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    open |= crate::profileui::avatar(ui, &me, self.book.me.id, 36.0).clicked();
+                    ui.vertical(|ui| {
+                        ui.set_width(110.0);
+                        open |= ui.add(egui::Label::new(RichText::new(&self.book.me.name).font(bold(14.0))).truncate().sense(Sense::click())).on_hover_text("Изменить профиль").clicked();
+                        ui.label(RichText::new("● В сети").color(c_green()).size(11.5));
+                    });
+                });
+            });
+            if open { self.open_profile(); }
             if nav_item(ui, Ico::Info, "О программе", self.page == Page::About, None) {
                 self.page = Page::About;
             }
@@ -1986,6 +2068,7 @@ impl GuiApp {
     }
 
     fn spawn_friend_post(&mut self, topic: String, body: String, ok_text: String) {
+        self.watch_post = None;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let r = crate::ntfy::post(&topic, &body).map(|_| ok_text).map_err(|e| format!("{e:#}"));
@@ -1999,15 +2082,46 @@ impl GuiApp {
         match rx.try_recv() {
             Err(mpsc::TryRecvError::Empty) => self.friend_post = Some(rx),
             Ok(Ok(text)) => {
+                if let Some((id, nonce)) = self.watch_post.take() { self.watch_sent.insert(id, (nonce, Instant::now())); }
                 self.friend_ok = Some(text);
                 self.friend_error = None;
             }
             Ok(Err(e)) => {
+                self.watch_post = None;
                 self.friend_error = Some(e);
                 self.friend_ok = None;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
+                self.watch_post = None;
                 self.friend_error = Some("отправка прервалась".into());
+            }
+        }
+    }
+
+    fn drain_watch_cancel(&mut self) {
+        if let Some((id, nonce, rx)) = self.watch_cancel_post.take() {
+            match rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => self.watch_cancel_post = Some((id, nonce, rx)),
+                Ok(Ok(())) => {
+                    if self.watch_sent.get(&id).is_some_and(|(n, _)| *n == nonce) { self.watch_sent.remove(&id); }
+                    self.friend_error = None;
+                    self.friend_ok = Some("Запрос отменён.".into());
+                }
+                result => {
+                    let error = match result { Ok(Err(e)) => e, _ => "отправка прервалась".into() };
+                    self.friend_ok = None;
+                    self.friend_error = Some(format!("Отмена запроса не подтверждена: {error}. Повторите отмену, когда сервер будет доступен."));
+                }
+            }
+        }
+        if self.watch_cancel_post.is_none() && self.watch_post.is_none() {
+            if let Some((id, nonce)) = self.watch_cancel_wait.take() {
+                if let Some(msg) = self.book.cancel_watch(&id, &nonce, unix_now()) {
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::spawn(move || { let _ = tx.send(crate::ntfy::post(&msg.topic, &msg.body).map_err(|e| format!("{e:#}"))); });
+                    self.watch_cancel_post = Some((id, nonce, rx));
+                    self.friend_ok = Some("Отменяем запрос…".into());
+                } else { self.watch_sent.remove(&id); }
             }
         }
     }
@@ -2030,7 +2144,7 @@ impl GuiApp {
                 let next = friends::next_since(&self.friend_cursors.inbox, &lines).to_string();
                 if next != self.friend_cursors.inbox {
                     self.friend_cursors.inbox = next;
-                    friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
+                    friends::save_cursors(&crate::ntfy::cursor_dir(), &self.friend_cursors);
                 }
             }
             FriendNetKind::Pair { id, since } => {
@@ -2038,10 +2152,16 @@ impl GuiApp {
                 for line in &lines {
                     let Some(ev) = self.book.open_pair(&id, &line.message) else { continue };
                     match ev {
+                        PairEvent::WatchRequest { unix, nonce } => self.watch_requests.receive(id, unix, nonce, now),
+                        PairEvent::WatchCancel { unix, nonce } => self.watch_requests.cancel(id, unix, nonce, now),
+                        PairEvent::Profile { .. } => {
+                            friends::save_book(&friends::profile_dir(), &self.book);
+                        }
                         PairEvent::Presence { unix, .. } => {
                             self.friend_last_seen.insert(id, unix);
                         }
                         PairEvent::Invite(inv) => {
+                            self.watch_sent.remove(&id);
                             if friends::invite_fresh(inv.unix, now)
                                 && !self.friend_pending_invites.iter().any(|(i, fid)| i.nonce == inv.nonce && *fid == id)
                             {
@@ -2053,16 +2173,22 @@ impl GuiApp {
                                 s.proc.send(&code);
                             }
                         }
-                        PairEvent::Decline { .. } => {}
+                        PairEvent::Decline { nonce } => {
+                            if self.watch_sent.get(&id).is_some_and(|(n, _)| *n == nonce) {
+                                self.watch_sent.remove(&id);
+                                self.friend_ok = Some("Друг пока не готов транслировать.".into());
+                            }
+                        }
                     }
                 }
                 let new_since = friends::next_since(&since, &lines).to_string();
                 if new_since != since && self.book.pair_topic(&id).is_some() {
                     self.friend_cursors.set_pair(id, &new_since);
-                    friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
+                    friends::save_cursors(&crate::ntfy::cursor_dir(), &self.friend_cursors);
                 }
             }
             FriendNetKind::Presence => {}
+            FriendNetKind::ProfileSent { id, profile } => { self.profile_sent.insert(id, profile); }
         }
     }
 
@@ -2070,6 +2196,7 @@ impl GuiApp {
     /// once and poll it quickly for 90 s, so both sides see each other in seconds, not after a full cycle.
     fn friend_greet(&mut self, id: [u8; 16], hello: Option<friends::OutMsg>) {
         let Some(presence) = self.book.presence(&id, unix_now()) else { return };
+        self.presence_attempt.insert(id, Instant::now());
         let ours = hello.is_some();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -2083,6 +2210,7 @@ impl GuiApp {
             let _ = tx.send(r.map(|_| "Друг добавлен. Как только его программа будет запущена, он появится «в сети».".to_string()).map_err(|e| format!("{e:#}")));
         });
         if ours {
+            self.watch_post = None;
             self.friend_post = Some(rx);
         }
         self.friend_rush_ids.insert(id, Instant::now() + Duration::from_secs(90));
@@ -2093,6 +2221,7 @@ impl GuiApp {
     /// An empty list still polls the inbox — that is how the other side's hello arrives.
     fn friends_poll(&mut self) {
         self.drain_friend_post();
+        self.drain_watch_cancel();
         self.friend_flush_answer();
         if let Some(rx) = self.friend_net.take() {
             match rx.try_recv() {
@@ -2113,10 +2242,19 @@ impl GuiApp {
         if self.friend_poll_last.is_some_and(|t| t.elapsed().as_millis() < gap as u128) {
             return;
         }
-        self.friend_poll_last = Some(now);
-
         let op = friends::relay_op(n, self.friend_poll_i);
         self.friend_poll_i = self.friend_poll_i.wrapping_add(1);
+        if let friends::RelayOp::Profile(i) = op {
+            if self.profile_sent.get(&self.book.friends[i].id) == Some(&self.book.own_profile()) {
+                return; // No network slot consumed for an unchanged profile.
+            }
+        }
+        if let friends::RelayOp::Presence(i) = op {
+            let id = self.book.friends[i].id;
+            if !friends::presence_due(self.presence_attempt.get(&id).map(|t| t.elapsed().as_secs()), n) { return; }
+            self.presence_attempt.insert(id, now);
+        }
+        self.friend_poll_last = Some(now);
         if op == friends::RelayOp::Inbox {
             let topic = self.book.inbox_topic();
             let since = self.friend_cursors.inbox.clone();
@@ -2131,13 +2269,19 @@ impl GuiApp {
             self.spawn_friend_get(FriendNetKind::Pair { id, since: since.clone() }, topic, since);
             return;
         }
-        let friends::RelayOp::Presence(i) = op else { return };
+        let (i, profile) = match op {
+            friends::RelayOp::Presence(i) => (i, false),
+            friends::RelayOp::Profile(i) => (i, true),
+            _ => return,
+        };
         let id = ids[i];
-        if let Some(msg) = self.book.presence(&id, unix_now()) {
+        let msg = if profile { self.book.profile_message(&id, unix_now()) } else { self.book.presence(&id, unix_now()) };
+        if let Some(msg) = msg {
+            let kind = if profile { FriendNetKind::ProfileSent { id, profile: self.book.own_profile() } } else { FriendNetKind::Presence };
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
                 let body = crate::ntfy::post(&msg.topic, &msg.body).map(|_| String::new()).map_err(|e| format!("{e:#}"));
-                let _ = tx.send(FriendNet { kind: FriendNetKind::Presence, body });
+                let _ = tx.send(FriendNet { kind, body });
             });
             self.friend_net = Some(rx);
         }
@@ -2146,6 +2290,105 @@ impl GuiApp {
     fn friends_page(&mut self, ui: &mut egui::Ui) {
         page_head(ui, Ico::Friends, "Друзья", "Добавляйте друзей один раз — потом просто приглашайте на трансляцию");
 
+        ui.columns(2, |cols| {
+            if big_button_i(&mut cols[0], Some(Ico::Monitor), "Транслировать", c_accent(), true) {
+                if !self.host.as_ref().is_some_and(Session::active) { self.host = None; self.broadcast_target = None; self.manual_broadcast = false; }
+                self.page = Page::Host;
+            }
+            if big_button_i(&mut cols[1], Some(Ico::Eye), "Смотреть", c_card_hover(), true) { self.page = Page::Join; }
+        });
+        ui.add_space(12.0);
+        if let Some(e) = &self.friend_error { error_text(ui, e); }
+        if let Some(ok) = &self.friend_ok { ui.label(RichText::new(ok).color(c_green()).size(13.0)); }
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.online_only, false, "Все");
+            ui.selectable_value(&mut self.online_only, true, "В сети");
+            ui.add(egui::TextEdit::singleline(&mut self.friend_search).hint_text("Поиск друзей").desired_width(ui.available_width()));
+        });
+        ui.add_space(10.0);
+        if self.book.friends.is_empty() {
+            section(ui, |ui| {
+                ui.label(RichText::new("Пока никого нет").font(bold(16.0)));
+                ui.label(
+                    RichText::new("Добавьте друга по коду — или подождите, если свой код уже отправили ему.")
+                        .color(c_muted())
+                        .size(13.0),
+                );
+            });
+        } else {
+            let now = unix_now();
+            let n = self.book.friends.len();
+            let mut rows: Vec<([u8; 16], String, bool)> = self
+                .book
+                .friends
+                .iter()
+                .map(|f| {
+                    let online = friends::is_online(self.friend_last_seen.get(&f.id).copied(), now, n);
+                    (f.id, f.name.clone(), online)
+                })
+                .collect();
+            rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+            let query = self.friend_search.trim().to_lowercase();
+            rows.retain(|(_, name, online)| (!self.online_only || *online) && name.to_lowercase().contains(&query));
+            let mut to_remove: Option<[u8; 16]> = None;
+            let mut to_invite: Option<[u8; 16]> = None;
+            section(ui, |ui| {
+                ui.label(RichText::new(format!("Друзья ({})", rows.len())).font(bold(16.0)));
+                ui.add_space(4.0);
+                if rows.is_empty() { ui.label(RichText::new("Никого не найдено").color(c_muted())); }
+                for (id, name, online) in &rows {
+                    let profile = self.book.profiles.get(id).cloned().unwrap_or_default();
+                    egui::Frame::new().fill(c_field()).corner_radius(10).inner_margin(12).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            if crate::profileui::avatar(ui, &profile, id, 44.0).clicked() { self.viewed_profile = Some(*id); }
+                            ui.vertical(|ui| {
+                                ui.set_max_width((ui.available_width() - 170.0).max(100.0));
+                                ui.add(egui::Label::new(RichText::new(name).font(bold(15.0))).truncate()).on_hover_text(name);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(if *online { "● В сети" } else { "○ Не в сети" }).color(if *online { c_green() } else { c_muted() }).size(12.0));
+                                    if !profile.status.is_empty() { ui.add(egui::Label::new(RichText::new(&profile.status).color(c_muted()).size(12.0)).truncate()).on_hover_text(&profile.status); }
+                                });
+                            });
+                            if ui.button("Пригласить").on_hover_text("Пригласить посмотреть вашу трансляцию").clicked() { to_invite = Some(*id); }
+                            ui.menu_button("···", |ui| {
+                                if ui.button("Профиль").clicked() { self.viewed_profile = Some(*id); ui.close(); }
+                                if ui.button("Переименовать у себя").clicked() { self.friend_rename_id = Some(*id); self.friend_rename_input = name.clone(); ui.close(); }
+                                if ui.button("Убрать из друзей").clicked() { to_remove = Some(*id); ui.close(); }
+                            });
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+            if let Some(id) = to_remove {
+                self.book.remove(&id);
+                self.watch_sent.remove(&id);
+                self.watch_requests.pending.retain(|(fid, _, _)| *fid != id);
+                self.profile_sent.remove(&id);
+                if self.viewed_profile == Some(id) { self.viewed_profile = None; }
+                self.friend_last_seen.remove(&id);
+                self.friend_cursors.forget(&id);
+                friends::save_cursors(&crate::ntfy::cursor_dir(), &self.friend_cursors);
+                self.friend_rush_ids.remove(&id);
+                self.friend_poll_i = 0;
+                if self.friend_rename_id == Some(id) {
+                    self.friend_rename_id = None;
+                }
+                self.friend_pending_invites.retain(|(_, fid)| *fid != id);
+                if self.friend_answer.as_ref().is_some_and(|(fid, _)| *fid == id) {
+                    self.friend_answer = None;
+                }
+                friends::save_book(&friends::profile_dir(), &self.book);
+            }
+            if let Some(id) = to_invite {
+                let ctx = ui.ctx().clone();
+                self.invite_friend(&ctx, id);
+            }
+        }
+
+        egui::CollapsingHeader::new("Добавить друга или поделиться своим кодом")
+            .default_open(self.book.friends.is_empty()).show(ui, |ui| {
         section(ui, |ui| {
             ui.label(RichText::new("Ваш код друга").font(bold(16.0)));
             ui.label(
@@ -2176,12 +2419,6 @@ impl GuiApp {
             ui.label(RichText::new("Попросите друга показать его код из вкладки «Друзья». Вставьте его сюда.").color(c_muted()).size(13.0));
             ui.add_space(4.0);
             let enter = code_input(ui, &mut self.friend_code_input, "Код друга...");
-            if let Some(e) = &self.friend_error {
-                error_text(ui, e);
-            }
-            if let Some(ok) = &self.friend_ok {
-                ui.label(RichText::new(ok).color(c_green()).size(13.0));
-            }
             if big_button(ui, "Добавить друга", c_accent(), !self.friend_code_input.trim().is_empty()) || enter {
                 self.friend_error = None;
                 self.friend_ok = None;
@@ -2190,7 +2427,7 @@ impl GuiApp {
                     Ok(msg) => {
                         if let Some((id, _)) = friends::parse_code(&raw) {
                             self.friend_cursors.forget(&id);
-                            friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
+                            friends::save_cursors(&crate::ntfy::cursor_dir(), &self.friend_cursors);
                             self.friend_last_seen.remove(&id);
                         }
                         self.friend_poll_i = 0;
@@ -2206,97 +2443,7 @@ impl GuiApp {
             }
         });
 
-        if self.book.friends.is_empty() {
-            section(ui, |ui| {
-                ui.label(RichText::new("Пока никого нет").font(bold(16.0)));
-                ui.label(
-                    RichText::new("Добавьте друга по коду — или подождите, если свой код уже отправили ему.")
-                        .color(c_muted())
-                        .size(13.0),
-                );
             });
-        } else {
-            let now = unix_now();
-            let n = self.book.friends.len();
-            let rows: Vec<([u8; 16], String, bool)> = self
-                .book
-                .friends
-                .iter()
-                .map(|f| {
-                    let online = friends::is_online(self.friend_last_seen.get(&f.id).copied(), now, n);
-                    (f.id, f.name.clone(), online)
-                })
-                .collect();
-            let mut to_remove: Option<[u8; 16]> = None;
-            let mut to_invite: Option<[u8; 16]> = None;
-            section(ui, |ui| {
-                ui.label(RichText::new(format!("Друзья ({})", rows.len())).font(bold(16.0)));
-                ui.add_space(4.0);
-                for (id, name, online) in &rows {
-                    egui::Frame::new()
-                        .fill(if *online { c_green().gamma_multiply(0.08) } else { c_field() })
-                        .stroke(Stroke::new(1.0, if *online { c_green().gamma_multiply(0.3) } else { c_border() }))
-                        .corner_radius(12)
-                        .inner_margin(Margin::same(12))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-                                ui.painter().circle_filled(r.center(), 5.0, if *online { c_green() } else { c_muted() });
-                                ui.label(RichText::new(name).font(bold(15.0)));
-                                ui.label(
-                                    RichText::new(if *online { "в сети" } else { "не в сети" })
-                                        .color(if *online { c_green() } else { c_muted() })
-                                        .size(12.0),
-                                );
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("×").on_hover_text("Удалить").clicked() {
-                                        to_remove = Some(*id);
-                                    }
-                                    if ui.button("имя").on_hover_text("Переименовать").clicked() {
-                                        self.friend_rename_id = Some(*id);
-                                        self.friend_rename_input = name.clone();
-                                    }
-                                });
-                            });
-                        });
-                    ui.add_space(4.0);
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("Пригласить на трансляцию").size(13.0))
-                                .fill(c_accent().gamma_multiply(0.2))
-                                .stroke(Stroke::new(1.0, c_accent().gamma_multiply(0.4)))
-                                .corner_radius(8),
-                        )
-                        .clicked()
-                    {
-                        to_invite = Some(*id);
-                    }
-                    ui.add_space(8.0);
-                }
-            });
-            if let Some(id) = to_remove {
-                self.book.remove(&id);
-                self.friend_last_seen.remove(&id);
-                self.friend_cursors.forget(&id);
-                friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
-                self.friend_rush_ids.remove(&id);
-                self.friend_poll_i = 0;
-                if self.friend_rename_id == Some(id) {
-                    self.friend_rename_id = None;
-                }
-                self.friend_pending_invites.retain(|(_, fid)| *fid != id);
-                if self.friend_answer.as_ref().is_some_and(|(fid, _)| *fid == id) {
-                    self.friend_answer = None;
-                }
-                friends::save_book(&friends::profile_dir(), &self.book);
-            }
-            if let Some(id) = to_invite {
-                let ctx = ui.ctx().clone();
-                self.invite_friend(&ctx, id);
-            }
-        }
-
         if let Some(id) = self.friend_rename_id {
             section(ui, |ui| {
                 ui.label(RichText::new("Переименовать друга").font(bold(15.0)));
@@ -2316,12 +2463,78 @@ impl GuiApp {
         }
     }
 
+    fn open_profile(&mut self) {
+        self.profile_draft = self.book.profiles.get(&self.book.me.id).cloned().unwrap_or_default();
+        self.profile_draft.name = self.book.me.name.clone();
+        self.profile_error = None;
+        self.page = Page::Profile;
+    }
+
+    fn profile_page(&mut self, ui: &mut egui::Ui) {
+        page_head(ui, Ico::Friends, "Мой профиль", "Так вас видят друзья");
+        section(ui, |ui| {
+            ui.horizontal(|ui| {
+                crate::profileui::avatar(ui, &self.profile_draft, "my-profile-preview", 88.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Аватарка").font(bold(16.0)));
+                    if ui.button("Выбрать фото…").clicked() {
+                        match crate::profileui::choose_photo(self.hwnd) {
+                            Ok(Some(photo)) => { self.profile_draft.photo = photo; self.profile_error = None; }
+                            Ok(None) => {}
+                            Err(e) => self.profile_error = Some(e),
+                        }
+                    }
+                    ui.label(RichText::new("Или выберите кота ниже").color(c_muted()).size(12.0));
+                });
+            });
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                for i in 0..crate::stickers::count() {
+                    let p = friends::Profile { avatar: i as u8, ..Default::default() };
+                    if crate::profileui::avatar(ui, &p, ("avatar-choice", i), 40.0).on_hover_text(crate::stickers::name(i)).clicked() {
+                        self.profile_draft.avatar = i as u8; self.profile_draft.photo.clear(); self.profile_error = None;
+                    }
+                }
+            });
+            ui.add_space(16.0);
+            ui.label("Имя");
+            ui.add(egui::TextEdit::singleline(&mut self.profile_draft.name).char_limit(40).desired_width(f32::INFINITY));
+            ui.add_space(10.0);
+            ui.label("Статус");
+            ui.add(egui::TextEdit::singleline(&mut self.profile_draft.status).char_limit(64).hint_text("Например: смотрим кино").desired_width(f32::INFINITY));
+            ui.label(RichText::new("Доступность «В сети» определяется автоматически.").color(c_muted()).size(12.0));
+            if let Some(e) = &self.profile_error { error_text(ui, e); }
+        });
+        ui.columns(2, |cols| {
+            if big_button(&mut cols[0], "Сохранить", c_accent(), !self.profile_draft.name.trim().is_empty()) {
+                let mut updated = self.book.clone();
+                updated.set_my_name(&self.profile_draft.name);
+                let mut profile = self.profile_draft.clone();
+                profile.name = updated.me.name.clone();
+                profile.status = friends::clean_status(&profile.status);
+                updated.profiles.insert(updated.me.id, profile);
+                match friends::save_book_checked(&friends::profile_dir(), &updated) {
+                    Ok(()) => {
+                        self.book = updated;
+                        self.friend_ok = Some("Профиль сохранён. Друзья получат обновление при следующем обмене.".into());
+                        self.friend_poll_i = 0;
+                        self.page = Page::Friends;
+                    }
+                    Err(e) => self.profile_error = Some(format!("Не удалось сохранить профиль: {e}")),
+                }
+            }
+            if big_button(&mut cols[1], "Отмена", c_card_hover(), true) { self.page = Page::Friends; }
+        });
+    }
+
     /// Shown on every page, same idea as the "viewer asks for control" card.
     fn friend_invite_card(&mut self, ui: &mut egui::Ui) {
         let now = unix_now();
         self.friend_pending_invites.retain(|(inv, _)| friends::invite_fresh(inv.unix, now));
         let Some((inv, from_id)) = self.friend_pending_invites.first().cloned() else { return };
         let fname = self.book.friends.iter().find(|f| f.id == from_id).map(|f| f.name.clone()).unwrap_or_else(|| "Друг".into());
+        let busy = self.host.as_ref().is_some_and(Session::active)
+            || self.join.as_ref().is_some_and(Session::active) || self.test.is_some();
         let mut watch = false;
         let mut decline = false;
         egui::Frame::new()
@@ -2338,10 +2551,10 @@ impl GuiApp {
                         format!("{fname} приглашает посмотреть трансляцию · ещё {extra}")
                     };
                     ui.label(RichText::new(title).font(bold(17.0)));
-                    ui.label(RichText::new("Нажмите «Смотреть» — подключение без кодов.").color(c_muted()).size(13.0));
+                    ui.label(RichText::new(if busy { "Приглашение сохранено. Завершите текущую сессию, чтобы принять его." } else { "Нажмите «Смотреть» — подключение без кодов." }).color(c_muted()).size(13.0));
                     ui.add_space(6.0);
                     ui.columns(2, |cols| {
-                        if big_button_i(&mut cols[0], Some(Ico::Eye), "Смотреть", c_accent(), true) {
+                        if big_button_i(&mut cols[0], Some(Ico::Eye), "Смотреть", c_accent(), !busy) {
                             watch = true;
                         }
                         if big_button_i(&mut cols[1], Some(Ico::Cross), "Отклонить", c_card_hover(), true) {
@@ -2368,6 +2581,23 @@ impl GuiApp {
     }
 
     fn invite_friend(&mut self, ctx: &egui::Context, friend_id: [u8; 16]) {
+        if self.host.as_ref().is_some_and(Session::active) {
+            self.start_inviting_friend(ctx, friend_id);
+        } else {
+            self.host = None;
+            self.broadcast_target = Some(friend_id);
+            self.manual_broadcast = false;
+            self.windows = wincap::list_windows();
+            self.page = Page::Host;
+        }
+    }
+
+    fn start_inviting_friend(&mut self, ctx: &egui::Context, friend_id: [u8; 16]) {
+        if !self.book.friends.iter().any(|f| f.id == friend_id) {
+            self.friend_error = Some("Друг больше не в списке. Выберите получателя заново.".into());
+            self.broadcast_target = None;
+            return;
+        }
         self.friend_error = None;
         self.friend_ok = None;
         let mut started = false;
@@ -2630,19 +2860,8 @@ fn big_button_i(ui: &mut egui::Ui, ico: Option<Ico>, text: &str, fill: Color32, 
         p.rect_stroke(rect, 12.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
         text_color = if enabled { c_text() } else { c_muted().gamma_multiply(0.7) };
     } else if enabled {
-        let k = if down { 0.0 } else { 1.0 };
-        if !pal().light {
-            glow(p, rect, 12, fill, k * (0.20 + 0.28 * t), 22, 4);
-        } else {
-            glow(p, rect, 12, fill, k * (0.18 + 0.18 * t), 14, 3);
-        }
-        let (top, bot) = if down {
-            (fill.lerp_to_gamma(Color32::BLACK, 0.12), fill.lerp_to_gamma(Color32::BLACK, 0.26))
-        } else {
-            (fill.lerp_to_gamma(Color32::WHITE, 0.14 + 0.10 * t), fill.lerp_to_gamma(Color32::BLACK, 0.18 - 0.06 * t))
-        };
-        grad_rect(p, rect, 12.0, top, bot);
-        p.rect_stroke(rect, 12.0, Stroke::new(1.0, Color32::from_white_alpha(if down { 18 } else { 42 })), egui::StrokeKind::Inside);
+        let flat = if down { fill.lerp_to_gamma(Color32::BLACK, 0.12) } else { fill.lerp_to_gamma(Color32::WHITE, 0.08 * t) };
+        p.rect_filled(rect, 9.0, flat);
         text_color = on_fill(fill);
     } else {
         p.rect_filled(rect, 12.0, fill.gamma_multiply(0.35));
@@ -2674,16 +2893,14 @@ fn crumb(ui: &mut egui::Ui, label: &str) -> bool {
     r.clicked()
 }
 
-/// Header of a page: a rounded gradient icon tile, the title and a one-line subtitle.
+/// Header of a page: a flat icon tile, the title and a one-line subtitle.
 fn page_head(ui: &mut egui::Ui, ico: Ico, t: &str, sub: &str) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 16.0;
         let (r, _) = ui.allocate_exact_size(Vec2::splat(54.0), Sense::hover());
         let p = ui.painter();
         let a = c_accent();
-        glow(p, r, 15, a, if pal().light { 0.22 } else { 0.30 }, 20, 4);
-        grad_rect(p, r, 15.0, a.lerp_to_gamma(Color32::WHITE, 0.18), a.lerp_to_gamma(Color32::BLACK, 0.2));
-        p.rect_stroke(r, 15.0, Stroke::new(1.0, Color32::from_white_alpha(40)), egui::StrokeKind::Inside);
+        p.rect_filled(r, 12.0, a);
         draw_ico(p, ico, r.center(), 26.0, on_fill(a));
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 3.0;
@@ -3459,7 +3676,7 @@ impl GuiApp {
             ui.checkbox(&mut self.easy, "Простое подключение (beta): один короткий код вместо двух длинных");
             if self.easy {
                 ui.label(
-                    RichText::new("Коды обмениваются через публичный сервер ntfy.sh в зашифрованном виде. Обычные коды тоже останутся — на случай, если не сработает.")
+                    RichText::new("Коды обмениваются через публичный сервер ntfy-me.com в зашифрованном виде. Обычные коды тоже останутся — на случай, если не сработает.")
                         .color(c_muted())
                         .size(12.5),
                 );
@@ -3600,7 +3817,7 @@ impl GuiApp {
             ui.add(egui::Label::new(
                 RichText::new(
                     "Видео и звук идут по прямому соединению между транслирующим и зрителем, без промежуточных серверов. \
-                     Единственное, что может проходить через сервер, — короткий код в режиме «простое подключение (beta)»: он передаётся в зашифрованном виде через публичный сервер ntfy.sh.",
+                     Приглашения, запросы трансляции, профили и статусы друзей передаются в зашифрованном виде через бесплатный публичный сервер ntfy-me.com. Сервер видит IP-адреса и время запросов. Для друзей нужна одинаковая новая версия приложения.",
                 )
                 .color(c_muted())
                 .size(13.5),
@@ -3795,10 +4012,56 @@ impl GuiApp {
         }
     }
 
+    fn broadcast_recipients(&mut self, ui: &mut egui::Ui) {
+        page_head(ui, Ico::Friends, "Кому транслировать", "Сначала выберите друга, затем экран или окно");
+        ui.add(egui::TextEdit::singleline(&mut self.friend_search).hint_text("Найти друга").desired_width(f32::INFINITY));
+        let now = unix_now();
+        let query = self.friend_search.trim().to_lowercase();
+        let mut friends = self.book.friends.clone();
+        friends.sort_by_key(|f| (!friends::is_online(self.friend_last_seen.get(&f.id).copied(), now, self.book.friends.len()), f.name.to_lowercase()));
+        let mut selected = None;
+        for f in friends.iter().filter(|f| f.name.to_lowercase().contains(&query)) {
+            let profile = self.book.profiles.get(&f.id).cloned().unwrap_or_default();
+            let online = friends::is_online(self.friend_last_seen.get(&f.id).copied(), now, self.book.friends.len());
+            section(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    crate::profileui::avatar(ui, &profile, ("broadcast", f.id), 40.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&f.name).font(bold(15.0)));
+                        ui.label(RichText::new(if online { "В сети" } else { "Не в сети — приглашение будет доступно 15 минут" }).color(c_muted()).size(12.0));
+                    });
+                    if ui.button("Выбрать →").clicked() { selected = Some(f.id); }
+                });
+            });
+        }
+        if self.book.friends.is_empty() {
+            ui.label("Сначала добавьте друга на главном экране.");
+            if ui.button("К друзьям").clicked() { self.page = Page::Friends; }
+        }
+        if let Some(id) = selected {
+            self.broadcast_target = Some(id);
+            self.windows = wincap::list_windows();
+            self.start_error = None;
+        }
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new("Подключение по коду — если друга нет в списке")
+            .default_open(false).show(ui, |ui| {
+                ui.label(RichText::new("Выберите источник, затем раскройте «Подключение по коду», чтобы передать код зрителю.").color(c_muted()));
+                if ui.button("Выбрать экран для подключения по коду").clicked() {
+                    self.manual_broadcast = true;
+                    self.windows = wincap::list_windows();
+                }
+            });
+    }
+
     fn host_page(&mut self, ui: &mut egui::Ui) {
         if let Some(b) = self.tab_busy(lg::Tab::Host) {
             page_head(ui, Ico::Monitor, "Транслировать экран", "Сейчас занято другим");
             self.busy_notice(ui, b);
+            return;
+        }
+        if self.host.is_none() && self.broadcast_target.is_none() && !self.manual_broadcast {
+            self.broadcast_recipients(ui);
             return;
         }
         let live = self.host.as_ref().is_some_and(|s| s.connected && s.active());
@@ -3817,11 +4080,19 @@ impl GuiApp {
             },
         );
 
+        if self.host.is_none() {
+            let who = self.broadcast_target.and_then(|id| self.book.friends.iter().find(|f| f.id == id)).map(|f| f.name.clone());
+            ui.horizontal(|ui| {
+                if ui.button("‹ Кому транслировать").clicked() { self.broadcast_target = None; self.manual_broadcast = false; }
+                ui.label(RichText::new(who.map(|n| format!("Получатель: {n}")).unwrap_or_else(|| "Подключение по коду".into())).color(c_muted()));
+            });
+            if self.broadcast_target.is_none() && !self.manual_broadcast { return; }
+        }
         let Some(s) = &mut self.host else {
             section(ui, |ui| {
                 ui.label(RichText::new("Что транслировать").font(bold(15.0)));
                 // The cards give way so that quality and the start button stay on the screen (at 1024x740 and up).
-                let room = ui.ctx().content_rect().height() - 32.0 - HOST_FIXED_H;
+                let room = ui.ctx().content_rect().height() - 32.0 - HOST_FIXED_H - 64.0;
                 self.pick_source_h(ui, room.clamp(170.0, 352.0));
             });
             if let Some(e) = &self.start_error {
@@ -3829,7 +4100,8 @@ impl GuiApp {
             }
             if big_button_i(ui, Some(Ico::Play), "Начать трансляцию", c_accent(), !self.monitors.is_empty()) {
                 let ctx = ui.ctx().clone();
-                self.start_host(&ctx);
+                if let Some(id) = self.broadcast_target { self.start_inviting_friend(&ctx, id); }
+                else { self.start_host(&ctx); }
             }
             if self.settings_line(ui) {
                 self.settings_tab = 0;
@@ -3945,8 +4217,7 @@ impl GuiApp {
                     ui.label(RichText::new(&s.status).color(c_muted()));
                 });
                 if big_button_i(ui, Some(Ico::Retry), "Транслировать снова", c_accent(), true) {
-                    let ctx = ui.ctx().clone();
-                    self.start_host(&ctx);
+                    self.go_home(); self.broadcast_target = None; self.manual_broadcast = false;
                 } else if big_button_i(ui, Some(Ico::Cross), "Закрыть", c_card_hover(), true) {
                     self.go_home();
                 }
@@ -3955,8 +4226,7 @@ impl GuiApp {
             let raw = raw.or_else(|| Some(s.status.clone()).filter(|t| !t.is_empty()));
             match error_card(ui, raw.as_deref(), "Повторить") {
                 Some(ErrAction::Retry) => {
-                    let ctx = ui.ctx().clone();
-                    self.start_host(&ctx);
+                    self.go_home(); self.broadcast_target = None; self.manual_broadcast = false;
                 }
                 Some(ErrAction::Home) => self.go_home(),
                 None => {}
@@ -3964,6 +4234,23 @@ impl GuiApp {
             return;
         }
 
+        if let Some(id) = self.broadcast_target {
+            let name = self.book.friends.iter().find(|f| f.id == id).map(|f| f.name.as_str()).unwrap_or("Друг");
+            section(ui, |ui| {
+                ui.label(RichText::new(format!("Трансляция для {name}")).font(bold(20.0)));
+                spinner_line(ui, if s.code.is_some() { "Ожидаем принятия приглашения другом…" } else { "Подготавливаем приглашение…" });
+                ui.label(RichText::new("Коды пересылать не нужно. Приглашение появится в программе друга.").color(c_muted()));
+                if let Some(e) = &self.friend_error { error_text(ui, e); }
+                if let Some(ok) = &self.friend_ok { ui.label(RichText::new(ok).color(c_muted())); }
+            });
+        } else {
+            section(ui, |ui| {
+                ui.label(RichText::new("Подключение по коду").font(bold(20.0)));
+                ui.label(RichText::new("Код и поле ответа находятся в раскрывающемся блоке ниже.").color(c_muted()));
+            });
+        }
+        egui::CollapsingHeader::new("Подключение по коду — дополнительный способ")
+            .id_salt("broadcast-code-fallback").default_open(false).show(ui, |ui| {
         if let Some(room) = s.room.clone() {
             section(ui, |ui| {
                 step(ui, 1, "Передайте зрителю этот код");
@@ -3984,8 +4271,87 @@ impl GuiApp {
             classic_host_codes(ui, s, &mut self.input, &mut self.copied_at);
             connect_card(ui, s);
         }
+            });
         if big_button_i(ui, Some(Ico::Cross), "Отмена", c_card_hover(), true) {
             self.go_home();
+        }
+    }
+
+    fn watch_friend_picker(&mut self, ui: &mut egui::Ui) {
+        ui.add(egui::TextEdit::singleline(&mut self.friend_search).hint_text("Найти друга").desired_width(f32::INFINITY));
+        if let Some(e) = &self.friend_error { error_text(ui, e); }
+        if let Some(ok) = &self.friend_ok { ui.label(RichText::new(ok).color(c_muted())); }
+        if self.book.friends.is_empty() {
+            ui.label("Добавьте друга, чтобы запросить трансляцию без кодов.");
+            if ui.button("К друзьям").clicked() { self.page = Page::Friends; }
+        }
+        let retry = crate::ntfy::retry_after_seconds();
+        if retry > 0 { ui.label(RichText::new(format!("Пауза сервера: ещё {retry} с. Затем можно повторить запрос.")).color(c_muted())); }
+        let query = self.friend_search.trim().to_lowercase();
+        let peers = self.book.friends.clone();
+        self.watch_sent.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(friends::INVITE_TTL_SECS));
+        let mut request = None;
+        let mut cancel = None;
+        for f in peers.iter().filter(|f| f.name.to_lowercase().contains(&query)) {
+            let profile = self.book.profiles.get(&f.id).cloned().unwrap_or_default();
+            let sent = self.watch_sent.contains_key(&f.id);
+            let sending = self.watch_post.as_ref().is_some_and(|(id, _)| *id == f.id);
+            let cancelling = self.watch_cancel_wait.as_ref().is_some_and(|(id, _)| *id == f.id)
+                || self.watch_cancel_post.as_ref().is_some_and(|(id, _, _)| *id == f.id);
+            section(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    crate::profileui::avatar(ui, &profile, ("watch", f.id), 40.0);
+                    ui.label(RichText::new(&f.name).font(bold(15.0)));
+                    if ui.add_enabled(retry == 0 && !sent && !sending && !cancelling && self.friend_post.is_none(), egui::Button::new(if sending { "Отправляем…" } else if sent { "Ожидаем друга" } else { "Попросить трансляцию" })).clicked() { request = Some(f.id); }
+                    if sent || sending {
+                        if ui.add_enabled(!cancelling && self.watch_cancel_wait.is_none() && self.watch_cancel_post.is_none(), egui::Button::new(if cancelling { "Отменяем…" } else { "Отменить запрос" })).clicked() { cancel = Some(f.id); }
+                    }
+                });
+            });
+        }
+        if let Some(id) = cancel {
+            let nonce = self.watch_post.as_ref().filter(|(i, _)| *i == id).map(|(_, n)| n.clone())
+                .or_else(|| self.watch_sent.get(&id).map(|(n, _)| n.clone()));
+            if let Some(nonce) = nonce {
+                self.watch_sent.entry(id).or_insert((nonce.clone(), Instant::now()));
+                self.watch_cancel_wait = Some((id, nonce));
+                self.friend_ok = Some("Отменяем запрос…".into());
+                self.friend_error = None;
+            }
+        }
+        if let Some(id) = request {
+            if let Some((msg, nonce)) = self.book.request_watch(&id, unix_now()) {
+                self.friend_ok = None;
+                self.friend_error = None;
+                self.spawn_friend_post(msg.topic, msg.body, "Запрос отправлен. Друг выберет экран и пришлёт приглашение.".into());
+                self.watch_post = Some((id, nonce));
+            }
+        }
+        ui.label(RichText::new("Друг сам подтвердит запуск и выберет, что показать. Для запросов нужна новая версия у обоих.").color(c_muted()).size(12.0));
+        ui.add_space(12.0);
+    }
+
+    fn watch_request_card(&mut self, ui: &mut egui::Ui) {
+        let now = unix_now();
+        self.watch_requests.prune(now);
+        let Some((id, _, nonce)) = self.watch_requests.pending.first().cloned() else { return };
+        let name = self.book.friends.iter().find(|f| f.id == id).map(|f| f.name.clone()).unwrap_or_else(|| "Друг".into());
+        let busy = self.host.as_ref().is_some_and(Session::active) || self.join.as_ref().is_some_and(Session::active) || self.test.is_some();
+        let mut accept = false; let mut decline = false;
+        egui::Frame::new().fill(c_card()).stroke(Stroke::new(1.0, c_accent())).corner_radius(12).inner_margin(14).show(ui, |ui| {
+            ui.label(RichText::new(format!("{name} просит вас начать трансляцию")).font(bold(16.0)));
+            ui.label(if busy { "Завершите текущую сессию, чтобы выбрать экран." } else { "Вы сами выберете экран или окно. Передача начнётся только после подтверждения." });
+            ui.horizontal_wrapped(|ui| {
+                accept = ui.add_enabled(!busy, egui::Button::new("Выбрать экран")).clicked();
+                decline = ui.button("Отклонить").clicked();
+            });
+        });
+        if accept {
+            self.invite_friend(ui.ctx(), id);
+            self.watch_requests.pending.retain(|(fid, _, n)| !(*fid == id && *n == nonce));
+        } else if decline {
+            if let Some(msg) = self.book.decline(&id, &nonce) { self.spawn_friend_post(msg.topic, msg.body, "Запрос отклонён.".into()); }
+            self.watch_requests.pending.retain(|(fid, _, n)| !(*fid == id && *n == nonce));
         }
     }
 
@@ -3996,7 +4362,7 @@ impl GuiApp {
             return;
         }
         let live = self.join.as_ref().is_some_and(|s| s.connected && s.active());
-        page_head(ui, Ico::Eye, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Нужен код от транслирующего: он нажимает «Транслировать экран» и присылает код" });
+        page_head(ui, Ico::Eye, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Выберите друга и попросите его начать трансляцию" });
 
         if let Some(s) = &mut self.join {
             if s.connected && !s.ended {
@@ -4028,11 +4394,9 @@ impl GuiApp {
                         ui.label(RichText::new("Просмотр завершён").font(bold(20.0)));
                         ui.label(RichText::new(&s.status).color(c_muted()));
                     });
-                    if big_button_i(ui, Some(Ico::Retry), "Подключиться снова", c_accent(), true) {
-                        let ctx = ui.ctx().clone();
-                        self.start_join(&ctx);
-                    } else if big_button_i(ui, Some(Ico::Cross), "Закрыть", c_card_hover(), true) {
-                        self.go_home();
+                    ui.label(RichText::new("Вы остаётесь в сети и можете принять новое приглашение.").color(c_muted()));
+                    if big_button_i(ui, Some(Ico::Friends), "К друзьям", c_accent(), true) {
+                        self.go_home(); self.page = Page::Friends;
                     }
                     return;
                 }
@@ -4064,6 +4428,16 @@ impl GuiApp {
             }
             return;
         }
+        if self.join.is_none() {
+            self.watch_friend_picker(ui);
+            egui::CollapsingHeader::new("Подключение по коду — дополнительный способ")
+                .id_salt("watch-code-fallback").default_open(false).show(ui, |ui| self.join_code_form(ui));
+            return;
+        }
+        self.join_code_form(ui);
+    }
+
+    fn join_code_form(&mut self, ui: &mut egui::Ui) {
         let have_reply = self.join.as_ref().is_some_and(|s| s.code.is_some());
         if !have_reply {
             section(ui, |ui| {
