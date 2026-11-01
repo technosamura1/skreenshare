@@ -1298,6 +1298,8 @@ impl App {
         let PhysicalKey::Code(k) = ev.physical_key else { return false };
         let r = match k {
             KeyCode::KeyL => {
+                self.armed = None;
+                self.picker = false;
                 self.laser = !self.laser;
                 let spot = if self.laser { self.picture_spot(winit::dpi::PhysicalPosition::new(self.cursor.0 as f64, self.cursor.1 as f64)) } else { None };
                 self.input.laser(spot);
@@ -1343,6 +1345,9 @@ impl App {
                 return Some((t.clone(), 0x00_3E_CF_8E, 1.0));
             }
         }
+        if self.hover == Hit::Laser {
+            return Some(("Указка · L — включить/выключить · Esc — обычный курсор".into(), LASER, 0.95));
+        }
         if self.picker {
             return Some(("Стикеры: ЛКМ — выбрать · ПКМ — в избранное (встанет первым на панели)".into(), 0x00_3E_CF_8E, 0.9));
         }
@@ -1351,7 +1356,7 @@ impl App {
             return Some((format!("Стикер «{name}»: кликайте по картинке — он появится у транслирующего · ПКМ или Esc — убрать"), 0x00_3E_CF_8E, 0.9));
         }
         if self.laser && !self.captured {
-            return Some(("Лазерная указка у транслирующего · гаснет, если не двигать мышь 3 с · L — выключить".into(), LASER, 0.85));
+            return Some(("Лазерная указка у транслирующего · гаснет, если не двигать мышь 3 с · L или Esc — выключить".into(), LASER, 0.85));
         }
         if let Some(h) = self.ctl_hint() {
             return Some(h);
@@ -1574,7 +1579,8 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
                 match event.logical_key {
                     Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
-                    Key::Named(NamedKey::Escape) if self.armed.is_some() || self.picker => {
+                    Key::Named(NamedKey::Escape) if self.armed.is_some() || self.picker || self.laser => {
+                        self.laser = false; self.input.laser(None);
                         self.armed = None;
                         self.picker = false;
                         self.redraw();
@@ -1717,6 +1723,7 @@ impl ApplicationHandler<UserEv> for App {
                             Hit::Fullscreen => self.toggle_fullscreen(),
                             Hit::Control => self.toggle_control(),
                             Hit::React(i) => {
+                                self.laser = false; self.input.laser(None);
                                 let id = self.favs[i];
                                 self.armed = if self.armed == Some(id) { None } else { Some(id) };
                                 self.picker = false;
@@ -1724,8 +1731,16 @@ impl ApplicationHandler<UserEv> for App {
                                     self.set_capture(false);
                                 }
                             }
+                            Hit::Laser => {
+                                if self.captured { self.set_capture(false); }
+                                self.laser = !self.laser;
+                                self.armed = None;
+                                self.picker = false;
+                                self.input.laser(if self.laser { self.picture_spot(winit::dpi::PhysicalPosition::new(self.cursor.0 as f64, self.cursor.1 as f64)) } else { None });
+                            }
                             Hit::More => self.picker = !self.picker,
                             Hit::Pick(id) => {
+                                self.laser = false; self.input.laser(None);
                                 self.armed = Some(id);
                                 self.picker = false;
                                 if self.captured {
@@ -1859,6 +1874,7 @@ impl App {
                 ctl: ctl.map(|(on, allowed, pads, pad_ok, kbm_ok)| bar::Ctl { on, allowed, pads: pads as u8, captured: self.captured, pad_ok, kbm_ok }),
                 armed: self.armed,
                 picker: self.picker,
+                laser: self.laser,
                 favs: self.favs,
             };
             let geom = Bar::with_control(ww as i32, wh as i32, sc, ctl.is_some());
@@ -1971,6 +1987,7 @@ pub fn overlay_preview(out: &std::path::Path, panel: bool, on: bool) -> std::io:
         ctl: Some(bar::Ctl { on, allowed: true, pads: 2, captured: on && kbm_ok, pad_ok, kbm_ok }),
         armed: Some(crate::stickers::FAVORITES[1]),
         picker: panel,
+        laser: false,
         favs: crate::stickers::FAVORITES,
     };
     let geom = Bar::with_control(ww as i32, wh as i32, 1, true);

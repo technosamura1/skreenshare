@@ -1120,7 +1120,7 @@ impl GuiApp {
             egui::TextureOptions::LINEAR,
         );
         GuiApp {
-            page: if first_run { Page::Welcome } else { Page::Host },
+            page: if first_run { Page::Welcome } else { Page::Friends },
             settings_tab: 0,
             asked_seen: false,
             monitors,
@@ -1485,6 +1485,22 @@ impl eframe::App for GuiApp {
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             page_bg(ui.painter(), ui.max_rect());
+            // Requests remain reachable even when the current page is scrolled down.
+            egui::Frame::new().inner_margin(Margin::symmetric(24, 8)).show(ui, |ui| {
+                self.control_ask(ui);
+                if self.host.as_ref().is_some_and(|s| s.active() && s.ctrl.is_some_and(|c| c.on)) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Зрителю разрешено управление").color(c_yellow()));
+                        if ui.button("Забрать управление").clicked() {
+                            self.ctl.allow = false;
+                            if let Some(s) = &mut self.host {
+                                s.proc.send(&lg::control_line(false, self.ctl.pad, self.ctl.kbm));
+                            }
+                        }
+                    });
+                }
+                self.friend_invite_card(ui);
+            });
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 // A centred column, at most 800 px wide, with air around it.
                 let avail = ui.available_width();
@@ -1504,8 +1520,6 @@ impl eframe::App for GuiApp {
                             ui.add_space((1.0 - tr) * 16.0);
                             ui.ctx().request_repaint();
                         }
-                        self.control_ask(ui);
-                        self.friend_invite_card(ui);
                         match self.page {
                             Page::Welcome => self.welcome(ui),
                             Page::Host => self.host_page(ui),
@@ -2146,66 +2160,13 @@ impl GuiApp {
     fn friends_page(&mut self, ui: &mut egui::Ui) {
         page_head(ui, Ico::Friends, "Друзья", "Добавляйте друзей один раз — потом просто приглашайте на трансляцию");
 
-        section(ui, |ui| {
-            ui.label(RichText::new("Ваш код друга").font(bold(16.0)));
-            ui.label(
-                RichText::new("Этот код можно отправить другу. Или попросите его код и вставьте ниже — достаточно одного из двух.")
-                    .color(c_muted())
-                    .size(13.0),
-            );
-            ui.add_space(6.0);
-            if ui
-                .add(
-                    egui::Button::new(if self.friend_show_my_code { "Скрыть код" } else { "Показать мой код" })
-                        .fill(c_card_hover())
-                        .corner_radius(8),
-                )
-                .clicked()
-            {
-                self.friend_show_my_code = !self.friend_show_my_code;
-            }
-            if self.friend_show_my_code {
-                ui.add_space(6.0);
-                let code = self.book.code();
-                code_box(ui, &code, &mut self.friend_code_copied);
-            }
+        ui.columns(2, |cols| {
+            if big_button_i(&mut cols[0], Some(Ico::Monitor), "Транслировать", c_accent(), true) { self.page = Page::Host; }
+            if big_button_i(&mut cols[1], Some(Ico::Eye), "Смотреть по коду", c_card_hover(), true) { self.page = Page::Join; }
         });
-
-        section(ui, |ui| {
-            ui.label(RichText::new("Добавить друга").font(bold(16.0)));
-            ui.label(RichText::new("Попросите друга показать его код из вкладки «Друзья». Вставьте его сюда.").color(c_muted()).size(13.0));
-            ui.add_space(4.0);
-            let enter = code_input(ui, &mut self.friend_code_input, "Код друга...");
-            if let Some(e) = &self.friend_error {
-                error_text(ui, e);
-            }
-            if let Some(ok) = &self.friend_ok {
-                ui.label(RichText::new(ok).color(c_green()).size(13.0));
-            }
-            if big_button(ui, "Добавить друга", c_accent(), !self.friend_code_input.trim().is_empty()) || enter {
-                self.friend_error = None;
-                self.friend_ok = None;
-                let raw = self.friend_code_input.trim().to_string();
-                match self.book.add(&raw) {
-                    Ok(msg) => {
-                        if let Some((id, _)) = friends::parse_code(&raw) {
-                            self.friend_cursors.forget(&id);
-                            friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
-                            self.friend_last_seen.remove(&id);
-                        }
-                        self.friend_poll_i = 0;
-                        friends::save_book(&friends::profile_dir(), &self.book);
-                        self.friend_ok = Some("Друг добавлен. Когда он запустит программу, появится в списке.".into());
-                        self.friend_code_input.clear();
-                        if let Some((id, _)) = friends::parse_code(&raw) {
-                            self.friend_greet(id, Some(msg));
-                        }
-                    }
-                    Err(e) => self.friend_error = Some(friends::add_error_text(e).into()),
-                }
-            }
-        });
-
+        ui.add_space(12.0);
+        if let Some(e) = &self.friend_error { error_text(ui, e); }
+        if let Some(ok) = &self.friend_ok { ui.label(RichText::new(ok).color(c_green()).size(13.0)); }
         if self.book.friends.is_empty() {
             section(ui, |ui| {
                 ui.label(RichText::new("Пока никого нет").font(bold(16.0)));
@@ -2218,7 +2179,7 @@ impl GuiApp {
         } else {
             let now = unix_now();
             let n = self.book.friends.len();
-            let rows: Vec<([u8; 16], String, bool)> = self
+            let mut rows: Vec<([u8; 16], String, bool)> = self
                 .book
                 .friends
                 .iter()
@@ -2227,6 +2188,7 @@ impl GuiApp {
                     (f.id, f.name.clone(), online)
                 })
                 .collect();
+            rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
             let mut to_remove: Option<[u8; 16]> = None;
             let mut to_invite: Option<[u8; 16]> = None;
             section(ui, |ui| {
@@ -2297,6 +2259,63 @@ impl GuiApp {
             }
         }
 
+        egui::CollapsingHeader::new("Добавить друга или поделиться своим кодом")
+            .default_open(self.book.friends.is_empty()).show(ui, |ui| {
+        section(ui, |ui| {
+            ui.label(RichText::new("Ваш код друга").font(bold(16.0)));
+            ui.label(
+                RichText::new("Этот код можно отправить другу. Или попросите его код и вставьте ниже — достаточно одного из двух.")
+                    .color(c_muted())
+                    .size(13.0),
+            );
+            ui.add_space(6.0);
+            if ui
+                .add(
+                    egui::Button::new(if self.friend_show_my_code { "Скрыть код" } else { "Показать мой код" })
+                        .fill(c_card_hover())
+                        .corner_radius(8),
+                )
+                .clicked()
+            {
+                self.friend_show_my_code = !self.friend_show_my_code;
+            }
+            if self.friend_show_my_code {
+                ui.add_space(6.0);
+                let code = self.book.code();
+                code_box(ui, &code, &mut self.friend_code_copied);
+            }
+        });
+
+        section(ui, |ui| {
+            ui.label(RichText::new("Добавить друга").font(bold(16.0)));
+            ui.label(RichText::new("Попросите друга показать его код из вкладки «Друзья». Вставьте его сюда.").color(c_muted()).size(13.0));
+            ui.add_space(4.0);
+            let enter = code_input(ui, &mut self.friend_code_input, "Код друга...");
+            if big_button(ui, "Добавить друга", c_accent(), !self.friend_code_input.trim().is_empty()) || enter {
+                self.friend_error = None;
+                self.friend_ok = None;
+                let raw = self.friend_code_input.trim().to_string();
+                match self.book.add(&raw) {
+                    Ok(msg) => {
+                        if let Some((id, _)) = friends::parse_code(&raw) {
+                            self.friend_cursors.forget(&id);
+                            friends::save_cursors(&friends::profile_dir(), &self.friend_cursors);
+                            self.friend_last_seen.remove(&id);
+                        }
+                        self.friend_poll_i = 0;
+                        friends::save_book(&friends::profile_dir(), &self.book);
+                        self.friend_ok = Some("Друг добавлен. Когда он запустит программу, появится в списке.".into());
+                        self.friend_code_input.clear();
+                        if let Some((id, _)) = friends::parse_code(&raw) {
+                            self.friend_greet(id, Some(msg));
+                        }
+                    }
+                    Err(e) => self.friend_error = Some(friends::add_error_text(e).into()),
+                }
+            }
+        });
+
+            });
         if let Some(id) = self.friend_rename_id {
             section(ui, |ui| {
                 ui.label(RichText::new("Переименовать друга").font(bold(15.0)));
@@ -2322,6 +2341,8 @@ impl GuiApp {
         self.friend_pending_invites.retain(|(inv, _)| friends::invite_fresh(inv.unix, now));
         let Some((inv, from_id)) = self.friend_pending_invites.first().cloned() else { return };
         let fname = self.book.friends.iter().find(|f| f.id == from_id).map(|f| f.name.clone()).unwrap_or_else(|| "Друг".into());
+        let busy = self.host.as_ref().is_some_and(Session::active)
+            || self.join.as_ref().is_some_and(Session::active) || self.test.is_some();
         let mut watch = false;
         let mut decline = false;
         egui::Frame::new()
@@ -2338,10 +2359,10 @@ impl GuiApp {
                         format!("{fname} приглашает посмотреть трансляцию · ещё {extra}")
                     };
                     ui.label(RichText::new(title).font(bold(17.0)));
-                    ui.label(RichText::new("Нажмите «Смотреть» — подключение без кодов.").color(c_muted()).size(13.0));
+                    ui.label(RichText::new(if busy { "Приглашение сохранено. Завершите текущую сессию, чтобы принять его." } else { "Нажмите «Смотреть» — подключение без кодов." }).color(c_muted()).size(13.0));
                     ui.add_space(6.0);
                     ui.columns(2, |cols| {
-                        if big_button_i(&mut cols[0], Some(Ico::Eye), "Смотреть", c_accent(), true) {
+                        if big_button_i(&mut cols[0], Some(Ico::Eye), "Смотреть", c_accent(), !busy) {
                             watch = true;
                         }
                         if big_button_i(&mut cols[1], Some(Ico::Cross), "Отклонить", c_card_hover(), true) {
@@ -3996,7 +4017,7 @@ impl GuiApp {
             return;
         }
         let live = self.join.as_ref().is_some_and(|s| s.connected && s.active());
-        page_head(ui, Ico::Eye, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Нужен код от транслирующего: он нажимает «Транслировать экран» и присылает код" });
+        page_head(ui, Ico::Eye, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Примите приглашение друга или введите код трансляции" });
 
         if let Some(s) = &mut self.join {
             if s.connected && !s.ended {
@@ -4028,11 +4049,9 @@ impl GuiApp {
                         ui.label(RichText::new("Просмотр завершён").font(bold(20.0)));
                         ui.label(RichText::new(&s.status).color(c_muted()));
                     });
-                    if big_button_i(ui, Some(Ico::Retry), "Подключиться снова", c_accent(), true) {
-                        let ctx = ui.ctx().clone();
-                        self.start_join(&ctx);
-                    } else if big_button_i(ui, Some(Ico::Cross), "Закрыть", c_card_hover(), true) {
-                        self.go_home();
+                    ui.label(RichText::new("Вы остаётесь в сети и можете принять новое приглашение.").color(c_muted()));
+                    if big_button_i(ui, Some(Ico::Friends), "К друзьям", c_accent(), true) {
+                        self.go_home(); self.page = Page::Friends;
                     }
                     return;
                 }
