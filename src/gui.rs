@@ -1048,11 +1048,9 @@ struct GuiApp {
     friend_pending_invites: Vec<(friends::Invite, [u8; 16])>,
     /// Offer we accepted: (friend, nonce). The viewer's C… code is posted back once the client prints it.
     friend_answer: Option<([u8; 16], String)>,
-    /// After an invite, poll those friends' pair topics quickly so a C… answer is not stuck behind presence.
-    /// Several invites at once each keep their own deadline. Rush does not own the scheduler:
-    /// two rushed polls, then one ordinary step, still one HTTP call and never faster than 5 s.
+    /// After adding or inviting a friend, speed up the entire fair cycle.
+    /// Priority polls must never postpone presence or other friends' invitations.
     friend_rush_ids: HashMap<[u8; 16], Instant>,
-    friend_rush_i: usize,
     friend_rename_input: String,
     friend_rename_id: Option<[u8; 16]>,
     friend_show_my_code: bool,
@@ -1177,7 +1175,6 @@ impl GuiApp {
             friend_pending_invites: Vec::new(),
             friend_answer: None,
             friend_rush_ids: HashMap::new(),
-            friend_rush_i: 0,
             friend_rename_input: String::new(),
             friend_rename_id: None,
             friend_show_my_code: false,
@@ -1418,7 +1415,7 @@ impl eframe::App for GuiApp {
         } else if self.friend_net.is_some() || self.friend_post.is_some() {
             200
         } else {
-            friends::relay_gap_ms(self.book.friends.len())
+            friends::poll_gap_ms(self.book.friends.len(), !self.friend_rush_ids.is_empty()).min(1000)
         };
         ctx.request_repaint_after(Duration::from_millis(friend_wait));
         if self.host.as_ref().is_some_and(|s| s.ended) {
@@ -2112,47 +2109,31 @@ impl GuiApp {
         self.friend_rush_ids.retain(|id, until| *until > now && self.book.pair_topic(id).is_some());
         let n = self.book.friends.len();
         let rushing = !self.friend_rush_ids.is_empty();
-        // Rush used to return here and poll nobody else for 120 s, so another friend's invite
-        // sat unread. Falling through while the 5 s gap has not elapsed does nothing either:
-        // the ordinary cycle waits at least that long too. Take turns instead.
-        let gap = if rushing { friends::RELAY_MIN_GAP_MS } else { friends::relay_gap_ms(n) };
+        // Speed up the entire fair cycle: priority polls used to starve presence.
+        let gap = friends::poll_gap_ms(n, rushing);
         if self.friend_poll_last.is_some_and(|t| t.elapsed().as_millis() < gap as u128) {
             return;
         }
-        if rushing && self.friend_rush_i % 3 != 2 {
-            let mut ids: Vec<[u8; 16]> = self.friend_rush_ids.keys().copied().collect();
-            ids.sort();
-            let id = ids[self.friend_rush_i % ids.len()];
-            self.friend_rush_i = self.friend_rush_i.wrapping_add(1);
-            self.friend_poll_last = Some(now);
-            let since = self.friend_cursors.pair(&id);
-            let Some(topic) = self.book.pair_topic(&id) else { return };
-            self.spawn_friend_get(FriendNetKind::Pair { id, since: since.clone() }, topic, since);
-            return;
-        }
-        if rushing {
-            self.friend_rush_i = self.friend_rush_i.wrapping_add(1);
-        }
         self.friend_poll_last = Some(now);
 
-        let ops = (friends::ops_per_cycle(n) as usize).max(1);
-        let i = self.friend_poll_i % ops;
+        let op = friends::relay_op(n, self.friend_poll_i);
         self.friend_poll_i = self.friend_poll_i.wrapping_add(1);
-        if i == 0 {
+        if op == friends::RelayOp::Inbox {
             let topic = self.book.inbox_topic();
             let since = self.friend_cursors.inbox.clone();
             self.spawn_friend_get(FriendNetKind::Inbox, topic, since);
             return;
         }
         let ids: Vec<[u8; 16]> = self.book.friends.iter().map(|f| f.id).collect();
-        if i <= n {
-            let id = ids[i - 1];
+        if let friends::RelayOp::Pair(i) = op {
+            let id = ids[i];
             let since = self.friend_cursors.pair(&id);
             let Some(topic) = self.book.pair_topic(&id) else { return };
             self.spawn_friend_get(FriendNetKind::Pair { id, since: since.clone() }, topic, since);
             return;
         }
-        let id = ids[i - 1 - n];
+        let friends::RelayOp::Presence(i) = op else { return };
+        let id = ids[i];
         if let Some(msg) = self.book.presence(&id, unix_now()) {
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
@@ -2371,6 +2352,7 @@ impl GuiApp {
                 });
         ui.add_space(8.0);
         if watch {
+            self.friend_rush_ids.insert(from_id, Instant::now() + Duration::from_secs(120));
             self.join_media_key = self.book.friends.iter().find(|f| f.id == from_id).map(|f| f.pair);
             self.friend_answer = if inv.kind == InviteKind::Offer { Some((from_id, inv.nonce.clone())) } else { None };
             self.input = inv.code;

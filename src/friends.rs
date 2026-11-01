@@ -332,6 +332,22 @@ pub fn relay_gap_ms(n_friends: usize) -> u64 {
     gap.max(RELAY_MIN_GAP_MS)
 }
 
+/// Priority mode speeds up the entire cycle without postponing heartbeats.
+pub fn poll_gap_ms(n_friends: usize, rushing: bool) -> u64 {
+    if rushing { RELAY_MIN_GAP_MS } else { relay_gap_ms(n_friends) }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayOp { Inbox, Pair(usize), Presence(usize) }
+
+/// Runs independently of the viewer lifecycle, including its retry screen.
+pub fn relay_op(n_friends: usize, index: usize) -> RelayOp {
+    let i = index % ops_per_cycle(n_friends).max(1) as usize;
+    if i == 0 { RelayOp::Inbox }
+    else if i <= n_friends { RelayOp::Pair(i - 1) }
+    else { RelayOp::Presence(i - 1 - n_friends) }
+}
+
 pub fn invite_fresh(unix: u64, now: u64) -> bool {
     now.saturating_sub(unix) <= INVITE_TTL_SECS && unix <= now.saturating_add(60)
 }
@@ -1132,6 +1148,44 @@ mod tests {
                 assert!(cycle_secs(n) <= 60, "n={n} cycle {}", cycle_secs(n));
             }
         }
+    }
+
+    #[test]
+    fn invitations_never_starve_presence_or_other_friends() {
+        for n in 1..=MAX_FRIENDS {
+            let ops = ops_per_cycle(n) as usize;
+            let mut last_post = vec![None; n];
+            let mut last_poll = vec![None; n];
+            let mut last_seen = vec![None; n];
+            let mut now_ms = 1_000_000u64;
+            for step in 0..ops * 12 {
+                // Connection rush, then an ended viewer left on Retry without Cancel.
+                now_ms += poll_gap_ms(n, step < ops * 6) + 200;
+                match relay_op(n, step) {
+                    RelayOp::Presence(i) => {
+                        if let Some(prev) = last_post[i] {
+                            assert!(now_ms - prev < online_ttl_secs(n) * 1000);
+                        }
+                        last_post[i] = Some(now_ms);
+                    }
+                    RelayOp::Pair(i) => {
+                        if let Some(prev) = last_poll[i] {
+                            assert!(now_ms - prev < online_ttl_secs(n) * 1000);
+                        }
+                        last_poll[i] = Some(now_ms);
+                        last_seen[i] = last_post[i];
+                    }
+                    RelayOp::Inbox => {}
+                }
+                if step >= ops * 2 {
+                    for seen in &last_seen {
+                        assert!(is_online(seen.map(|t| t / 1000), now_ms / 1000, n),
+                            "n={n} step={step}: viewer must stay online without Cancel");
+                    }
+                }
+            }
+        }
+        assert_eq!(relay_op(0, usize::MAX), RelayOp::Inbox);
     }
 
     /// Two fresh profiles over the real ntfy.sh (needs the internet): add, hello, presence both ways,
