@@ -972,6 +972,8 @@ struct GuiApp {
     asked_seen: bool,
     /// Settings tab: 0 quality of the stream, 1 look, 2 checks.
     settings_tab: u32,
+    broadcast_target: Option<[u8; 16]>,
+    manual_broadcast: bool,
     profile_draft: friends::Profile,
     profile_sent: HashMap<[u8; 16], friends::Profile>,
     profile_error: Option<String>,
@@ -1130,6 +1132,8 @@ impl GuiApp {
         GuiApp {
             page: if first_run { Page::Welcome } else { Page::Friends },
             settings_tab: 0,
+            broadcast_target: None,
+            manual_broadcast: false,
             profile_draft: Default::default(),
             profile_sent: HashMap::new(),
             profile_error: None,
@@ -1206,6 +1210,11 @@ impl GuiApp {
         match self.page {
             Page::Host => {
                 self.host = None;
+                self.broadcast_target = None;
+                self.manual_broadcast = false;
+                self.friend_invite_wait.clear();
+                self.friend_invite_since = None;
+                self.friend_invite_autostart = false;
                 self.ctl.allow = false; // consent ends with the session
             }
             Page::Join => self.join = None,
@@ -1703,6 +1712,7 @@ impl GuiApp {
         let host_live = dot(&self.host);
         let join_live = dot(&self.join);
         if nav_item(ui, Ico::Monitor, "Транслировать", self.page == Page::Host, host_live) && self.page != Page::Host {
+            if !self.host.as_ref().is_some_and(Session::active) { self.host = None; self.broadcast_target = None; self.manual_broadcast = false; }
             self.windows = wincap::list_windows();
             self.thumbs.last_list = Instant::now();
             self.page = Page::Host;
@@ -2220,7 +2230,10 @@ impl GuiApp {
         page_head(ui, Ico::Friends, "Друзья", "Добавляйте друзей один раз — потом просто приглашайте на трансляцию");
 
         ui.columns(2, |cols| {
-            if big_button_i(&mut cols[0], Some(Ico::Monitor), "Транслировать", c_accent(), true) { self.page = Page::Host; }
+            if big_button_i(&mut cols[0], Some(Ico::Monitor), "Транслировать", c_accent(), true) {
+                if !self.host.as_ref().is_some_and(Session::active) { self.host = None; self.broadcast_target = None; self.manual_broadcast = false; }
+                self.page = Page::Host;
+            }
             if big_button_i(&mut cols[1], Some(Ico::Eye), "Смотреть по коду", c_card_hover(), true) { self.page = Page::Join; }
         });
         ui.add_space(12.0);
@@ -2268,10 +2281,8 @@ impl GuiApp {
                         ui.set_width(ui.available_width());
                         ui.horizontal_wrapped(|ui| {
                             if crate::profileui::avatar(ui, &profile, id, 44.0).clicked() { self.viewed_profile = Some(*id); }
-                            let info_w = (ui.available_width() - 170.0).max(100.0);
-                            ui.allocate_ui_with_layout(Vec2::new(info_w, 44.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                                ui.set_min_width(info_w);
-                                ui.set_max_width(info_w);
+                            ui.vertical(|ui| {
+                                ui.set_max_width((ui.available_width() - 170.0).max(100.0));
                                 ui.add(egui::Label::new(RichText::new(name).font(bold(15.0))).truncate()).on_hover_text(name);
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(if *online { "● В сети" } else { "○ Не в сети" }).color(if *online { c_green() } else { c_muted() }).size(12.0));
@@ -2507,6 +2518,23 @@ impl GuiApp {
     }
 
     fn invite_friend(&mut self, ctx: &egui::Context, friend_id: [u8; 16]) {
+        if self.host.as_ref().is_some_and(Session::active) {
+            self.start_inviting_friend(ctx, friend_id);
+        } else {
+            self.host = None;
+            self.broadcast_target = Some(friend_id);
+            self.manual_broadcast = false;
+            self.windows = wincap::list_windows();
+            self.page = Page::Host;
+        }
+    }
+
+    fn start_inviting_friend(&mut self, ctx: &egui::Context, friend_id: [u8; 16]) {
+        if !self.book.friends.iter().any(|f| f.id == friend_id) {
+            self.friend_error = Some("Друг больше не в списке. Выберите получателя заново.".into());
+            self.broadcast_target = None;
+            return;
+        }
         self.friend_error = None;
         self.friend_ok = None;
         let mut started = false;
@@ -3921,10 +3949,56 @@ impl GuiApp {
         }
     }
 
+    fn broadcast_recipients(&mut self, ui: &mut egui::Ui) {
+        page_head(ui, Ico::Friends, "Кому транслировать", "Сначала выберите друга, затем экран или окно");
+        ui.add(egui::TextEdit::singleline(&mut self.friend_search).hint_text("Найти друга").desired_width(f32::INFINITY));
+        let now = unix_now();
+        let query = self.friend_search.trim().to_lowercase();
+        let mut friends = self.book.friends.clone();
+        friends.sort_by_key(|f| (!friends::is_online(self.friend_last_seen.get(&f.id).copied(), now, self.book.friends.len()), f.name.to_lowercase()));
+        let mut selected = None;
+        for f in friends.iter().filter(|f| f.name.to_lowercase().contains(&query)) {
+            let profile = self.book.profiles.get(&f.id).cloned().unwrap_or_default();
+            let online = friends::is_online(self.friend_last_seen.get(&f.id).copied(), now, self.book.friends.len());
+            section(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    crate::profileui::avatar(ui, &profile, ("broadcast", f.id), 40.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&f.name).font(bold(15.0)));
+                        ui.label(RichText::new(if online { "В сети" } else { "Не в сети — приглашение будет доступно 15 минут" }).color(c_muted()).size(12.0));
+                    });
+                    if ui.button("Выбрать →").clicked() { selected = Some(f.id); }
+                });
+            });
+        }
+        if self.book.friends.is_empty() {
+            ui.label("Сначала добавьте друга на главном экране.");
+            if ui.button("К друзьям").clicked() { self.page = Page::Friends; }
+        }
+        if let Some(id) = selected {
+            self.broadcast_target = Some(id);
+            self.windows = wincap::list_windows();
+            self.start_error = None;
+        }
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new("Подключение по коду — если друга нет в списке")
+            .default_open(false).show(ui, |ui| {
+                ui.label(RichText::new("Выберите источник, затем раскройте «Подключение по коду», чтобы передать код зрителю.").color(c_muted()));
+                if ui.button("Выбрать экран для подключения по коду").clicked() {
+                    self.manual_broadcast = true;
+                    self.windows = wincap::list_windows();
+                }
+            });
+    }
+
     fn host_page(&mut self, ui: &mut egui::Ui) {
         if let Some(b) = self.tab_busy(lg::Tab::Host) {
             page_head(ui, Ico::Monitor, "Транслировать экран", "Сейчас занято другим");
             self.busy_notice(ui, b);
+            return;
+        }
+        if self.host.is_none() && self.broadcast_target.is_none() && !self.manual_broadcast {
+            self.broadcast_recipients(ui);
             return;
         }
         let live = self.host.as_ref().is_some_and(|s| s.connected && s.active());
@@ -3943,11 +4017,19 @@ impl GuiApp {
             },
         );
 
+        if self.host.is_none() {
+            let who = self.broadcast_target.and_then(|id| self.book.friends.iter().find(|f| f.id == id)).map(|f| f.name.clone());
+            ui.horizontal(|ui| {
+                if ui.button("‹ Кому транслировать").clicked() { self.broadcast_target = None; self.manual_broadcast = false; }
+                ui.label(RichText::new(who.map(|n| format!("Получатель: {n}")).unwrap_or_else(|| "Подключение по коду".into())).color(c_muted()));
+            });
+            if self.broadcast_target.is_none() && !self.manual_broadcast { return; }
+        }
         let Some(s) = &mut self.host else {
             section(ui, |ui| {
                 ui.label(RichText::new("Что транслировать").font(bold(15.0)));
                 // The cards give way so that quality and the start button stay on the screen (at 1024x740 and up).
-                let room = ui.ctx().content_rect().height() - 32.0 - HOST_FIXED_H;
+                let room = ui.ctx().content_rect().height() - 32.0 - HOST_FIXED_H - 64.0;
                 self.pick_source_h(ui, room.clamp(170.0, 352.0));
             });
             if let Some(e) = &self.start_error {
@@ -3955,7 +4037,8 @@ impl GuiApp {
             }
             if big_button_i(ui, Some(Ico::Play), "Начать трансляцию", c_accent(), !self.monitors.is_empty()) {
                 let ctx = ui.ctx().clone();
-                self.start_host(&ctx);
+                if let Some(id) = self.broadcast_target { self.start_inviting_friend(&ctx, id); }
+                else { self.start_host(&ctx); }
             }
             if self.settings_line(ui) {
                 self.settings_tab = 0;
@@ -4071,8 +4154,7 @@ impl GuiApp {
                     ui.label(RichText::new(&s.status).color(c_muted()));
                 });
                 if big_button_i(ui, Some(Ico::Retry), "Транслировать снова", c_accent(), true) {
-                    let ctx = ui.ctx().clone();
-                    self.start_host(&ctx);
+                    self.go_home(); self.broadcast_target = None; self.manual_broadcast = false;
                 } else if big_button_i(ui, Some(Ico::Cross), "Закрыть", c_card_hover(), true) {
                     self.go_home();
                 }
@@ -4081,8 +4163,7 @@ impl GuiApp {
             let raw = raw.or_else(|| Some(s.status.clone()).filter(|t| !t.is_empty()));
             match error_card(ui, raw.as_deref(), "Повторить") {
                 Some(ErrAction::Retry) => {
-                    let ctx = ui.ctx().clone();
-                    self.start_host(&ctx);
+                    self.go_home(); self.broadcast_target = None; self.manual_broadcast = false;
                 }
                 Some(ErrAction::Home) => self.go_home(),
                 None => {}
@@ -4090,6 +4171,23 @@ impl GuiApp {
             return;
         }
 
+        if let Some(id) = self.broadcast_target {
+            let name = self.book.friends.iter().find(|f| f.id == id).map(|f| f.name.as_str()).unwrap_or("Друг");
+            section(ui, |ui| {
+                ui.label(RichText::new(format!("Трансляция для {name}")).font(bold(20.0)));
+                spinner_line(ui, if s.code.is_some() { "Ожидаем принятия приглашения другом…" } else { "Подготавливаем приглашение…" });
+                ui.label(RichText::new("Коды пересылать не нужно. Приглашение появится в программе друга.").color(c_muted()));
+                if let Some(e) = &self.friend_error { error_text(ui, e); }
+                if let Some(ok) = &self.friend_ok { ui.label(RichText::new(ok).color(c_muted())); }
+            });
+        } else {
+            section(ui, |ui| {
+                ui.label(RichText::new("Подключение по коду").font(bold(20.0)));
+                ui.label(RichText::new("Код и поле ответа находятся в раскрывающемся блоке ниже.").color(c_muted()));
+            });
+        }
+        egui::CollapsingHeader::new("Подключение по коду — дополнительный способ")
+            .id_salt("broadcast-code-fallback").default_open(false).show(ui, |ui| {
         if let Some(room) = s.room.clone() {
             section(ui, |ui| {
                 step(ui, 1, "Передайте зрителю этот код");
@@ -4110,6 +4208,7 @@ impl GuiApp {
             classic_host_codes(ui, s, &mut self.input, &mut self.copied_at);
             connect_card(ui, s);
         }
+            });
         if big_button_i(ui, Some(Ico::Cross), "Отмена", c_card_hover(), true) {
             self.go_home();
         }
