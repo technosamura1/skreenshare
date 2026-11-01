@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 pub const KIND_WATCH: u8 = b'W';
+pub const KIND_WATCH_CANCEL: u8 = b'X';
 pub const KIND_PROFILE: u8 = b'U';
 pub const KIND_HELLO: u8 = b'H';
 pub const KIND_PRESENCE: u8 = b'P';
@@ -88,6 +89,7 @@ pub enum PairEvent {
     Profile { unix: u64, profile: Profile },
     Invite(Invite),
     WatchRequest { unix: u64, nonce: String },
+    WatchCancel { unix: u64, nonce: String },
     Answer { nonce: String, code: String },
     Decline { nonce: String },
 }
@@ -275,6 +277,11 @@ impl Book {
         Some((self.pair_line(id, KIND_WATCH, &format!("{unix}\n{nonce}"))?, nonce))
     }
 
+    pub fn cancel_watch(&self, id: &[u8; 16], nonce: &str, unix: u64) -> Option<OutMsg> {
+        if nonce.len() != 16 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+        self.pair_line(id, KIND_WATCH_CANCEL, &format!("{unix}\n{nonce}"))
+    }
+
     pub fn profile_message(&self, id: &[u8; 16], unix: u64) -> Option<OutMsg> {
         let profile = self.own_profile();
         self.pair_line(id, KIND_PROFILE, &format!("{unix}\n{}", profile.encode()))
@@ -417,6 +424,36 @@ pub fn relay_op(n_friends: usize, index: usize) -> RelayOp {
     else if i <= n_friends { RelayOp::Pair(i - 1) }
     else if i <= 2 * n_friends { RelayOp::Presence(i - 1 - n_friends) }
     else { RelayOp::Profile(i - 1 - 2 * n_friends) }
+}
+
+/// Retain cancellations so a delayed request cannot revive a dismissed notification.
+#[derive(Default)]
+pub struct WatchInbox {
+    pub pending: Vec<([u8; 16], u64, String)>,
+    cancelled: Vec<([u8; 16], u64, String)>,
+}
+impl WatchInbox {
+    pub fn prune(&mut self, now: u64) {
+        self.pending.retain(|(_, t, _)| invite_fresh(*t, now));
+        self.cancelled.retain(|(_, t, _)| invite_fresh(*t, now));
+    }
+    pub fn receive(&mut self, id: [u8; 16], unix: u64, nonce: String, now: u64) {
+        self.prune(now);
+        if !invite_fresh(unix, now) || self.cancelled.iter().any(|(i, _, n)| *i == id && *n == nonce) { return; }
+        if self.pending.iter().any(|(i, _, n)| *i == id && *n == nonce) { return; }
+        self.pending.retain(|(i, _, _)| *i != id);
+        self.pending.push((id, unix, nonce));
+    }
+    pub fn cancel(&mut self, id: [u8; 16], unix: u64, nonce: String, now: u64) {
+        self.prune(now);
+        if !invite_fresh(unix, now) { return; }
+        self.pending.retain(|(i, _, n)| !(*i == id && *n == nonce));
+        if !self.cancelled.iter().any(|(i, _, n)| *i == id && *n == nonce) {
+            // Bound state even when a trusted friend sends excessive cancellations.
+            if self.cancelled.len() >= 1024 { self.cancelled.remove(0); }
+            self.cancelled.push((id, unix, nonce));
+        }
+    }
 }
 
 pub fn invite_fresh(unix: u64, now: u64) -> bool {
@@ -691,10 +728,12 @@ fn parse_hello(body: &str) -> Option<([u8; 16], [u8; 32], [u8; 32], String)> {
 
 fn parse_pair(kind: u8, body: &str) -> Option<PairEvent> {
     match kind {
-        KIND_WATCH => {
+        KIND_WATCH | KIND_WATCH_CANCEL => {
             let (unix, nonce) = body.split_once('\n')?;
             if nonce.len() != 16 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
-            Some(PairEvent::WatchRequest { unix: unix.parse().ok()?, nonce: nonce.to_ascii_lowercase() })
+            let unix = unix.parse().ok()?;
+            let nonce = nonce.to_ascii_lowercase();
+            Some(if kind == KIND_WATCH { PairEvent::WatchRequest { unix, nonce } } else { PairEvent::WatchCancel { unix, nonce } })
         }
         KIND_PROFILE => {
             let (unix, payload) = body.split_once('\n')?;
@@ -776,7 +815,7 @@ impl Channel {
     }
 
     fn open_any(&self, message: &str) -> Option<(u8, String)> {
-        for k in [KIND_WATCH, KIND_PROFILE, KIND_PRESENCE, KIND_INVITE, KIND_ANSWER, KIND_DECLINE, KIND_HELLO] {
+        for k in [KIND_WATCH_CANCEL, KIND_WATCH, KIND_PROFILE, KIND_PRESENCE, KIND_INVITE, KIND_ANSWER, KIND_DECLINE, KIND_HELLO] {
             if let Some(body) = self.open(k, message) {
                 return Some((k, body));
             }
@@ -952,6 +991,37 @@ mod tests {
         let mut key = [n.wrapping_add(9); 32];
         key[0] = n;
         Book::new(Identity { id, key, name: name.into() })
+    }
+
+    #[test]
+    fn watch_cancellation_handles_reordering_and_new_requests() {
+        let mut inbox = WatchInbox::default(); let a = [1; 16]; let b = [2; 16];
+        inbox.receive(a, 1000, "old".into(), 1000);
+        inbox.cancel(a, 1001, "old".into(), 1001);
+        assert!(inbox.pending.is_empty());
+        inbox.receive(a, 1000, "old".into(), 1002);
+        assert!(inbox.pending.is_empty());
+        inbox.cancel(a, 1003, "ahead".into(), 1003);
+        inbox.receive(a, 1002, "ahead".into(), 1004);
+        assert!(inbox.pending.is_empty());
+        inbox.receive(a, 1004, "new".into(), 1004);
+        inbox.cancel(b, 1005, "new".into(), 1005);
+        inbox.cancel(a, 1001, "old".into(), 1005);
+        assert_eq!(inbox.pending[0].2, "new");
+        inbox.cancel(a, 1, "new".into(), 1005);
+        assert_eq!(inbox.pending.len(), 1);
+        inbox.prune(2000); assert!(inbox.pending.is_empty()); assert!(inbox.cancelled.is_empty());
+    }
+    #[test]
+    fn watch_cancel_is_authenticated_and_distinct_from_request() {
+        let mut a = fixed(60, "A"); let mut b = fixed(61, "B");
+        let hello = a.add(&b.code()).unwrap(); b.take_hellos(&[hello.body]);
+        let (_, nonce) = a.request_watch(&b.me.id, 1000).unwrap();
+        let cancel = a.cancel_watch(&b.me.id, &nonce, 1001).unwrap();
+        assert!(matches!(b.open_pair(&a.me.id, &cancel.body), Some(PairEvent::WatchCancel { unix: 1001, nonce: got }) if got == nonce));
+        assert!(a.open_pair(&b.me.id, &cancel.body).is_none());
+        assert!(a.cancel_watch(&b.me.id, "bad", 1001).is_none());
+        assert!(parse_pair(KIND_WATCH_CANCEL, "1001\nnot-a-valid-nonce").is_none());
     }
 
     #[test]
@@ -1409,6 +1479,16 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(2));
         let lines = poll(&pair, &since);
         assert!(lines.iter().any(|l| matches!(a.open_pair(&b.me.id, &l.message), Some(PairEvent::WatchRequest { nonce: got, .. }) if got == nonce)));
+        let mut inbox = WatchInbox::default();
+        for l in &lines { if let Some(PairEvent::WatchRequest { unix, nonce }) = a.open_pair(&b.me.id, &l.message) { inbox.receive(b.me.id, unix, nonce, now); } }
+        assert_eq!(inbox.pending.len(), 1);
+        let since = next_since(&since, &lines).to_string();
+        let cancel = b.cancel_watch(&a.me.id, &nonce, now).unwrap();
+        crate::ntfy::post(&cancel.topic, &cancel.body).expect("post cancel");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let lines = poll(&pair, &since);
+        for l in &lines { if let Some(PairEvent::WatchCancel { unix, nonce }) = a.open_pair(&b.me.id, &l.message) { inbox.cancel(b.me.id, unix, nonce, now); } }
+        assert!(inbox.pending.is_empty());
 
     }
 

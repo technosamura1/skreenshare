@@ -1057,7 +1057,9 @@ struct GuiApp {
     /// Invites waiting for «Смотреть». A second one must not erase the first: the relay cursor
     /// already moved past both, so the overwritten invite would never come back.
     friend_pending_invites: Vec<(friends::Invite, [u8; 16])>,
-    watch_requests: Vec<([u8; 16], u64, String)>,
+    watch_requests: friends::WatchInbox,
+    watch_cancel_wait: Option<([u8; 16], String)>,
+    watch_cancel_post: Option<([u8; 16], String, Receiver<Result<(), String>>)>,
     watch_post: Option<([u8; 16], String)>,
     watch_sent: HashMap<[u8; 16], (String, Instant)>,
     /// Offer we accepted: (friend, nonce). The viewer's C… code is posted back once the client prints it.
@@ -1196,7 +1198,9 @@ impl GuiApp {
             presence_attempt: HashMap::new(),
             friend_last_seen: HashMap::new(),
             friend_pending_invites: Vec::new(),
-            watch_requests: Vec::new(),
+            watch_requests: friends::WatchInbox::default(),
+            watch_cancel_wait: None,
+            watch_cancel_post: None,
             watch_post: None,
             watch_sent: HashMap::new(),
             friend_answer: None,
@@ -1593,7 +1597,7 @@ impl GuiApp {
         let asked = self.host.as_ref().is_some_and(|s| !s.ended && s.ctrl.is_some_and(|c| c.asked && !c.on));
         let flash_ask = asked && !self.asked_seen;
         self.asked_seen = asked;
-        let invites = self.friend_pending_invites.len() + self.watch_requests.len();
+        let invites = self.friend_pending_invites.len() + self.watch_requests.pending.len();
         let flash_invite = invites > self.friend_invites_flashed;
         self.friend_invites_flashed = invites;
         if flash_ask || flash_invite {
@@ -2094,6 +2098,34 @@ impl GuiApp {
         }
     }
 
+    fn drain_watch_cancel(&mut self) {
+        if let Some((id, nonce, rx)) = self.watch_cancel_post.take() {
+            match rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => self.watch_cancel_post = Some((id, nonce, rx)),
+                Ok(Ok(())) => {
+                    if self.watch_sent.get(&id).is_some_and(|(n, _)| *n == nonce) { self.watch_sent.remove(&id); }
+                    self.friend_error = None;
+                    self.friend_ok = Some("Запрос отменён.".into());
+                }
+                result => {
+                    let error = match result { Ok(Err(e)) => e, _ => "отправка прервалась".into() };
+                    self.friend_ok = None;
+                    self.friend_error = Some(format!("Отмена запроса не подтверждена: {error}. Повторите отмену, когда сервер будет доступен."));
+                }
+            }
+        }
+        if self.watch_cancel_post.is_none() && self.watch_post.is_none() {
+            if let Some((id, nonce)) = self.watch_cancel_wait.take() {
+                if let Some(msg) = self.book.cancel_watch(&id, &nonce, unix_now()) {
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::spawn(move || { let _ = tx.send(crate::ntfy::post(&msg.topic, &msg.body).map_err(|e| format!("{e:#}"))); });
+                    self.watch_cancel_post = Some((id, nonce, rx));
+                    self.friend_ok = Some("Отменяем запрос…".into());
+                } else { self.watch_sent.remove(&id); }
+            }
+        }
+    }
+
     fn apply_friend_net(&mut self, msg: FriendNet) {
         let Ok(raw) = msg.body else { return };
         let now = unix_now();
@@ -2120,13 +2152,8 @@ impl GuiApp {
                 for line in &lines {
                     let Some(ev) = self.book.open_pair(&id, &line.message) else { continue };
                     match ev {
-                        PairEvent::WatchRequest { unix, nonce } => {
-                            if friends::invite_fresh(unix, now) && !self.watch_requests.iter().any(|(fid, _, n)| *fid == id && *n == nonce) {
-                                // One outstanding request per friend, bounded by the friend list.
-                                self.watch_requests.retain(|(fid, _, _)| *fid != id);
-                                self.watch_requests.push((id, unix, nonce));
-                            }
-                        }
+                        PairEvent::WatchRequest { unix, nonce } => self.watch_requests.receive(id, unix, nonce, now),
+                        PairEvent::WatchCancel { unix, nonce } => self.watch_requests.cancel(id, unix, nonce, now),
                         PairEvent::Profile { .. } => {
                             friends::save_book(&friends::profile_dir(), &self.book);
                         }
@@ -2194,6 +2221,7 @@ impl GuiApp {
     /// An empty list still polls the inbox — that is how the other side's hello arrives.
     fn friends_poll(&mut self) {
         self.drain_friend_post();
+        self.drain_watch_cancel();
         self.friend_flush_answer();
         if let Some(rx) = self.friend_net.take() {
             match rx.try_recv() {
@@ -2336,7 +2364,7 @@ impl GuiApp {
             if let Some(id) = to_remove {
                 self.book.remove(&id);
                 self.watch_sent.remove(&id);
-                self.watch_requests.retain(|(fid, _, _)| *fid != id);
+                self.watch_requests.pending.retain(|(fid, _, _)| *fid != id);
                 self.profile_sent.remove(&id);
                 if self.viewed_profile == Some(id) { self.viewed_profile = None; }
                 self.friend_last_seen.remove(&id);
@@ -4261,17 +4289,35 @@ impl GuiApp {
         if retry > 0 { ui.label(RichText::new(format!("Пауза сервера: ещё {retry} с. Затем можно повторить запрос.")).color(c_muted())); }
         let query = self.friend_search.trim().to_lowercase();
         let peers = self.book.friends.clone();
+        self.watch_sent.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(friends::INVITE_TTL_SECS));
         let mut request = None;
+        let mut cancel = None;
         for f in peers.iter().filter(|f| f.name.to_lowercase().contains(&query)) {
             let profile = self.book.profiles.get(&f.id).cloned().unwrap_or_default();
-            let sent = self.watch_sent.get(&f.id).is_some_and(|(_, t)| t.elapsed() < Duration::from_secs(30));
+            let sent = self.watch_sent.contains_key(&f.id);
+            let sending = self.watch_post.as_ref().is_some_and(|(id, _)| *id == f.id);
+            let cancelling = self.watch_cancel_wait.as_ref().is_some_and(|(id, _)| *id == f.id)
+                || self.watch_cancel_post.as_ref().is_some_and(|(id, _, _)| *id == f.id);
             section(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     crate::profileui::avatar(ui, &profile, ("watch", f.id), 40.0);
                     ui.label(RichText::new(&f.name).font(bold(15.0)));
-                    if ui.add_enabled(retry == 0 && !sent && self.friend_post.is_none(), egui::Button::new(if self.watch_post.as_ref().is_some_and(|(id, _)| *id == f.id) { "Отправляем…" } else if sent { "Запрос отправлен" } else { "Попросить трансляцию" })).clicked() { request = Some(f.id); }
+                    if ui.add_enabled(retry == 0 && !sent && !sending && !cancelling && self.friend_post.is_none(), egui::Button::new(if sending { "Отправляем…" } else if sent { "Ожидаем друга" } else { "Попросить трансляцию" })).clicked() { request = Some(f.id); }
+                    if sent || sending {
+                        if ui.add_enabled(!cancelling && self.watch_cancel_wait.is_none() && self.watch_cancel_post.is_none(), egui::Button::new(if cancelling { "Отменяем…" } else { "Отменить запрос" })).clicked() { cancel = Some(f.id); }
+                    }
                 });
             });
+        }
+        if let Some(id) = cancel {
+            let nonce = self.watch_post.as_ref().filter(|(i, _)| *i == id).map(|(_, n)| n.clone())
+                .or_else(|| self.watch_sent.get(&id).map(|(n, _)| n.clone()));
+            if let Some(nonce) = nonce {
+                self.watch_sent.entry(id).or_insert((nonce.clone(), Instant::now()));
+                self.watch_cancel_wait = Some((id, nonce));
+                self.friend_ok = Some("Отменяем запрос…".into());
+                self.friend_error = None;
+            }
         }
         if let Some(id) = request {
             if let Some((msg, nonce)) = self.book.request_watch(&id, unix_now()) {
@@ -4287,8 +4333,8 @@ impl GuiApp {
 
     fn watch_request_card(&mut self, ui: &mut egui::Ui) {
         let now = unix_now();
-        self.watch_requests.retain(|(_, t, _)| friends::invite_fresh(*t, now));
-        let Some((id, _, nonce)) = self.watch_requests.first().cloned() else { return };
+        self.watch_requests.prune(now);
+        let Some((id, _, nonce)) = self.watch_requests.pending.first().cloned() else { return };
         let name = self.book.friends.iter().find(|f| f.id == id).map(|f| f.name.clone()).unwrap_or_else(|| "Друг".into());
         let busy = self.host.as_ref().is_some_and(Session::active) || self.join.as_ref().is_some_and(Session::active) || self.test.is_some();
         let mut accept = false; let mut decline = false;
@@ -4302,10 +4348,10 @@ impl GuiApp {
         });
         if accept {
             self.invite_friend(ui.ctx(), id);
-            self.watch_requests.retain(|(fid, _, n)| !(*fid == id && *n == nonce));
+            self.watch_requests.pending.retain(|(fid, _, n)| !(*fid == id && *n == nonce));
         } else if decline {
             if let Some(msg) = self.book.decline(&id, &nonce) { self.spawn_friend_post(msg.topic, msg.body, "Запрос отклонён.".into()); }
-            self.watch_requests.retain(|(fid, _, n)| !(*fid == id && *n == nonce));
+            self.watch_requests.pending.retain(|(fid, _, n)| !(*fid == id && *n == nonce));
         }
     }
 
