@@ -1130,7 +1130,7 @@ impl GuiApp {
             egui::TextureOptions::LINEAR,
         );
         GuiApp {
-            page: if first_run { Page::Welcome } else { Page::Friends },
+            page: if first_run { Page::Welcome } else { Page::Host },
             settings_tab: 0,
             broadcast_target: None,
             manual_broadcast: false,
