@@ -1265,12 +1265,11 @@ impl GuiApp {
         if let Some(r) = &room {
             args.extend(["--room".to_string(), r.clone()]);
         }
-        if let Some(key) = self.join_media_key.take() {
-            args.extend(["--media-key".into(), crate::crypto::hex_key(&key)]);
-        }
+        let media_key = self.join_media_key.take();
         self.join = None;
         match Session::start(ctx, args) {
             Ok(mut s) => {
+                if let Some(key) = media_key { s.proc.send(&format!("MEDIAKEY {}", crate::crypto::hex_key(&key))); }
                 if room.is_some() {
                     s.room = room;
                     s.status = "Ищу трансляцию по короткому коду...".into();

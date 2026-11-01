@@ -20,6 +20,49 @@ pub fn media_key(pair: &[u8; 32], token: u32) -> [u8; 32] {
     out
 }
 
+/// Bind the long-lived friend key to the fresh 256-bit secret in this host code.
+/// A public 32-bit routing token alone repeats after only about 2^16 sessions.
+pub fn friend_session_key(pair: &[u8; 32], session: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"screenshare-friend-media-v2");
+    h.update(pair);
+    h.update(session);
+    h.finalize().into()
+}
+
+#[derive(Default)]
+pub struct ReplayWindow {
+    highest: Option<u64>,
+    seen: u128,
+}
+impl ReplayWindow {
+    /// Called only after authentication. Allow reordered packets, never a duplicate.
+    pub fn accept(&mut self, n: u64) -> bool {
+        let Some(high) = self.highest else {
+            self.highest = Some(n);
+            self.seen = 1;
+            return true;
+        };
+        if n > high {
+            let delta = n - high;
+            self.seen = if delta >= 128 {
+                1
+            } else {
+                (self.seen << delta) | 1
+            };
+            self.highest = Some(n);
+            true
+        } else {
+            let delta = high - n;
+            if delta >= 128 || self.seen & (1u128 << delta) != 0 {
+                return false;
+            }
+            self.seen |= 1u128 << delta;
+            true
+        }
+    }
+}
+
 pub fn make_nonce(frame_id: u32, frag_idx: u16, stream: u16) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce[0..4].copy_from_slice(&frame_id.to_le_bytes());
@@ -30,25 +73,59 @@ pub fn make_nonce(frame_id: u32, frag_idx: u16, stream: u16) -> [u8; 12] {
 
 /// Encrypt `payload`. The clear `header` (already carrying the encrypted packet type) and the nonce are
 /// authenticated, so a flipped type or fragment number does not decrypt.
-pub fn encrypt_payload(key: &[u8; 32], nonce: &[u8; 12], header: &[u8], payload: &[u8]) -> Option<Vec<u8>> {
+pub fn encrypt_payload(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    header: &[u8],
+    payload: &[u8],
+) -> Option<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new_from_slice(key).ok()?;
     let mut aad = Vec::with_capacity(header.len() + nonce.len());
     aad.extend_from_slice(header);
     aad.extend_from_slice(nonce);
-    cipher.encrypt(&Nonce::from(*nonce), Payload { msg: payload, aad: &aad }).ok()
+    cipher
+        .encrypt(
+            &Nonce::from(*nonce),
+            Payload {
+                msg: payload,
+                aad: &aad,
+            },
+        )
+        .ok()
 }
 
-pub fn decrypt_payload(key: &[u8; 32], nonce: &[u8; 12], header: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
+pub fn decrypt_payload(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    header: &[u8],
+    ciphertext: &[u8],
+) -> Option<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new_from_slice(key).ok()?;
     let mut aad = Vec::with_capacity(header.len() + nonce.len());
     aad.extend_from_slice(header);
     aad.extend_from_slice(nonce);
-    cipher.decrypt(&Nonce::from(*nonce), Payload { msg: ciphertext, aad: &aad }).ok()
+    cipher
+        .decrypt(
+            &Nonce::from(*nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .ok()
 }
 
 /// `pkt` is a plaintext datagram. `header_len` bytes stay clear (with `enc_type` written over the type),
 /// the rest is encrypted. `frame_id` + `frag_idx` + `stream` is the nonce and must be unique for `key`.
-pub fn seal(key: &[u8; 32], pkt: &[u8], enc_type: u8, header_len: usize, frame_id: u32, frag_idx: u16, stream: u16) -> Option<Vec<u8>> {
+pub fn seal(
+    key: &[u8; 32],
+    pkt: &[u8],
+    enc_type: u8,
+    header_len: usize,
+    frame_id: u32,
+    frag_idx: u16,
+    stream: u16,
+) -> Option<Vec<u8>> {
     if pkt.len() < header_len || header_len == 0 {
         return None;
     }
@@ -139,6 +216,28 @@ mod tests {
         let mut flipped = sealed.clone();
         flipped[5] ^= 1; // frame id in the clear header, covered by the tag
         assert!(open(&key, &flipped, 0x90, 14).is_none());
+    }
+
+    #[test]
+    fn friend_keys_change_even_when_the_public_token_repeats() {
+        let pair = [7; 32];
+        let a = friend_session_key(&pair, &media_key(&[1; 32], 123));
+        let b = friend_session_key(&pair, &media_key(&[2; 32], 123));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn replay_window_accepts_reordering_but_not_replays() {
+        let mut w = ReplayWindow::default();
+        for n in [10, 12, 11, 9, 140, 139] {
+            assert!(w.accept(n));
+        }
+        for n in [10, 12, 11, 9, 140, 139, 0] {
+            assert!(!w.accept(n));
+        }
+        assert!(w.accept(u64::MAX));
+        assert!(!w.accept(u64::MAX));
+        assert!(w.accept(u64::MAX - 1));
     }
 
     #[test]

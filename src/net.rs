@@ -54,6 +54,8 @@ pub const PT_ANNOT_ENC: u8 = 0xB1;
 pub const PT_CTLREQ_ENC: u8 = 0xB2;
 pub const PT_CTRL_ENC: u8 = 0xB3;
 pub const PT_RUMBLE_ENC: u8 = 0xB4;
+/// Authenticated signalling, including handshake, disconnect and feedback (0.13+).
+pub const PT_SIGNAL_ENC: u8 = 0xB5;
 /// Viewer understands encrypted media and has the friend secret. Host stays in the clear until it sees this.
 pub const CAP_ENC: u8 = 4;
 
@@ -109,7 +111,7 @@ fn sim_drop() -> bool {
 }
 
 /// Video, audio and remote-control packets are encrypted once a key is installed.
-/// Punch, ping and loss reports stay clear: they carry no picture and no keystrokes.
+/// Signalling and handshake are authenticated as well; encryption failure drops the packet.
 pub fn send_media(sock: &UdpSocket, pkt: &[u8], to: SocketAddr) {
     if sim_drop() {
         return;
@@ -121,8 +123,8 @@ pub fn send_media(sock: &UdpSocket, pkt: &[u8], to: SocketAddr) {
     if let Some(key) = armed_media_key() {
         if let Some(sealed) = seal_media(&key, pkt) {
             let _ = sock.send_to(&sealed, to);
-            return;
         }
+        return; // Encryption failure must never fall back to plaintext.
     }
     let _ = sock.send_to(pkt, to);
 }
@@ -141,7 +143,8 @@ pub fn open_incoming(pkt: &[u8]) -> Incoming {
     let ty = pkt.first().copied();
     let encrypted = matches!(
         ty,
-        Some(PT_VIDEO_ENC)
+        Some(PT_SIGNAL_ENC)
+            | Some(PT_VIDEO_ENC)
             | Some(PT_AUDIO_ENC)
             | Some(PT_AUDIO2_ENC)
             | Some(PT_INPUT_ENC)
@@ -153,6 +156,14 @@ pub fn open_incoming(pkt: &[u8]) -> Incoming {
     if encrypted {
         for key in decrypt_keys() {
             if let Some(p) = open_media(&key, pkt) {
+                if matches!(ty, Some(PT_SIGNAL_ENC | PT_INPUT_ENC | PT_ANNOT_ENC | PT_CTLREQ_ENC | PT_CTRL_ENC | PT_RUMBLE_ENC)) {
+                    let nonce = &pkt[HEADER_LEN..HEADER_LEN + 12];
+                    let role = nonce[10];
+                    let mut g = match media_arm().lock() { Ok(g) => g, Err(_) => return Incoming::Drop };
+                    if !matches!(role, ROLE_HOST | ROLE_CLIENT) || role == g.role { return Incoming::Drop; }
+                    let seq = u64::from_le_bytes(nonce[..8].try_into().unwrap());
+                    if !g.replays.entry((key, ty.unwrap())).or_default().accept(seq) { return Incoming::Drop; }
+                }
                 return Incoming::Opened(p);
             }
         }
@@ -160,9 +171,7 @@ pub fn open_incoming(pkt: &[u8]) -> Incoming {
     }
     // A v2 session has a key the packet headers do not carry. Clear picture or input would let anyone
     // who can see the token (it is in every header) inject keystrokes or frames.
-    if session_armed() && matches!(ty, Some(PT_VIDEO | PT_AUDIO | PT_AUDIO2 | PT_AUDIO3 | PT_INPUT | PT_ANNOT | PT_CTLREQ | PT_CTRL | PT_RUMBLE)) {
-        return Incoming::Drop;
-    }
+    if session_armed() { return Incoming::Drop; }
     Incoming::Plain
 }
 
@@ -186,6 +195,12 @@ fn seal_media(key: &[u8; 32], pkt: &[u8]) -> Option<Vec<u8>> {
         PT_CTLREQ => seal_ctrl(key, pkt, PT_CTLREQ_ENC, 5),
         PT_CTRL => seal_ctrl(key, pkt, PT_CTRL_ENC, 6),
         PT_RUMBLE => seal_ctrl(key, pkt, PT_RUMBLE_ENC, 7),
+        _ if pkt.len() >= HEADER_LEN => {
+            // Inner type and token are encrypted too. A clear outer token is only routing.
+            let mut inner = pkt[..HEADER_LEN].to_vec();
+            inner.extend_from_slice(pkt);
+            seal_ctrl(key, &inner, PT_SIGNAL_ENC, 8)
+        }
         _ => None,
     }
 }
@@ -196,17 +211,32 @@ fn seal_ctrl(key: &[u8; 32], pkt: &[u8], enc_type: u8, stream: u16) -> Option<Ve
     if pkt.len() < HEADER_LEN {
         return None;
     }
-    let n = {
+    let (n, role) = {
         let mut g = media_arm().lock().ok()?;
         let n = g.ctrl_nonce;
-        g.ctrl_nonce = g.ctrl_nonce.wrapping_add(1);
-        n
+        g.ctrl_nonce = g.ctrl_nonce.checked_add(1)?;
+        (n, g.role)
     };
-    crate::crypto::seal(key, pkt, enc_type, HEADER_LEN, n, 0, stream)
+    let mut nonce = [0u8; 12];
+    nonce[..8].copy_from_slice(&n.to_le_bytes());
+    nonce[8..10].copy_from_slice(&stream.to_le_bytes());
+    nonce[10] = role; // opposite directions must never share a nonce
+    let mut header = pkt[..HEADER_LEN].to_vec();
+    header[0] = enc_type;
+    let ct = crate::crypto::encrypt_payload(key, &nonce, &header, &pkt[HEADER_LEN..])?;
+    header.extend_from_slice(&nonce);
+    header.extend_from_slice(&ct);
+    Some(header)
 }
 
 fn open_media(key: &[u8; 32], pkt: &[u8]) -> Option<Vec<u8>> {
     match pkt.first().copied()? {
+        PT_SIGNAL_ENC => {
+            let opened = crate::crypto::open(key, pkt, PT_SIGNAL_ENC, HEADER_LEN)?;
+            let inner = opened.get(HEADER_LEN..)?;
+            if inner.len() < HEADER_LEN || inner[1..5] != pkt[1..5] { return None; }
+            Some(inner.to_vec())
+        }
         PT_VIDEO_ENC => crate::crypto::open(key, pkt, PT_VIDEO, VIDEO_HEADER_LEN),
         PT_AUDIO_ENC => crate::crypto::open(key, pkt, PT_AUDIO3, HEADER_LEN),
         PT_AUDIO2_ENC => crate::crypto::open(key, pkt, PT_AUDIO2, HEADER_LEN),
@@ -219,6 +249,7 @@ fn open_media(key: &[u8; 32], pkt: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+#[derive(Default)]
 struct MediaArm {
     /// Derived key from the H… code. None for an old code: the stream stays clear.
     session: Option<[u8; 32]>,
@@ -228,14 +259,16 @@ struct MediaArm {
     /// which the viewer can also open. Nothing goes out in the clear once a session key exists.
     send_pair: bool,
     peer_enc: bool,
-    ctrl_nonce: u32,
+    ctrl_nonce: u64,
+    role: u8,
+    replays: std::collections::HashMap<([u8; 32], u8), crate::crypto::ReplayWindow>,
 }
 
 fn media_arm() -> &'static std::sync::Mutex<MediaArm> {
     use std::sync::OnceLock;
     static M: OnceLock<std::sync::Mutex<MediaArm>> = OnceLock::new();
     M.get_or_init(|| {
-        std::sync::Mutex::new(MediaArm { session: None, pair: None, send_pair: false, peer_enc: false, ctrl_nonce: 0 })
+        std::sync::Mutex::new(MediaArm::default())
     })
 }
 
@@ -255,25 +288,26 @@ fn session_armed() -> bool {
 
 /// Viewer side, friend call: the pair key is known before the first packet.
 /// The session key, if the code had one, stays installed so the host's first packets still open.
-pub fn install_media_key(pair: &[u8; 32], token: u32) {
+pub fn install_media_key(pair: &[u8; 32], _token: u32) {
     if let Ok(mut g) = media_arm().lock() {
-        g.pair = Some(crate::crypto::media_key(pair, token));
+        g.pair = g.session.map(|session| crate::crypto::friend_session_key(pair, &session));
         g.send_pair = true;
     }
 }
 
 /// Both sides of a v2 connection. The secret travelled only inside the H… code, never in a UDP header.
-pub fn install_session_key(secret: &[u8; 32], token: u32) {
+pub fn install_session_key(secret: &[u8; 32], token: u32, role: u8) {
     if let Ok(mut g) = media_arm().lock() {
         g.session = Some(crate::crypto::media_key(secret, token));
+        g.role = role;
     }
 }
 
 /// Host side, from the GUI. Decrypt with the pair key immediately; keep sending with the session key
 /// until the viewer says it has the pair key too ([`note_peer_enc`]).
-pub fn note_media_pair(pair: [u8; 32], token: u32) {
+pub fn note_media_pair(pair: [u8; 32], _token: u32) {
     if let Ok(mut g) = media_arm().lock() {
-        g.pair = Some(crate::crypto::media_key(&pair, token));
+        g.pair = g.session.map(|session| crate::crypto::friend_session_key(&pair, &session));
         if g.peer_enc {
             g.send_pair = true;
         }
@@ -731,10 +765,10 @@ pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], t
         if last_send.map_or(true, |t| t.elapsed() >= Duration::from_millis(100)) {
             write_punch(&mut out, token, my_role, announce_enc);
             for c in peer {
-                let _ = sock.send_to(&out, SocketAddr::V4(*c));
+                send_media(sock, &out, SocketAddr::V4(*c));
             }
             if let Some(a) = seen {
-                let _ = sock.send_to(&out, a);
+                send_media(sock, &out, a);
             }
             last_send = Some(Instant::now());
         }
@@ -744,7 +778,7 @@ pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], t
         if last_spray.map_or(true, |t| t.elapsed() >= Duration::from_millis(250)) {
             write_punch(&mut out, token, my_role, announce_enc);
             for a in &sprayed {
-                let _ = sock.send_to(&out, SocketAddr::V4(*a));
+                send_media(sock, &out, SocketAddr::V4(*a));
             }
             last_spray = Some(Instant::now());
         }
@@ -753,7 +787,13 @@ pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], t
             Err(e) if is_benign(&e) => continue,
             Err(e) => break Err(e.into()),
         };
-        let Some((ty, body)) = parse_header(&buf[..n], token) else { continue };
+        let raw = &buf[..n];
+        let opened = match open_incoming(raw) {
+            Incoming::Drop => continue,
+            Incoming::Plain => None,
+            Incoming::Opened(p) => Some(p),
+        };
+        let Some((ty, body)) = parse_header(opened.as_deref().unwrap_or(raw), token) else { continue };
         if !heard.iter().any(|(a, t)| *a == from && *t == ty) {
             heard.push((from, ty));
             let known = matches!(from, SocketAddr::V4(v) if peer.contains(&v));
@@ -776,14 +816,14 @@ pub fn punch(sock: &UdpSocket, my_role: u8, token: u32, peer: &[SocketAddrV4], t
                 if ty == PT_PUNCH {
                     write_header(&mut out, PT_PUNCH_ACK, token);
                     out.push(my_role);
-                    let _ = sock.send_to(&out, from);
+                    send_media(sock, &out, from);
                     seen = Some(from);
                 } else {
                     // Tell the peer a few more times in case our ACKs got lost.
                     write_header(&mut out, PT_PUNCH_ACK, token);
                     out.push(my_role);
                     for _ in 0..3 {
-                        let _ = sock.send_to(&out, from);
+                        send_media(sock, &out, from);
                     }
                     break Ok(from);
                 }
@@ -823,7 +863,7 @@ pub fn answer_punch(sock: &UdpSocket, token: u32, my_role: u8, body: &[u8], from
         let mut out = Vec::with_capacity(8);
         write_header(&mut out, PT_PUNCH_ACK, token);
         out.push(my_role);
-        let _ = sock.send_to(&out, from);
+        send_media(sock, &out, from);
     }
 }
 
@@ -847,9 +887,9 @@ mod tests {
     fn sealed_media_roundtrips_and_plaintext_stays_plaintext() {
         let token = 0xA1B2_C3D4u32;
         if let Ok(mut g) = media_arm().lock() {
-            *g = MediaArm { session: None, pair: None, send_pair: false, peer_enc: false, ctrl_nonce: 0 };
+            *g = MediaArm::default();
         }
-        install_session_key(&[3u8; 32], token);
+        install_session_key(&[3u8; 32], token, ROLE_CLIENT);
         install_media_key(&[9u8; 32], token);
         let mut video = vec![PT_VIDEO];
         video.extend_from_slice(&token.to_le_bytes());
@@ -877,13 +917,26 @@ mod tests {
             Incoming::Plain => panic!("plaintext"),
             Incoming::Drop => panic!("dropped"),
         }
-        // Ping is not picture and not input.
-        assert!(seal_media(&armed_media_key().unwrap(), &[PT_PING, 0, 0, 0, 0]).is_none());
+        // Disconnect and feedback are authenticated, not just media.
+        for ty in [PT_PING, PT_BYE, PT_CAPS, PT_REPORT, PT_PUNCH, PT_PUNCH_ACK, PT_NACK, PT_ANACK] {
+            media_arm().lock().unwrap().role = ROLE_CLIENT;
+            let pkt = [ty, 0, 0, 0, 0];
+            let sealed = seal_media(&armed_media_key().unwrap(), &pkt).unwrap();
+            assert!(matches!(open_incoming(&sealed), Incoming::Drop), "reflection");
+            media_arm().lock().unwrap().role = ROLE_HOST;
+            let mut forged = sealed.clone();
+            *forged.last_mut().unwrap() ^= 1;
+            assert!(matches!(open_incoming(&forged), Incoming::Drop), "bad tag must not advance replay window");
+            assert!(matches!(open_incoming(&sealed), Incoming::Opened(p) if p == pkt));
+            assert!(matches!(open_incoming(&sealed), Incoming::Drop), "replay");
+        }
+        media_arm().lock().unwrap().role = ROLE_CLIENT;
         let mut input = vec![PT_INPUT];
         input.extend_from_slice(&token.to_le_bytes());
         input.extend_from_slice(&[1, 0, 1]);
         let sealed_in = seal_media(&armed_media_key().unwrap(), &input).unwrap();
         assert_eq!(sealed_in[0], PT_INPUT_ENC);
+        media_arm().lock().unwrap().role = ROLE_HOST;
         match open_incoming(&sealed_in) {
             Incoming::Opened(p) => assert_eq!(p, input),
             Incoming::Plain => panic!("plaintext"),
@@ -895,17 +948,27 @@ mod tests {
         let mut clear = vec![PT_INPUT, 0, 0, 0, 0, 1];
         clear[1..5].copy_from_slice(&token.to_le_bytes());
         assert!(matches!(open_incoming(&clear), Incoming::Drop));
-        assert!(matches!(open_incoming(&[PT_PING, 0, 0, 0, 0]), Incoming::Plain));
+        assert!(matches!(open_incoming(&[PT_PING, 0, 0, 0, 0]), Incoming::Drop));
         let session_only = {
             let g = media_arm().lock().unwrap();
             g.session.unwrap()
         };
+        media_arm().lock().unwrap().role = ROLE_CLIENT;
         let sealed_session = seal_media(&session_only, &input).unwrap();
+        media_arm().lock().unwrap().role = ROLE_HOST;
         match open_incoming(&sealed_session) {
             Incoming::Opened(p) => assert_eq!(p, input),
             Incoming::Plain => panic!("plaintext"),
             Incoming::Drop => panic!("dropped"),
         }
+        // Counter exhaustion fails closed, including at the actual UDP boundary.
+        media_arm().lock().unwrap().ctrl_nonce = u64::MAX;
+        assert!(seal_media(&session_only, &input).is_none());
+        let recv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        recv.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        let send = UdpSocket::bind("127.0.0.1:0").unwrap();
+        send_media(&send, &input, recv.local_addr().unwrap());
+        assert!(recv.recv_from(&mut [0u8; 128]).is_err(), "encryption failure must not leak plaintext");
     }
 
     #[test]

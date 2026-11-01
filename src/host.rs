@@ -409,7 +409,7 @@ pub fn run(o: HostOpts) -> Result<()> {
     let token = net::random_token();
     let me = Code::for_socket(net::ROLE_HOST, token, &sock, &nat);
     if let Some(secret) = me.secret {
-        net::install_session_key(&secret, token);
+        net::install_session_key(&secret, token, net::ROLE_HOST);
     }
     ui::show_code(&o.exchange, &me.encode(), "host.code", "Ваш код — передайте его зрителю:")?;
     let peer_code = ui::read_code(
@@ -482,6 +482,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                         continue;
                     }
                 };
+                if from != peer { continue; }
                 if n >= net::HEADER_LEN {
                     let t = u32::from_le_bytes(buf[1..5].try_into().unwrap());
                     if t == token {
@@ -506,7 +507,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     net::PT_PING => {
                         net::write_header(&mut out, net::PT_PONG, token);
                         out.extend_from_slice(body);
-                        let _ = sock.send_to(&out, from);
+                        net::send_media(&sock, &out, from);
                     }
                     net::PT_PUNCH => net::answer_punch(&sock, token, net::ROLE_HOST, body, from),
                     net::PT_CAPS => {
@@ -978,7 +979,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     let mut bye = Vec::new();
     net::write_header(&mut bye, net::PT_BYE, token);
     for _ in 0..3 {
-        let _ = sock.send_to(&bye, peer);
+        net::send_media(&sock, &bye, peer);
     }
     Ok(())
 }

@@ -109,7 +109,7 @@ mod report_tests {
 fn send_ping(sock: &UdpSocket, peer: SocketAddr, token: u32, sh: &Shared, out: &mut Vec<u8>) {
     net::write_header(out, net::PT_PING, token);
     out.extend_from_slice(&(sh.start.elapsed().as_micros() as u64).to_le_bytes());
-    let _ = sock.send_to(out, peer);
+    net::send_media(sock, out, peer);
 }
 
 /// Typical decode + convert + present time; the frame hold is shortened by this much.
@@ -275,9 +275,12 @@ pub fn run(o: ClientOpts) -> Result<()> {
         &sock,
         nat.keepalive_server,
     )?;
+    let mut o = o;
+    if o.media_pair.is_none() { o.media_pair = ui::take_media_pair(); }
     if let Some(secret) = host.secret {
-        net::install_session_key(&secret, host.token);
+        net::install_session_key(&secret, host.token, net::ROLE_CLIENT);
     }
+    if let Some(pair) = o.media_pair { net::install_media_key(&pair, host.token); }
     let me = Code::for_socket(net::ROLE_CLIENT, host.token, &sock, &nat);
     ui::show_code(&o.exchange, &me.encode(), "client.code", "Ваш код ответа — передайте его тому, кто транслирует экран:")?;
     println!("Жду, пока код ответа введут на стороне показа...");
@@ -411,6 +414,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
             while sh.running.load(Ordering::Relaxed) {
                 match sock.recv_from(&mut buf) {
                     Ok((n, from)) => {
+                        if from != peer { continue; }
                         let incoming = net::open_incoming(&buf[..n]);
                         if matches!(incoming, net::Incoming::Drop) {
                             continue;
@@ -487,13 +491,13 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     rx3.tick(now, &mut |s, rate| q.push(s, rate));
                     let want = rx3.nacks(now);
                     if !want.is_empty() {
-                        let _ = sock.send_to(&crate::opusaudio::anack_packet(token, &want), peer);
+                        net::send_media(&sock, &crate::opusaudio::anack_packet(token, &want), peer);
                     }
                 }
                 for (fid, idxs) in re.nacks(now, rtt) {
                     // One request per frame (a huge list is split so each datagram stays small).
                     for pkt in retx::nack_packets(token, fid, &idxs) {
-                        let _ = sock.send_to(&pkt, peer);
+                        net::send_media(&sock, &pkt, peer);
                     }
                 }
                 re.check_timeout(now, rtt, &mut ready);
@@ -559,7 +563,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 // pair key only after CAP_ENC. Say it immediately so that switch is not late.
                 net::write_header(&mut out, net::PT_CAPS, token);
                 out.push(if audio_on { net::CAP_OPUS } else { 0 } | if control { net::CAP_INPUT } else { 0 } | if enc { net::CAP_ENC } else { 0 });
-                let _ = sock.send_to(&out, peer);
+                net::send_media(&sock, &out, peer);
             }
             while sh.running.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
@@ -567,7 +571,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 // Keyframe request: last resort, with a backoff so a bad moment doesn't become a request storm.
                 if keyreq.poll(Instant::now(), sh.waiting_key.load(Ordering::Relaxed)) {
                     net::write_header(&mut out, net::PT_KEYREQ, token);
-                    let _ = sock.send_to(&out, peer);
+                    net::send_media(&sock, &out, peer);
                     sh.keyreqs.store(keyreq.sent, Ordering::Relaxed);
                 }
                 if (audio_on || control || enc) && tick % 10 == 1 {
@@ -575,7 +579,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                     // and remote control (it only sends control answers to viewers that say so).
                     net::write_header(&mut out, net::PT_CAPS, token);
                     out.push(if audio_on { net::CAP_OPUS } else { 0 } | if control { net::CAP_INPUT } else { 0 } | if enc { net::CAP_ENC } else { 0 });
-                    let _ = sock.send_to(&out, peer);
+                    net::send_media(&sock, &out, peer);
                 }
                 if tick % 5 == 0 {
                     send_ping(&sock, peer, token, &sh, &mut out);
@@ -589,7 +593,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                         requested: 0,
                     };
                     report_datagram(&mut out, token, &st, sh.rtt_us.load(Ordering::Relaxed));
-                    let _ = sock.send_to(&out, peer);
+                    net::send_media(&sock, &out, peer);
                 }
                 if tick % 10 == 0 {
                     let (rx, miss, res) =
@@ -1073,7 +1077,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
     let mut out = Vec::new();
     net::write_header(&mut out, net::PT_BYE, token);
     for _ in 0..3 {
-        let _ = sock.send_to(&out, peer);
+        net::send_media(&sock, &out, peer);
     }
     drop(player);
     Ok(())

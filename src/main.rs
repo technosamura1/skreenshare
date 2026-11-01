@@ -368,6 +368,10 @@ fn run(mut a: Args) -> Result<()> {
 }
 
 fn main() {
+    if let Err(e) = bundle::secure_search() {
+        eprintln!("Безопасная загрузка библиотек недоступна: {e:#}");
+        std::process::exit(1);
+    }
     let mut a = Args(std::env::args().skip(1).collect());
     if a.0.is_empty() {
         unsafe {

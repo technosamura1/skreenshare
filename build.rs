@@ -1,6 +1,7 @@
 // Packs the FFmpeg DLLs into the exe (zstd-compressed) and marks them delay-loaded, so the program ships
 // as a single file: on first start it unpacks them to %LOCALAPPDATA% (see src/bundle.rs).
 use std::io::Write;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 // avformat is linked by ffmpeg-next but none of its functions end up in the exe, so it isn't shipped.
@@ -85,9 +86,11 @@ fn main() {
         bundle.extend_from_slice(name.as_bytes());
         bundle.extend_from_slice(&(data.len() as u64).to_le_bytes());
         bundle.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+        let digest = Sha256::digest(&data);
+        bundle.extend_from_slice(&digest);
         bundle.extend_from_slice(&packed);
-        // FNV-1a over names and sizes: a new FFmpeg build gets a new cache folder.
-        for b in name.bytes().chain(data.len().to_le_bytes()) {
+        // Include contents in the cache id, not just DLL names and sizes.
+        for b in name.bytes().chain(digest.iter().copied()) {
             id = (id ^ b as u64).wrapping_mul(0x100000001b3);
         }
         let lower = name.to_lowercase();
