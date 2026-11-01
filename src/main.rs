@@ -1,6 +1,7 @@
 // GUI app: no console window when started by double-click. CLI use attaches to the parent console.
 #![windows_subsystem = "windows"]
 
+mod captureexclude;
 mod annot;
 mod annotview;
 mod audio;
