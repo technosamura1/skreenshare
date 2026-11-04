@@ -165,6 +165,11 @@ impl ViewInput {
     }
 
     /// A sticker for the host's screen, at a spot of the picture (None: where the laser is, or a corner).
+    /// A click with the laser: a glow at `at` on the host's screen.
+    pub fn pulse(&self, at: (u16, u16)) {
+        self.annot.lock().unwrap().pulse(at, Instant::now());
+    }
+
     pub fn react(&self, sticker: u8, at: Option<(u16, u16)>) {
         self.annot.lock().unwrap().react(sticker, at);
     }

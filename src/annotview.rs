@@ -130,8 +130,12 @@ fn run(
             Some(inst.into()),
             None,
         )?;
-        let mut excluded = crate::captureexclude::apply(h);
-        if debug_visible { excluded = crate::captureexclude::Exclusion { wgc: true, dda: true }; }
+        // SS_ANNOT_VISIBLE: screenshots must see the overlay, so it is not excluded at all (only then).
+        let excluded = if debug_visible {
+            crate::captureexclude::Exclusion { wgc: true, dda: true }
+        } else {
+            crate::captureexclude::apply(h)
+        };
         *exclusion.lock().unwrap() = Some(excluded);
         h
     };
@@ -191,6 +195,9 @@ fn run(
             .filter_map(|s| {
                 let (x, y) = inputhost::region_point(reg, s.at)?;
                 let age = now.saturating_duration_since(s.born);
+                if s.sticker == annot::PULSE {
+                    return Some((s.sticker as usize, (x as f32, y as f32), 1.0, 1.0, age));
+                }
                 let (rise, scale, alpha) = annot::motion(age);
                 Some((s.sticker as usize, (x as f32 + s.lane as f32 * STICKER * 0.7, y as f32 - rise * STICKER), scale, alpha, age))
             })
@@ -211,8 +218,8 @@ fn run(
         if let Some((x, y)) = laser {
             grow(x as f32, y as f32, LASER_R + 4.0);
         }
-        for (_, (x, y), _, _, _) in &items {
-            grow(*x, *y, STICKER * 0.55);
+        for (i, (x, y), _, _, _) in &items {
+            grow(*x, *y, if *i == annot::PULSE as usize { 84.0 } else { STICKER * 0.55 });
         }
         // Top centre of the streamed monitor / window.
         let banner = asking.then(|| inputhost::region_rect(reg)).flatten().map(|(rl, rt, rw, _)| (rl as f32 + rw as f32 / 2.0, rt as f32 + 80.0));
@@ -321,6 +328,25 @@ fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, 
             dpiY: 96.0,
         };
         for (i, (x, y), scale, alpha, age) in items {
+            if *i == annot::PULSE as usize {
+                // The viewer clicked with the laser: a soft glow and two rings spreading from the spot.
+                let (x, y) = (x - ox, y - oy);
+                let (rings, (dr, da)) = annot::pulse_rings(*age);
+                let brush = rt.CreateSolidColorBrush(&color(1.0, 0.25, 0.2, da), None)?;
+                let at = windows_numerics::Vector2 { X: x, Y: y };
+                if da > 0.0 {
+                    rt.FillEllipse(&D2D1_ELLIPSE { point: at, radiusX: dr, radiusY: dr }, &brush);
+                }
+                for (r, a) in rings {
+                    if a > 0.0 {
+                        brush.SetColor(&color(1.0, 0.35, 0.28, a));
+                        rt.DrawEllipse(&D2D1_ELLIPSE { point: at, radiusX: r, radiusY: r }, &brush, 4.0, None);
+                        brush.SetColor(&color(1.0, 0.75, 0.7, a * 0.6));
+                        rt.DrawEllipse(&D2D1_ELLIPSE { point: at, radiusX: r, radiusY: r }, &brush, 1.5, None);
+                    }
+                }
+                continue;
+            }
             // The sticker moves: this moment's frame.
             let img = crate::stickers::get(*i, STICKER as i32, *age);
             let size = D2D_SIZE_U { width: img.size as u32, height: img.size as u32 };
@@ -364,10 +390,17 @@ pub fn demo(region: Region) {
     let mut s = annot::Sender::new(1);
     let t0 = Instant::now();
     let mut next_r = 0;
+    let mut pulses = 0u64;
     while t0.elapsed() < Duration::from_secs(7) {
         let now = Instant::now();
         let f = t0.elapsed().as_secs_f32() / 7.0;
-        s.set_laser(Some(((8000.0 + f * 49000.0) as u16, (32768.0 + (f * 12.0).sin() * 12000.0) as u16)), now);
+        let laser = ((8000.0 + f * 49000.0) as u16, (32768.0 + (f * 12.0).sin() * 12000.0) as u16);
+        s.set_laser(Some(laser), now);
+        // Laser clicks: the glow, once a second from 1.2 s.
+        if t0.elapsed() > Duration::from_millis(1200 + 1000 * pulses) {
+            s.pulse(laser, now);
+            pulses += 1;
+        }
         if next_r < 4 && t0.elapsed() > Duration::from_millis(600 + 700 * next_r as u64) {
             s.react(crate::stickers::FAVORITES[next_r] as u8, None);
             next_r += 1;

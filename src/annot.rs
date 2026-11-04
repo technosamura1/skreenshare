@@ -140,6 +140,13 @@ impl Sender {
         self.laser.filter(|_| self.moved.is_some_and(|m| now.saturating_duration_since(m) < LASER_IDLE))
     }
 
+    /// A click with the laser: a glow at that spot (and the laser lights up again if it had gone idle).
+    pub fn pulse(&mut self, at: (u16, u16), now: Instant) {
+        self.laser = Some(at);
+        self.moved = Some(now);
+        self.react(PULSE, Some(at));
+    }
+
     pub fn react(&mut self, sticker: u8, at: Option<(u16, u16)>) {
         self.rseq = self.rseq.wrapping_add(1);
         self.pending.push((Sent { rseq: self.rseq, sticker, at }, SENDS));
@@ -168,6 +175,28 @@ impl Sender {
         self.last_send = Some(now);
         Some(Frame { seq: self.seq, laser, reactions })
     }
+}
+
+/// The viewer clicked with the laser on: a glow spreads a little from that spot to catch the streamer's eye.
+/// Travels as a reaction with this reserved number (the pack has fewer stickers), so it is repeated like one.
+pub const PULSE: u8 = 63;
+/// How long the glow lasts.
+pub const PULSE_LIFE: Duration = Duration::from_millis(900);
+
+fn life(sticker: u8) -> Duration {
+    if sticker == PULSE { PULSE_LIFE } else { REACTION_LIFE }
+}
+
+/// The glow `age` after the click: two rings spreading out, the second a little later, and a soft disc under
+/// them. (radius px, opacity) per ring, then the disc's (radius px, opacity). Opacity 0 = not drawn.
+pub fn pulse_rings(age: Duration) -> ([(f32, f32); 2], (f32, f32)) {
+    let ring = |delay: f32| {
+        let t = ((age.as_secs_f32() - delay) / (PULSE_LIFE.as_secs_f32() - delay)).clamp(0.0, 1.0);
+        let e = 1.0 - (1.0 - t) * (1.0 - t); // fast out, slowing down
+        if age.as_secs_f32() < delay || t >= 1.0 { (0.0, 0.0) } else { (14.0 + 62.0 * e, 0.85 * (1.0 - t)) }
+    };
+    let t = (age.as_secs_f32() / PULSE_LIFE.as_secs_f32()).clamp(0.0, 1.0);
+    ([ring(0.0), ring(0.18)], (22.0 + 26.0 * t, 0.32 * (1.0 - t)))
 }
 
 /// One reaction on screen.
@@ -217,7 +246,7 @@ impl Board {
 
     /// A reaction to show (`at` None: the corner, spread over lanes).
     pub fn add(&mut self, now: Instant, sticker: u8, at: Option<(u16, u16)>) {
-        self.shown.retain(|s| now.saturating_duration_since(s.born) < REACTION_LIFE);
+        self.shown.retain(|s| now.saturating_duration_since(s.born) < life(s.sticker));
         if self.shown.len() >= MAX_ACTIVE {
             self.shown.remove(0);
         }
@@ -237,7 +266,7 @@ impl Board {
     }
 
     pub fn reactions(&mut self, now: Instant) -> &[Shown] {
-        self.shown.retain(|s| now.saturating_duration_since(s.born) < REACTION_LIFE);
+        self.shown.retain(|s| now.saturating_duration_since(s.born) < life(s.sticker));
         &self.shown
     }
 
@@ -353,6 +382,31 @@ mod tests {
         s.set_laser(Some((6, 5)), now);
         b.on_frame(now, &s.poll(now).unwrap());
         assert_eq!(b.laser(now), Some((6, 5)));
+    }
+
+    #[test]
+    fn a_laser_click_glows_at_its_spot_briefly_and_wakes_the_laser() {
+        let t = Instant::now();
+        let mut s = Sender::new(0);
+        let mut b = Board::default();
+        s.set_laser(Some((10, 20)), t);
+        let late = t + LASER_IDLE + ms(500);
+        assert_eq!(s.laser_visible(late), None, "idle laser is dark");
+        s.pulse((30, 40), late);
+        assert_eq!(s.laser_visible(late), Some((30, 40)), "a click lights it again");
+        b.on_frame(late, &wire(s.poll(late).unwrap()));
+        let r = b.reactions(late);
+        assert_eq!((r.len(), r[0].sticker, r[0].at, r[0].lane), (1, PULSE, (30, 40), 0));
+        assert_eq!(b.reactions(late + PULSE_LIFE).len(), 0, "a glow is short, not a 2 s sticker");
+        // It spreads out and fades.
+        let ([a0, _], d0) = pulse_rings(ms(50));
+        let ([a1, b1], d1) = pulse_rings(ms(500));
+        assert!(a1.0 > a0.0 && a1.1 < a0.1 && b1.1 > 0.0 && d1.1 < d0.1);
+        assert!(pulse_rings(ms(0)).0[1].1 == 0.0, "the second ring starts later");
+        let ([e, f], g) = pulse_rings(PULSE_LIFE);
+        assert!(e.1 == 0.0 && f.1 == 0.0 && g.1 == 0.0);
+        assert!(a1.0 <= 80.0, "a little, not across the screen");
+        assert!(crate::stickers::count() < PULSE as usize, "the number is free");
     }
 
     #[test]

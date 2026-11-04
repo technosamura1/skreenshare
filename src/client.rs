@@ -1691,6 +1691,16 @@ impl ApplicationHandler<UserEv> for App {
                         self.picker = false;
                         self.redraw();
                     }
+                    Hit::Outside if self.laser && !self.captured && self.armed.is_none() => {
+                        // A click with the laser: a glow there, so the streamer looks (no double-click fullscreen).
+                        if let Some(at) = self.picture_spot(winit::dpi::PhysicalPosition::new(self.cursor.0 as f64, self.cursor.1 as f64)) {
+                            self.input.pulse(at);
+                            self.pops.retain(|p| p.0.elapsed() < crate::annot::REACTION_LIFE);
+                            self.pops.push((Instant::now(), self.cursor, crate::annot::PULSE as usize));
+                            self.redraw();
+                        }
+                        self.last_click = None;
+                    }
                     Hit::Outside if self.armed.is_some() => {
                         self.send_sticker(self.armed.unwrap_or(0));
                         self.last_click = None;
@@ -1914,6 +1924,19 @@ impl App {
             let big = 96 * sc;
             self.pops.retain(|p| p.0.elapsed() < crate::annot::REACTION_LIFE);
             for (t, (x, y), i) in &self.pops {
+                if *i == crate::annot::PULSE as usize {
+                    // Our own laser click, the same glow the streamer sees.
+                    let (rings, (dr, da)) = crate::annot::pulse_rings(t.elapsed());
+                    if da > 0.0 {
+                        ob.disc(*x, *y, dr * sc as f32, 0x00_FF_40_33, da);
+                    }
+                    for (r, a) in rings {
+                        if a > 0.0 {
+                            ob.ring(*x, *y, r * sc as f32, 3.0 * sc as f32, 0x00_FF_59_47, a);
+                        }
+                    }
+                    continue;
+                }
                 let (rise, scale, alpha) = crate::annot::motion(t.elapsed());
                 let size = (big as f32 * scale) as i32;
                 let img = crate::stickers::get(*i, size, t.elapsed());
