@@ -1467,6 +1467,16 @@ impl ApplicationHandler<UserEv> for App {
         self.surface = Some(softbuffer::Surface::new(&ctx, window.clone()).expect("softbuffer surface"));
         let s = window.inner_size();
         self.sh.win_size.store(((s.width as u64) << 32) | s.height as u64, Ordering::Relaxed);
+        // Local performance harness: prevent the fullscreen viewer feeding back
+        // into its own captured monitor. This is opt-in and off in normal use.
+        if std::env::var_os("SS_PERF_EXCLUDE_VIEWER").is_some() {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = window.window_handle() {
+                if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                    crate::captureexclude::apply(windows::Win32::Foundation::HWND(h.hwnd.get() as *mut core::ffi::c_void));
+                }
+            }
+        }
         self.window = Some(window);
     }
 

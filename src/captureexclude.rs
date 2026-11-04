@@ -44,20 +44,16 @@ pub fn allows(exclusion: Option<Exclusion>, dda: bool) -> bool {
     exclusion.is_some_and(|e| if dda { e.dda } else { e.wgc })
 }
 
-pub fn use_wgc_monitor(build: Option<u32>, annotations: bool, forced: &str) -> bool {
-    annotations && forced != "dd" && (forced == "wgc" || build.is_none_or(|b| b >= 20348))
-}
+pub fn use_wgc_monitor(forced: &str) -> bool { forced == "wgc" }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn windows_10_monitor_capture_avoids_wgc_border() {
-        assert!(!use_wgc_monitor(Some(19045), true, ""));
-        assert!(use_wgc_monitor(Some(22000), true, ""));
-        assert!(!use_wgc_monitor(Some(22000), true, "dd"));
-        assert!(use_wgc_monitor(Some(19045), true, "wgc"));
-        assert!(!use_wgc_monitor(Some(22000), false, ""));
+    fn monitor_capture_prefers_dda_with_explicit_wgc_override() {
+        assert!(!use_wgc_monitor(""));
+        assert!(!use_wgc_monitor("dd"));
+        assert!(use_wgc_monitor("wgc"));
     }
     #[test]
     fn each_backend_requires_its_own_exclusion() {

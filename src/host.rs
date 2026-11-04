@@ -240,23 +240,23 @@ fn sync_annotation_capture(cap: &Cap, capture_safe: &AtomicBool, paused: &Atomic
     Ok(())
 }
 
-/// The whole monitor: through Windows Graphics Capture when the pointer/sticker overlay is on (so it
-/// stays out of the stream), else (or when that fails) Desktop Duplication as always.
+/// Prefer low-latency Desktop Duplication for a whole monitor. The overlay has
+/// its own verified DDA exclusion; WGC remains an explicit override/fallback.
 fn open_screen(monitor: &MonitorInfo) -> Result<Cap> {
-    // Windows 10 client builds cannot disable the WGC border. Prefer DDA there;
-    // its overlay exclusion is verified separately through WCA_EXCLUDED_FROM_DDA.
     let forced = std::env::var("SS_CAPTURE").unwrap_or_default();
-    if crate::captureexclude::use_wgc_monitor(crate::glass::build_number(), crate::annotview::load_enabled(), &forced) {
-        match WindowCapturer::new_monitor(monitor.left + monitor.width as i32 / 2, monitor.top + monitor.height as i32 / 2) {
-            Ok(w) => {
-                crate::net::conn_log("захват экрана: Windows Graphics Capture (указка и стикеры не попадают в трансляцию)");
-                return Ok(Cap::Monitor(Box::new(w)));
+    if !crate::captureexclude::use_wgc_monitor(&forced) {
+        match Capturer::new(monitor) {
+            Ok(c) => {
+                crate::net::conn_log("захват экрана: Desktop Duplication (быстрый путь без рамки; оверлей проверяется отдельно)");
+                return Ok(Cap::Screen(c));
             }
-            Err(e) => crate::net::conn_log(&format!("захват экрана через Windows Graphics Capture не вышел ({e:#}); Desktop Duplication")),
+            Err(e) if forced == "dd" => return Err(e),
+            Err(e) => crate::net::conn_log(&format!("Desktop Duplication недоступен ({e:#}); пробую Windows Graphics Capture")),
         }
     }
-    crate::net::conn_log("захват экрана: Desktop Duplication (без системной рамки; оверлей проверяется отдельно)");
-    Ok(Cap::Screen(Capturer::new(monitor)?))
+    let w = WindowCapturer::new_monitor(monitor.left + monitor.width as i32 / 2, monitor.top + monitor.height as i32 / 2)?;
+    crate::net::conn_log("захват экрана: Windows Graphics Capture (резервный путь)");
+    Ok(Cap::Monitor(Box::new(w)))
 }
 
 /// Opens window capture, or says why it can't be done (the caller then shows the full screen).
