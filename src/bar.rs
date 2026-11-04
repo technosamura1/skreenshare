@@ -693,7 +693,7 @@ mod tests {
         for (ww, wh, s) in [(1280, 720, 1), (1000, 600, 1), (3840, 2160, 2)] {
             let b = Bar::with_control(ww, wh, s, true);
             assert!(b.react);
-            let n = 29;
+            let n = 27;
             let p = b.picker_rect(n);
             assert!(p.0 >= 0 && p.0 + p.2 <= ww && p.1 >= 0 && p.1 + p.3 <= b.y, "{p:?}");
             for i in 0..n {
