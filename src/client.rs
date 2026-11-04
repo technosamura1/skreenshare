@@ -1347,7 +1347,7 @@ impl App {
             }
         }
         if self.hover == Hit::Laser {
-            return Some(("Указка · L — включить/выключить · Esc — обычный курсор".into(), LASER, 0.95));
+            return Some(("Указка · L — включить/выключить · ПКМ или Esc — обычный курсор".into(), LASER, 0.95));
         }
         if self.picker {
             return Some(("Стикеры: ЛКМ — выбрать · ПКМ — в избранное (встанет первым на панели)".into(), 0x00_3E_CF_8E, 0.9));
@@ -1357,7 +1357,7 @@ impl App {
             return Some((format!("Стикер «{name}»: кликайте по картинке — он появится у транслирующего · ПКМ или Esc — убрать"), 0x00_3E_CF_8E, 0.9));
         }
         if self.laser && !self.captured {
-            return Some(("Лазерная указка у транслирующего · гаснет, если не двигать мышь 3 с · L или Esc — выключить".into(), LASER, 0.85));
+            return Some(("Лазерная указка у транслирующего · клик — сияние · гаснет, если не двигать мышь 3 с · ПКМ, L или Esc — выключить".into(), LASER, 0.85));
         }
         if let Some(h) = self.ctl_hint() {
             return Some(h);
@@ -1655,6 +1655,14 @@ impl ApplicationHandler<UserEv> for App {
                     }
                 }
                 if self.armed.take().is_some() | std::mem::take(&mut self.picker) {
+                    self.redraw();
+                    return;
+                }
+                // Right click puts the laser away (L turns it on again).
+                if self.laser {
+                    self.laser = false;
+                    self.input.laser(None);
+                    self.toast = Some(("Указка выключена (L — включить снова)".into(), Instant::now()));
                     self.redraw();
                     return;
                 }
