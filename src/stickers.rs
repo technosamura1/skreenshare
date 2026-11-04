@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn the_pack_unpacks_and_every_frame_is_a_premultiplied_square() {
-        assert_eq!(count(), 24);
+        assert_eq!(count(), 29);
         for id in 0..count() {
             for want in [1, 48, 60, 128, 400] {
                 let img = get(id, want, Duration::ZERO);
