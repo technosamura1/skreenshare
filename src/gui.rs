@@ -665,6 +665,11 @@ fn save_show_preview(on: bool) {
 /// The frame rates offered; anything else in the settings file falls back to 60.
 const FPS_CHOICES: [u32; 3] = [30, 60, 144];
 
+/// «Окно просмотра поверх всех окон» (gui.ini `viewer_on_top`, off by default).
+fn load_on_top() -> bool {
+    crate::volume::ini_get(&crate::volume::read_settings(), "viewer_on_top") == Some("1")
+}
+
 fn load_fps() -> u32 {
     crate::volume::ini_get(&crate::volume::read_settings(), "fps")
         .and_then(|v| v.parse().ok())
@@ -998,6 +1003,8 @@ struct GuiApp {
     /// "Звук только из этого окна" and "Не передавать звук Discord".
     audio_prefs: audiosel::AudioPrefs,
     fullscreen: bool,
+    /// The viewer window stays above all other windows (`viewer_on_top` in gui.ini; T while watching).
+    on_top: bool,
     /// Viewer mode «Игра» (low latency) instead of «Кино» (lip sync). Remembered.
     game: bool,
     host: Option<Session>,
@@ -1159,6 +1166,7 @@ impl GuiApp {
             audio: true,
             audio_prefs: audiosel::AudioPrefs::default(),
             fullscreen: true,
+            on_top: load_on_top(),
             game: crate::volume::ini_get(&crate::volume::read_settings(), "viewer_mode") == Some("game"),
             host: None,
             badge: Default::default(),
@@ -1294,6 +1302,11 @@ impl GuiApp {
         }
         if self.game {
             args.push("--game".into());
+        }
+        // The viewer may have toggled it with T last time: gui.ini has the newest choice.
+        self.on_top = load_on_top();
+        if self.on_top {
+            args.push("--on-top".into());
         }
         // A short room code needs no pasting at all: the client fetches the offer itself.
         let room = easy::normalize(&code);
@@ -1752,7 +1765,8 @@ impl GuiApp {
         let room = (ui.available_height() - (2.0 * 42.0 + 4.0 + 8.0 + 88.0)).max(60.0);
         let mut open = false;
         egui::ScrollArea::vertical().max_height(room).auto_shrink([false, true]).show(ui, |ui| {
-            egui::CollapsingHeader::new("Управление зрителя").default_open(false).show(ui, |ui| open = self.side_control(ui));
+            // Unindented: the sidebar is narrow, an indent pushed the card over its right edge.
+            egui::CollapsingHeader::new("Управление зрителя").default_open(false).show_unindented(ui, |ui| open = self.side_control(ui));
         });
         if open {
             self.page = Page::Control;
@@ -1838,16 +1852,17 @@ impl GuiApp {
                     ui.label(RichText::new("Отключено аварийным сочетанием").color(c_red()).size(12.5));
                 }
                 if ctl.pad {
-                    ui.horizontal(|ui| {
+                    // Icon + text that wraps under itself: one line was wider than the card in the narrow sidebar.
+                    let (text, col, ico) = if vigem {
+                        ("Драйвер геймпада есть", c_green(), Ico::Check)
+                    } else {
+                        ("Нет драйвера геймпада", c_yellow(), Ico::Warn)
+                    };
+                    ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                        if vigem {
-                            draw_ico(ui.painter(), Ico::Check, r.center(), 14.0, c_green());
-                            ui.label(RichText::new("Драйвер геймпада есть").color(c_green()).size(12.5));
-                        } else {
-                            draw_ico(ui.painter(), Ico::Warn, r.center(), 14.0, c_yellow());
-                            ui.label(RichText::new("Нет драйвера геймпада").color(c_yellow()).size(12.5));
-                        }
+                        draw_ico(ui.painter(), ico, r.center(), 14.0, col);
+                        ui.add(egui::Label::new(RichText::new(text).color(col).size(12.5)).wrap());
                     });
                 }
                 let w = ui.available_width();
@@ -3830,6 +3845,7 @@ impl GuiApp {
                 ("Esc", "выйти из полного экрана"),
                 ("Колесо мыши", "громкость, шаг 5%"),
                 ("M", "выключить и включить звук"),
+                ("T", "окно поверх всех остальных"),
             ] {
                 ui.horizontal(|ui| {
                     let (r, _) = ui.allocate_exact_size(Vec2::new(150.0, 24.0), Sense::hover());
@@ -4490,6 +4506,14 @@ impl GuiApp {
                 });
                 fold(ui, "Дополнительно", |ui| {
                     ui.checkbox(&mut self.fullscreen, "Открыть на весь экран");
+                    if ui.checkbox(&mut self.on_top, "Окно просмотра поверх всех окон").changed() {
+                        crate::volume::write_setting("viewer_on_top", if self.on_top { "1" } else { "0" });
+                    }
+                    ui.label(
+                        RichText::new("Окно трансляции остаётся сверху, даже когда вы переключаетесь на другие окна. Во время просмотра: клавиша T.")
+                            .color(c_muted())
+                            .size(12.5),
+                    );
                 });
             }
         } else {

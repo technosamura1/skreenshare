@@ -26,7 +26,7 @@ use winit::event::{DeviceEvent, DeviceId, ElementState, StartCause, MouseButton,
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::scancode::PhysicalKeyExtScancode;
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId, WindowLevel};
 
 pub struct ClientOpts {
     /// Remote control (gamepad, mouse, keyboard to the host when its owner allows it). `--no-control` turns it off.
@@ -40,6 +40,8 @@ pub struct ClientOpts {
     pub windowed: bool,
     /// «Игра»: show frames at once and keep only a small sound cushion (F3 switches while watching).
     pub game: bool,
+    /// The viewer window stays above all other windows, even when another one is picked (`--on-top`, key T).
+    pub on_top: bool,
     /// Test mode: save a decoded frame as BMP and quit after this many frames.
     pub screenshot: Option<PathBuf>,
     pub frames: Option<u64>,
@@ -1036,6 +1038,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         sh: sh.clone(),
         proxy,
         start_fullscreen: !o.windowed,
+        on_top: o.on_top,
         last_click: None,
         volume: player.as_ref().map(|p| p.volume.clone()),
         no_audio_note: if !o.audio {
@@ -1091,6 +1094,8 @@ struct App {
     #[allow(dead_code)]
     proxy: EventLoopProxy<UserEv>,
     start_fullscreen: bool,
+    /// «Поверх всех окон»: the window level, toggled with T and remembered in gui.ini.
+    on_top: bool,
     last_click: Option<Instant>,
     /// Level and mute of the sound (None when there is no audio output).
     volume: Option<Arc<VolumeCtl>>,
@@ -1458,6 +1463,9 @@ impl ApplicationHandler<UserEv> for App {
         if self.start_fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
+        if self.on_top {
+            attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop);
+        }
         let window = Rc::new(el.create_window(attrs).expect("create window"));
         self.cursor_shown = !self.start_fullscreen;
         window.set_cursor_visible(self.cursor_shown);
@@ -1564,6 +1572,26 @@ impl ApplicationHandler<UserEv> for App {
                     self.pad_panel = !self.pad_panel;
                     self.redraw();
                 }
+            }
+            // T (by its place, any layout): keep this window above all others, or not. Remembered for next time.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && !self.mods.control_key()
+                    && !self.mods.alt_key()
+                    && (matches!(event.physical_key, winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyT))
+                        || matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "t" | "T" | "е" | "Е"))) =>
+            {
+                self.on_top = !self.on_top;
+                if let Some(w) = &self.window {
+                    w.set_window_level(if self.on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
+                }
+                crate::volume::write_setting("viewer_on_top", if self.on_top { "1" } else { "0" });
+                self.toast = Some((
+                    if self.on_top { "Окно поверх всех остальных (T — выключить)" } else { "Окно больше не поверх остальных (T — включить)" }.into(),
+                    Instant::now(),
+                ));
+                self.redraw();
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat && matches!(event.logical_key, Key::Named(NamedKey::F3)) =>
