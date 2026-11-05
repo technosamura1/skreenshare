@@ -1064,6 +1064,8 @@ struct GuiApp {
     /// Invites waiting for «Смотреть». A second one must not erase the first: the relay cursor
     /// already moved past both, so the overwritten invite would never come back.
     friend_pending_invites: Vec<(friends::Invite, [u8; 16])>,
+    /// The invitation that answers our own «попросить трансляцию»: joined at once, no second «Смотреть».
+    friend_auto_join: Option<(friends::Invite, [u8; 16])>,
     watch_requests: friends::WatchInbox,
     watch_cancel_wait: Option<([u8; 16], String)>,
     watch_cancel_post: Option<([u8; 16], String, Receiver<Result<(), String>>)>,
@@ -1206,6 +1208,7 @@ impl GuiApp {
             presence_attempt: HashMap::new(),
             friend_last_seen: HashMap::new(),
             friend_pending_invites: Vec::new(),
+            friend_auto_join: None,
             watch_requests: friends::WatchInbox::default(),
             watch_cancel_wait: None,
             watch_cancel_post: None,
@@ -1458,6 +1461,16 @@ impl eframe::App for GuiApp {
         }
         self.play_cues();
         self.friends_poll();
+        // An invitation we asked for: straight into watching (unless something else is running — then the card).
+        if let Some((inv, id)) = self.friend_auto_join.take() {
+            let busy = self.host.as_ref().is_some_and(Session::active) || self.join.as_ref().is_some_and(Session::active) || self.test.is_some();
+            if busy {
+                self.friend_pending_invites.push((inv, id));
+            } else {
+                self.accept_invite(ctx, inv, id);
+                ctx.request_repaint();
+            }
+        }
         let friend_wait = if !self.friend_invite_wait.is_empty() {
             200
         } else if self.friend_net.is_some() || self.friend_post.is_some() {
@@ -2176,11 +2189,16 @@ impl GuiApp {
                             self.friend_last_seen.insert(id, unix);
                         }
                         PairEvent::Invite(inv) => {
-                            self.watch_sent.remove(&id);
+                            // We asked this friend to stream: their invitation is the «yes», so we just watch.
+                            let asked = self.watch_sent.remove(&id).is_some_and(|(_, t)| t.elapsed() < Duration::from_secs(friends::INVITE_TTL_SECS));
                             if friends::invite_fresh(inv.unix, now)
                                 && !self.friend_pending_invites.iter().any(|(i, fid)| i.nonce == inv.nonce && *fid == id)
                             {
-                                self.friend_pending_invites.push((inv, id));
+                                if asked && self.friend_auto_join.is_none() {
+                                    self.friend_auto_join = Some((inv, id));
+                                } else {
+                                    self.friend_pending_invites.push((inv, id));
+                                }
                             }
                         }
                         PairEvent::Answer { code, .. } => {
@@ -2579,20 +2597,25 @@ impl GuiApp {
                 });
         ui.add_space(8.0);
         if watch {
-            self.friend_rush_ids.insert(from_id, Instant::now() + Duration::from_secs(120));
-            self.join_media_key = self.book.friends.iter().find(|f| f.id == from_id).map(|f| f.pair);
-            self.friend_answer = if inv.kind == InviteKind::Offer { Some((from_id, inv.nonce.clone())) } else { None };
-            self.input = inv.code;
-            self.page = Page::Join;
-            let ctx = ui.ctx();
-            self.start_join(&ctx);
-            self.friend_pending_invites.retain(|(i, fid)| !(i.nonce == inv.nonce && *fid == from_id));
+            let ctx = ui.ctx().clone();
+            self.accept_invite(&ctx, inv, from_id);
         } else if decline {
             if let Some(msg) = self.book.decline(&from_id, &inv.nonce) {
                 self.spawn_friend_post(msg.topic, msg.body, "Приглашение отклонено.".into());
             }
             self.friend_pending_invites.retain(|(i, fid)| !(i.nonce == inv.nonce && *fid == from_id));
         }
+    }
+
+    /// «Смотреть» on an invitation, pressed or implied (we had asked for this stream ourselves).
+    fn accept_invite(&mut self, ctx: &egui::Context, inv: friends::Invite, from_id: [u8; 16]) {
+        self.friend_rush_ids.insert(from_id, Instant::now() + Duration::from_secs(120));
+        self.join_media_key = self.book.friends.iter().find(|f| f.id == from_id).map(|f| f.pair);
+        self.friend_answer = if inv.kind == InviteKind::Offer { Some((from_id, inv.nonce.clone())) } else { None };
+        self.friend_pending_invites.retain(|(i, fid)| !(i.nonce == inv.nonce && *fid == from_id));
+        self.input = inv.code;
+        self.page = Page::Join;
+        self.start_join(ctx);
     }
 
     fn invite_friend(&mut self, ctx: &egui::Context, friend_id: [u8; 16]) {
