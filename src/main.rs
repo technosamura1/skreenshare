@@ -1,6 +1,8 @@
 // GUI app: no console window when started by double-click. CLI use attaches to the parent console.
 #![windows_subsystem = "windows"]
 
+mod keepawake;
+mod captureexclude;
 mod annot;
 mod annotview;
 mod audio;
@@ -22,6 +24,7 @@ mod hdrmath;
 mod guilogic;
 mod glass;
 mod gui;
+mod profileui;
 mod icon;
 mod inputview;
 mod overlay;
@@ -180,6 +183,7 @@ fn client_opts(a: &mut Args) -> Result<client::ClientOpts> {
         cpu_convert: a.flag("--cpu-convert"),
         windowed: a.flag("--windowed"),
         game: a.flag("--game"),
+        on_top: a.flag("--on-top"),
         screenshot: a.value("--screenshot")?.map(PathBuf::from),
         frames: a.value("--frames")?.map(|v| v.parse()).transpose().context("--frames")?,
         media_pair: match a.value("--media-key")? {

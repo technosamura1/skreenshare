@@ -22,10 +22,11 @@ pub struct AnnotView {
     stop: Arc<AtomicBool>,
     /// The host's "show the viewer's pointer and reactions" switch.
     pub enabled: Arc<AtomicBool>,
-    /// Set by the capture loop. Desktop Duplication must never capture the overlay.
+    /// Set by the capture loop after checking exclusion for the selected backend.
     pub capture_safe: Arc<AtomicBool>,
     /// Acknowledgement from the draw thread that the overlay is hidden.
     pub paused: Arc<AtomicBool>,
+    pub exclusion: Arc<Mutex<Option<crate::captureexclude::Exclusion>>>,
     got_any: AtomicBool,
 }
 
@@ -38,26 +39,28 @@ impl AnnotView {
         // Fail closed until the capture backend has been selected.
         let capture_safe = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
+        let exclusion = Arc::new(Mutex::new(None));
+        let ex = exclusion.clone();
         let (b, s, e, c, p) = (board.clone(), stop.clone(), enabled.clone(), capture_safe.clone(), paused.clone());
         std::thread::Builder::new()
             .name("annot-view".into())
             .spawn(move || {
-                if let Err(err) = run(&b, &s, &e, &c, &p, &region, input.as_deref()) {
+                if let Err(err) = run(&b, &s, &e, &c, &p, &region, input.as_deref(), &ex) {
                     crate::net::conn_log(&format!("указка: окно не создано: {err}"));
+                    c.store(false, Ordering::Release);
+                    p.store(true, Ordering::Release);
                 }
             })
             .ok();
-        AnnotView { board, stop, enabled, capture_safe, paused, got_any: AtomicBool::new(false) }
+        AnnotView { board, stop, enabled, capture_safe, paused, exclusion, got_any: AtomicBool::new(false) }
     }
 
     pub fn on_packet(&self, body: &[u8]) {
-        if !self.enabled.load(Ordering::Relaxed) {
-            return;
-        }
         if let Some(f) = annot::decode(body) {
             if !self.got_any.swap(true, Ordering::Relaxed) {
-                crate::net::conn_log("указка/реакции: первый пакет от зрителя");
+                crate::net::conn_log(&format!("указка/реакции: первый пакет от зрителя, включены={}, разрешён показ={}", self.enabled.load(Ordering::Relaxed), self.capture_safe.load(Ordering::Relaxed)));
             }
+            if !self.enabled.load(Ordering::Relaxed) { return; }
             self.board.lock().unwrap().on_frame(Instant::now(), &f);
         }
     }
@@ -104,10 +107,11 @@ fn run(
     paused: &AtomicBool,
     region: &Mutex<Option<Region>>,
     input: Option<&inputhost::InputHost>,
+    exclusion: &Mutex<Option<crate::captureexclude::Exclusion>>,
 ) -> Result<()> {
     // Explicit screenshot/debug override. Otherwise the overlay stays hidden if Windows
     // does not actually confirm its exclusion affinity.
-    let mut affinity_ok = std::env::var("SS_ANNOT_VISIBLE").is_ok();
+    let debug_visible = std::env::var("SS_ANNOT_VISIBLE").is_ok();
     let hwnd = unsafe {
         let inst = GetModuleHandleW(None)?;
         let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: inst.into(), lpszClassName: w!("ScreenshareAnnot"), ..Default::default() };
@@ -126,19 +130,15 @@ fn run(
             Some(inst.into()),
             None,
         )?;
-        // SS_ANNOT_VISIBLE is only for deliberate screenshot debugging.
-        if !affinity_ok {
-            let r = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE);
-            let mut got = 0u32;
-            let checked = GetWindowDisplayAffinity(h, &mut got);
-            affinity_ok = r.is_ok() && checked.is_ok() && got == WDA_EXCLUDEFROMCAPTURE.0;
-            crate::net::conn_log(&format!("указка: исключение из захвата: {r:?}, проверка {checked:?}, сейчас {got:#x}"));
-        }
+        // SS_ANNOT_VISIBLE: screenshots must see the overlay, so it is not excluded at all (only then).
+        let excluded = if debug_visible {
+            crate::captureexclude::Exclusion { wgc: true, dda: true }
+        } else {
+            crate::captureexclude::apply(h)
+        };
+        *exclusion.lock().unwrap() = Some(excluded);
         h
     };
-    if !affinity_ok {
-        crate::net::conn_log("указка/стикеры скрыты: Windows не подтвердила исключение окна из захвата");
-    }
     let mut gfx: Option<Gfx> = None;
     let mut shown = false;
     let mut last_drawn: Option<(Option<(i32, i32)>, usize, bool)> = None;
@@ -156,7 +156,7 @@ fn run(
         let reg = *region.lock().unwrap();
         let asking = input.is_some_and(|i| i.asking(now));
         let mut b = board.lock().unwrap();
-        let can_draw = capture_safe.load(Ordering::Acquire) && affinity_ok;
+        let can_draw = capture_safe.load(Ordering::Acquire);
         let busy = can_draw && ((enabled.load(Ordering::Relaxed) && b.busy(now)) || asking);
         let (Some(reg), true) = (reg, busy) else {
             drop(b);
@@ -195,6 +195,9 @@ fn run(
             .filter_map(|s| {
                 let (x, y) = inputhost::region_point(reg, s.at)?;
                 let age = now.saturating_duration_since(s.born);
+                if s.sticker == annot::PULSE {
+                    return Some((s.sticker as usize, (x as f32, y as f32), 1.0, 1.0, age));
+                }
                 let (rise, scale, alpha) = annot::motion(age);
                 Some((s.sticker as usize, (x as f32 + s.lane as f32 * STICKER * 0.7, y as f32 - rise * STICKER), scale, alpha, age))
             })
@@ -215,8 +218,8 @@ fn run(
         if let Some((x, y)) = laser {
             grow(x as f32, y as f32, LASER_R + 4.0);
         }
-        for (_, (x, y), _, _, _) in &items {
-            grow(*x, *y, STICKER * 0.55);
+        for (i, (x, y), _, _, _) in &items {
+            grow(*x, *y, if *i == annot::PULSE as usize { 84.0 } else { STICKER * 0.55 });
         }
         // Top centre of the streamed monitor / window.
         let banner = asking.then(|| inputhost::region_rect(reg)).flatten().map(|(rl, rt, rw, _)| (rl as f32 + rw as f32 / 2.0, rt as f32 + 80.0));
@@ -325,6 +328,25 @@ fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, 
             dpiY: 96.0,
         };
         for (i, (x, y), scale, alpha, age) in items {
+            if *i == annot::PULSE as usize {
+                // The viewer clicked with the laser: a soft glow and two rings spreading from the spot.
+                let (x, y) = (x - ox, y - oy);
+                let (rings, (dr, da)) = annot::pulse_rings(*age);
+                let brush = rt.CreateSolidColorBrush(&color(1.0, 0.25, 0.2, da), None)?;
+                let at = windows_numerics::Vector2 { X: x, Y: y };
+                if da > 0.0 {
+                    rt.FillEllipse(&D2D1_ELLIPSE { point: at, radiusX: dr, radiusY: dr }, &brush);
+                }
+                for (r, a) in rings {
+                    if a > 0.0 {
+                        brush.SetColor(&color(1.0, 0.35, 0.28, a));
+                        rt.DrawEllipse(&D2D1_ELLIPSE { point: at, radiusX: r, radiusY: r }, &brush, 4.0, None);
+                        brush.SetColor(&color(1.0, 0.75, 0.7, a * 0.6));
+                        rt.DrawEllipse(&D2D1_ELLIPSE { point: at, radiusX: r, radiusY: r }, &brush, 1.5, None);
+                    }
+                }
+                continue;
+            }
             // The sticker moves: this moment's frame.
             let img = crate::stickers::get(*i, STICKER as i32, *age);
             let size = D2D_SIZE_U { width: img.size as u32, height: img.size as u32 };
@@ -363,13 +385,22 @@ fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, 
 pub fn demo(region: Region) {
     let v = AnnotView::spawn(Arc::new(Mutex::new(Some(region))), None);
     v.enabled.store(true, Ordering::Relaxed);
+    // No capture exists in this standalone visual demo.
+    v.capture_safe.store(true, Ordering::Release);
     let mut s = annot::Sender::new(1);
     let t0 = Instant::now();
     let mut next_r = 0;
+    let mut pulses = 0u64;
     while t0.elapsed() < Duration::from_secs(7) {
         let now = Instant::now();
         let f = t0.elapsed().as_secs_f32() / 7.0;
-        s.set_laser(Some(((8000.0 + f * 49000.0) as u16, (32768.0 + (f * 12.0).sin() * 12000.0) as u16)), now);
+        let laser = ((8000.0 + f * 49000.0) as u16, (32768.0 + (f * 12.0).sin() * 12000.0) as u16);
+        s.set_laser(Some(laser), now);
+        // Laser clicks: the glow, once a second from 1.2 s.
+        if t0.elapsed() > Duration::from_millis(1200 + 1000 * pulses) {
+            s.pulse(laser, now);
+            pulses += 1;
+        }
         if next_r < 4 && t0.elapsed() > Duration::from_millis(600 + 700 * next_r as u64) {
             s.react(crate::stickers::FAVORITES[next_r] as u8, None);
             next_r += 1;

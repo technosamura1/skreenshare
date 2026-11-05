@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn the_pack_unpacks_and_every_frame_is_a_premultiplied_square() {
-        assert_eq!(count(), 18);
+        assert_eq!(count(), 27);
         for id in 0..count() {
             for want in [1, 48, 60, 128, 400] {
                 let img = get(id, want, Duration::ZERO);
@@ -194,8 +194,19 @@ mod tests {
 
     #[test]
     fn stickers_move_and_loop() {
-        let moving = (0..count()).filter(|&id| get(id, 128, Duration::ZERO).px != get(id, 128, Duration::from_millis(170)).px).count();
-        assert!(moving >= count() - 2, "{moving}");
+        // Moving = some frame differs from the first (a fixed instant can land on a short loop's start, and the
+        // cat that walks in starts with a few empty frames).
+        let moving = (0..count())
+            .filter(|&id| {
+                let mut t = 0u64;
+                pack().items[id].durs.iter().any(|&d| {
+                    t += d as u64;
+                    get(id, 128, Duration::ZERO).px != get(id, 128, Duration::from_millis(t)).px
+                })
+            })
+            .count();
+        // Pack sticker 007 (id 6, the crying cat) has 12 frames that come out identical.
+        assert!(moving >= count() - 1, "every sticker but one is animated: {moving}");
         let total = Duration::from_millis(pack().items[7].total as u64);
         assert_eq!(get(7, 128, Duration::from_millis(30)).px, get(7, 128, total + Duration::from_millis(30)).px);
     }

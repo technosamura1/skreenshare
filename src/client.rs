@@ -26,7 +26,7 @@ use winit::event::{DeviceEvent, DeviceId, ElementState, StartCause, MouseButton,
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::scancode::PhysicalKeyExtScancode;
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId, WindowLevel};
 
 pub struct ClientOpts {
     /// Remote control (gamepad, mouse, keyboard to the host when its owner allows it). `--no-control` turns it off.
@@ -40,6 +40,8 @@ pub struct ClientOpts {
     pub windowed: bool,
     /// «Игра»: show frames at once and keep only a small sound cushion (F3 switches while watching).
     pub game: bool,
+    /// The viewer window stays above all other windows, even when another one is picked (`--on-top`, key T).
+    pub on_top: bool,
     /// Test mode: save a decoded frame as BMP and quit after this many frames.
     pub screenshot: Option<PathBuf>,
     pub frames: Option<u64>,
@@ -291,6 +293,7 @@ pub fn run(o: ClientOpts) -> Result<()> {
 }
 
 fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Result<()> {
+    let _awake = crate::keepawake::SessionAwake::acquire()?;
     if let Some(pair) = o.media_pair {
         net::install_media_key(&pair, token);
     }
@@ -1035,6 +1038,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         sh: sh.clone(),
         proxy,
         start_fullscreen: !o.windowed,
+        on_top: o.on_top,
         last_click: None,
         volume: player.as_ref().map(|p| p.volume.clone()),
         no_audio_note: if !o.audio {
@@ -1090,6 +1094,8 @@ struct App {
     #[allow(dead_code)]
     proxy: EventLoopProxy<UserEv>,
     start_fullscreen: bool,
+    /// «Поверх всех окон»: the window level, toggled with T and remembered in gui.ini.
+    on_top: bool,
     last_click: Option<Instant>,
     /// Level and mute of the sound (None when there is no audio output).
     volume: Option<Arc<VolumeCtl>>,
@@ -1298,6 +1304,8 @@ impl App {
         let PhysicalKey::Code(k) = ev.physical_key else { return false };
         let r = match k {
             KeyCode::KeyL => {
+                self.armed = None;
+                self.picker = false;
                 self.laser = !self.laser;
                 let spot = if self.laser { self.picture_spot(winit::dpi::PhysicalPosition::new(self.cursor.0 as f64, self.cursor.1 as f64)) } else { None };
                 self.input.laser(spot);
@@ -1343,6 +1351,9 @@ impl App {
                 return Some((t.clone(), 0x00_3E_CF_8E, 1.0));
             }
         }
+        if self.hover == Hit::Laser {
+            return Some(("Указка · L — включить/выключить · ПКМ или Esc — обычный курсор".into(), LASER, 0.95));
+        }
         if self.picker {
             return Some(("Стикеры: ЛКМ — выбрать · ПКМ — в избранное (встанет первым на панели)".into(), 0x00_3E_CF_8E, 0.9));
         }
@@ -1351,7 +1362,7 @@ impl App {
             return Some((format!("Стикер «{name}»: кликайте по картинке — он появится у транслирующего · ПКМ или Esc — убрать"), 0x00_3E_CF_8E, 0.9));
         }
         if self.laser && !self.captured {
-            return Some(("Лазерная указка у транслирующего · гаснет, если не двигать мышь 3 с · L — выключить".into(), LASER, 0.85));
+            return Some(("Лазерная указка у транслирующего · клик — сияние · гаснет, если не двигать мышь 3 с · ПКМ, L или Esc — выключить".into(), LASER, 0.85));
         }
         if let Some(h) = self.ctl_hint() {
             return Some(h);
@@ -1452,6 +1463,9 @@ impl ApplicationHandler<UserEv> for App {
         if self.start_fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
+        if self.on_top {
+            attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop);
+        }
         let window = Rc::new(el.create_window(attrs).expect("create window"));
         self.cursor_shown = !self.start_fullscreen;
         window.set_cursor_visible(self.cursor_shown);
@@ -1461,6 +1475,16 @@ impl ApplicationHandler<UserEv> for App {
         self.surface = Some(softbuffer::Surface::new(&ctx, window.clone()).expect("softbuffer surface"));
         let s = window.inner_size();
         self.sh.win_size.store(((s.width as u64) << 32) | s.height as u64, Ordering::Relaxed);
+        // Local performance harness: prevent the fullscreen viewer feeding back
+        // into its own captured monitor. This is opt-in and off in normal use.
+        if std::env::var_os("SS_PERF_EXCLUDE_VIEWER").is_some() {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = window.window_handle() {
+                if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                    crate::captureexclude::apply(windows::Win32::Foundation::HWND(h.hwnd.get() as *mut core::ffi::c_void));
+                }
+            }
+        }
         self.window = Some(window);
     }
 
@@ -1549,6 +1573,26 @@ impl ApplicationHandler<UserEv> for App {
                     self.redraw();
                 }
             }
+            // T (by its place, any layout): keep this window above all others, or not. Remembered for next time.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && !self.mods.control_key()
+                    && !self.mods.alt_key()
+                    && (matches!(event.physical_key, winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyT))
+                        || matches!(&event.logical_key, Key::Character(c) if matches!(c.as_str(), "t" | "T" | "е" | "Е"))) =>
+            {
+                self.on_top = !self.on_top;
+                if let Some(w) = &self.window {
+                    w.set_window_level(if self.on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
+                }
+                crate::volume::write_setting("viewer_on_top", if self.on_top { "1" } else { "0" });
+                self.toast = Some((
+                    if self.on_top { "Окно поверх всех остальных (T — выключить)" } else { "Окно больше не поверх остальных (T — включить)" }.into(),
+                    Instant::now(),
+                ));
+                self.redraw();
+            }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat && matches!(event.logical_key, Key::Named(NamedKey::F3)) =>
             {
@@ -1574,7 +1618,8 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
                 match event.logical_key {
                     Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
-                    Key::Named(NamedKey::Escape) if self.armed.is_some() || self.picker => {
+                    Key::Named(NamedKey::Escape) if self.armed.is_some() || self.picker || self.laser => {
+                        self.laser = false; self.input.laser(None);
                         self.armed = None;
                         self.picker = false;
                         self.redraw();
@@ -1641,6 +1686,14 @@ impl ApplicationHandler<UserEv> for App {
                     self.redraw();
                     return;
                 }
+                // Right click puts the laser away (L turns it on again).
+                if self.laser {
+                    self.laser = false;
+                    self.input.laser(None);
+                    self.toast = Some(("Указка выключена (L — включить снова)".into(), Instant::now()));
+                    self.redraw();
+                    return;
+                }
                 self.wake_bar();
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
@@ -1673,6 +1726,16 @@ impl ApplicationHandler<UserEv> for App {
                         // A click past the open picker just closes it.
                         self.picker = false;
                         self.redraw();
+                    }
+                    Hit::Outside if self.laser && !self.captured && self.armed.is_none() => {
+                        // A click with the laser: a glow there, so the streamer looks (no double-click fullscreen).
+                        if let Some(at) = self.picture_spot(winit::dpi::PhysicalPosition::new(self.cursor.0 as f64, self.cursor.1 as f64)) {
+                            self.input.pulse(at);
+                            self.pops.retain(|p| p.0.elapsed() < crate::annot::REACTION_LIFE);
+                            self.pops.push((Instant::now(), self.cursor, crate::annot::PULSE as usize));
+                            self.redraw();
+                        }
+                        self.last_click = None;
                     }
                     Hit::Outside if self.armed.is_some() => {
                         self.send_sticker(self.armed.unwrap_or(0));
@@ -1717,6 +1780,7 @@ impl ApplicationHandler<UserEv> for App {
                             Hit::Fullscreen => self.toggle_fullscreen(),
                             Hit::Control => self.toggle_control(),
                             Hit::React(i) => {
+                                self.laser = false; self.input.laser(None);
                                 let id = self.favs[i];
                                 self.armed = if self.armed == Some(id) { None } else { Some(id) };
                                 self.picker = false;
@@ -1724,8 +1788,16 @@ impl ApplicationHandler<UserEv> for App {
                                     self.set_capture(false);
                                 }
                             }
+                            Hit::Laser => {
+                                if self.captured { self.set_capture(false); }
+                                self.laser = !self.laser;
+                                self.armed = None;
+                                self.picker = false;
+                                self.input.laser(if self.laser { self.picture_spot(winit::dpi::PhysicalPosition::new(self.cursor.0 as f64, self.cursor.1 as f64)) } else { None });
+                            }
                             Hit::More => self.picker = !self.picker,
                             Hit::Pick(id) => {
+                                self.laser = false; self.input.laser(None);
                                 self.armed = Some(id);
                                 self.picker = false;
                                 if self.captured {
@@ -1859,6 +1931,7 @@ impl App {
                 ctl: ctl.map(|(on, allowed, pads, pad_ok, kbm_ok)| bar::Ctl { on, allowed, pads: pads as u8, captured: self.captured, pad_ok, kbm_ok }),
                 armed: self.armed,
                 picker: self.picker,
+                laser: self.laser,
                 favs: self.favs,
             };
             let geom = Bar::with_control(ww as i32, wh as i32, sc, ctl.is_some());
@@ -1887,6 +1960,19 @@ impl App {
             let big = 96 * sc;
             self.pops.retain(|p| p.0.elapsed() < crate::annot::REACTION_LIFE);
             for (t, (x, y), i) in &self.pops {
+                if *i == crate::annot::PULSE as usize {
+                    // Our own laser click, the same glow the streamer sees.
+                    let (rings, (dr, da)) = crate::annot::pulse_rings(t.elapsed());
+                    if da > 0.0 {
+                        ob.disc(*x, *y, dr * sc as f32, 0x00_FF_40_33, da);
+                    }
+                    for (r, a) in rings {
+                        if a > 0.0 {
+                            ob.ring(*x, *y, r * sc as f32, 3.0 * sc as f32, 0x00_FF_59_47, a);
+                        }
+                    }
+                    continue;
+                }
                 let (rise, scale, alpha) = crate::annot::motion(t.elapsed());
                 let size = (big as f32 * scale) as i32;
                 let img = crate::stickers::get(*i, size, t.elapsed());
@@ -1971,6 +2057,7 @@ pub fn overlay_preview(out: &std::path::Path, panel: bool, on: bool) -> std::io:
         ctl: Some(bar::Ctl { on, allowed: true, pads: 2, captured: on && kbm_ok, pad_ok, kbm_ok }),
         armed: Some(crate::stickers::FAVORITES[1]),
         picker: panel,
+        laser: false,
         favs: crate::stickers::FAVORITES,
     };
     let geom = Bar::with_control(ww as i32, wh as i32, 1, true);

@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 /// Same alphabet as the short room codes, so a code can be read aloud if it has to be.
 const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
+pub const KIND_WATCH: u8 = b'W';
+pub const KIND_WATCH_CANCEL: u8 = b'X';
+pub const KIND_PROFILE: u8 = b'U';
 pub const KIND_HELLO: u8 = b'H';
 pub const KIND_PRESENCE: u8 = b'P';
 pub const KIND_INVITE: u8 = b'I';
@@ -53,6 +56,7 @@ pub struct Friend {
 pub struct Book {
     pub me: Identity,
     pub friends: Vec<Friend>,
+    pub profiles: std::collections::HashMap<[u8; 16], Profile>,
 }
 
 /// A sealed blob ready to POST.
@@ -82,7 +86,10 @@ pub struct Invite {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PairEvent {
     Presence { unix: u64, name: String },
+    Profile { unix: u64, profile: Profile },
     Invite(Invite),
+    WatchRequest { unix: u64, nonce: String },
+    WatchCancel { unix: u64, nonce: String },
     Answer { nonce: String, code: String },
     Decline { nonce: String },
 }
@@ -106,6 +113,35 @@ struct Channel {
     key: [u8; 32],
 }
 
+/// Small, bounded profile payload. JPEG bytes are rendered only after dimension checks in the GUI.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Profile {
+    pub name: String,
+    pub status: String,
+    pub avatar: u8,
+    pub photo: Vec<u8>,
+}
+impl Profile {
+    pub fn encode(&self) -> String {
+        format!("v1\n{}\n{}\n{}\n{}", b64(sanitize_name(&self.name).as_bytes()),
+            b64(clean_status(&self.status).as_bytes()), self.avatar.min(63), b64(&self.photo))
+    }
+    pub fn decode(s: &str) -> Option<Self> {
+        if s.len() > 2800 { return None; }
+        let mut it = s.split('\n');
+        if it.next()? != "v1" { return None; }
+        let name = String::from_utf8(unb64(it.next()?)?).ok()?;
+        let status = String::from_utf8(unb64(it.next()?)?).ok()?;
+        let avatar: u8 = it.next()?.parse().ok()?;
+        let photo = unb64(it.next()?)?;
+        if photo.len() > 1600 || avatar > 63 || it.next().is_some() { return None; }
+        Some(Self { name: sanitize_name(&name), status: clean_status(&status), avatar, photo })
+    }
+}
+pub fn clean_status(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(64).collect::<String>().trim().to_string()
+}
+
 impl Identity {
     pub fn generate(name: &str) -> Identity {
         let mut id = [0u8; 16];
@@ -119,7 +155,7 @@ impl Identity {
 impl Book {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(me: Identity) -> Book {
-        Book { me, friends: Vec::new() }
+        Book { me, friends: Vec::new(), profiles: Default::default() }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -182,6 +218,7 @@ impl Book {
     pub fn remove(&mut self, id: &[u8; 16]) -> bool {
         let n = self.friends.len();
         self.friends.retain(|f| &f.id != id);
+        self.profiles.remove(id);
         self.friends.len() != n
     }
 
@@ -226,6 +263,28 @@ impl Book {
 
     pub fn presence(&self, id: &[u8; 16], unix: u64) -> Option<OutMsg> {
         self.pair_line(id, KIND_PRESENCE, &format!("{unix}\n{}", self.me.name))
+    }
+
+    pub fn own_profile(&self) -> Profile {
+        let mut profile = self.profiles.get(&self.me.id).cloned().unwrap_or_default();
+        profile.name = self.me.name.clone();
+        profile
+    }
+    /// Request consent to a broadcast; never carries an offer or starts capture.
+    pub fn request_watch(&self, id: &[u8; 16], unix: u64) -> Option<(OutMsg, String)> {
+        let mut nonce = [0u8; 8]; getrandom::fill(&mut nonce).expect("rng");
+        let nonce = hex(&nonce);
+        Some((self.pair_line(id, KIND_WATCH, &format!("{unix}\n{nonce}"))?, nonce))
+    }
+
+    pub fn cancel_watch(&self, id: &[u8; 16], nonce: &str, unix: u64) -> Option<OutMsg> {
+        if nonce.len() != 16 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+        self.pair_line(id, KIND_WATCH_CANCEL, &format!("{unix}\n{nonce}"))
+    }
+
+    pub fn profile_message(&self, id: &[u8; 16], unix: u64) -> Option<OutMsg> {
+        let profile = self.own_profile();
+        self.pair_line(id, KIND_PROFILE, &format!("{unix}\n{}", profile.encode()))
     }
 
     pub fn invite(&self, id: &[u8; 16], kind: InviteKind, code: &str, unix: u64) -> Option<OutMsg> {
@@ -281,6 +340,14 @@ impl Book {
                 }
             }
         }
+        if let PairEvent::Profile { unix, profile } = &ev {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            if *unix > now.saturating_add(60) || now.saturating_sub(*unix) > 86400 { return None; }
+            self.profiles.insert(*id, profile.clone());
+            if let Some(f) = self.friends.iter_mut().find(|f| f.id == *id) {
+                if !f.renamed { f.name = profile.name.clone(); }
+            }
+        }
         Some(ev)
     }
 
@@ -310,7 +377,17 @@ pub fn is_online(last: Option<u64>, now: u64, n_friends: usize) -> bool {
 }
 
 pub fn online_ttl_secs(n_friends: usize) -> u64 {
-    cycle_secs(n_friends).saturating_mul(2).saturating_add(15)
+    presence_interval_secs(n_friends).saturating_mul(2).saturating_add(cycle_secs(n_friends)).saturating_add(15)
+}
+
+/// Limit steady-state heartbeats to at most 480 posts/day per running launcher,
+/// reserving the public relay budget for actual invitations. Not a delivery quota.
+pub fn presence_interval_secs(n_friends: usize) -> u64 {
+    180 * n_friends.max(1) as u64
+}
+
+pub fn presence_due(last_elapsed_secs: Option<u64>, n_friends: usize) -> bool {
+    last_elapsed_secs.is_none_or(|t| t >= presence_interval_secs(n_friends))
 }
 
 /// Seconds one full pass takes (inbox poll + a poll and a presence post per friend), never faster
@@ -322,7 +399,7 @@ pub fn cycle_secs(n_friends: usize) -> u64 {
 }
 
 pub fn ops_per_cycle(n_friends: usize) -> u64 {
-    1 + 2 * n_friends as u64
+    1 + 3 * n_friends as u64
 }
 
 /// Gap between two relay calls for a list of this size. Always ≥ 5 s.
@@ -338,14 +415,45 @@ pub fn poll_gap_ms(n_friends: usize, rushing: bool) -> u64 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelayOp { Inbox, Pair(usize), Presence(usize) }
+pub enum RelayOp { Inbox, Pair(usize), Presence(usize), Profile(usize) }
 
 /// Runs independently of the viewer lifecycle, including its retry screen.
 pub fn relay_op(n_friends: usize, index: usize) -> RelayOp {
     let i = index % ops_per_cycle(n_friends).max(1) as usize;
     if i == 0 { RelayOp::Inbox }
     else if i <= n_friends { RelayOp::Pair(i - 1) }
-    else { RelayOp::Presence(i - 1 - n_friends) }
+    else if i <= 2 * n_friends { RelayOp::Presence(i - 1 - n_friends) }
+    else { RelayOp::Profile(i - 1 - 2 * n_friends) }
+}
+
+/// Retain cancellations so a delayed request cannot revive a dismissed notification.
+#[derive(Default)]
+pub struct WatchInbox {
+    pub pending: Vec<([u8; 16], u64, String)>,
+    cancelled: Vec<([u8; 16], u64, String)>,
+}
+impl WatchInbox {
+    pub fn prune(&mut self, now: u64) {
+        self.pending.retain(|(_, t, _)| invite_fresh(*t, now));
+        self.cancelled.retain(|(_, t, _)| invite_fresh(*t, now));
+    }
+    pub fn receive(&mut self, id: [u8; 16], unix: u64, nonce: String, now: u64) {
+        self.prune(now);
+        if !invite_fresh(unix, now) || self.cancelled.iter().any(|(i, _, n)| *i == id && *n == nonce) { return; }
+        if self.pending.iter().any(|(i, _, n)| *i == id && *n == nonce) { return; }
+        self.pending.retain(|(i, _, _)| *i != id);
+        self.pending.push((id, unix, nonce));
+    }
+    pub fn cancel(&mut self, id: [u8; 16], unix: u64, nonce: String, now: u64) {
+        self.prune(now);
+        if !invite_fresh(unix, now) { return; }
+        self.pending.retain(|(i, _, n)| !(*i == id && *n == nonce));
+        if !self.cancelled.iter().any(|(i, _, n)| *i == id && *n == nonce) {
+            // Bound state even when a trusted friend sends excessive cancellations.
+            if self.cancelled.len() >= 1024 { self.cancelled.remove(0); }
+            self.cancelled.push((id, unix, nonce));
+        }
+    }
 }
 
 pub fn invite_fresh(unix: u64, now: u64) -> bool {
@@ -397,13 +505,32 @@ pub fn load_book(dir: &Path) -> Book {
         me
     });
     let friends = read_friends(&dir.join("friends.txt"));
-    Book { me, friends }
+    let mut profiles = std::collections::HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(dir.join("profiles.txt")) {
+        for line in text.lines().take(MAX_FRIENDS + 1) {
+            if let Some((id, payload)) = line.split_once(' ') {
+                if let (Some(id), Some(bytes)) = (unhex16(id), unb64(payload)) {
+                    if (id == me.id || friends.iter().any(|f| f.id == id)) && bytes.len() <= 2800 {
+                        if let Ok(body) = String::from_utf8(bytes) {
+                            if let Some(profile) = Profile::decode(&body) { profiles.insert(id, profile); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Book { me, friends, profiles }
 }
 
-pub fn save_book(dir: &Path, book: &Book) {
-    let _ = std::fs::create_dir_all(dir);
-    let _ = write_identity(&dir.join("identity.txt"), &book.me);
-    let _ = write_friends(&dir.join("friends.txt"), &book.friends);
+pub fn save_book(dir: &Path, book: &Book) { let _ = save_book_checked(dir, book); }
+
+pub fn save_book_checked(dir: &Path, book: &Book) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_identity(&dir.join("identity.txt"), &book.me)?;
+    write_friends(&dir.join("friends.txt"), &book.friends)?;
+    let text = book.profiles.iter().filter(|(id, _)| **id == book.me.id || book.friends.iter().any(|f| f.id == **id))
+        .map(|(id, p)| format!("{} {}\n", hex(id), b64(p.encode().as_bytes()))).collect::<String>();
+    std::fs::write(dir.join("profiles.txt"), text)
 }
 
 /// Where the relay polls stopped (`since=` ids), kept between runs: without it every start read the last
@@ -601,6 +728,17 @@ fn parse_hello(body: &str) -> Option<([u8; 16], [u8; 32], [u8; 32], String)> {
 
 fn parse_pair(kind: u8, body: &str) -> Option<PairEvent> {
     match kind {
+        KIND_WATCH | KIND_WATCH_CANCEL => {
+            let (unix, nonce) = body.split_once('\n')?;
+            if nonce.len() != 16 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+            let unix = unix.parse().ok()?;
+            let nonce = nonce.to_ascii_lowercase();
+            Some(if kind == KIND_WATCH { PairEvent::WatchRequest { unix, nonce } } else { PairEvent::WatchCancel { unix, nonce } })
+        }
+        KIND_PROFILE => {
+            let (unix, payload) = body.split_once('\n')?;
+            Some(PairEvent::Profile { unix: unix.parse().ok()?, profile: Profile::decode(payload)? })
+        }
         KIND_PRESENCE => {
             let (unix, name) = body.split_once('\n')?;
             let unix: u64 = unix.parse().ok()?;
@@ -677,7 +815,7 @@ impl Channel {
     }
 
     fn open_any(&self, message: &str) -> Option<(u8, String)> {
-        for k in [KIND_PRESENCE, KIND_INVITE, KIND_ANSWER, KIND_DECLINE, KIND_HELLO] {
+        for k in [KIND_WATCH_CANCEL, KIND_WATCH, KIND_PROFILE, KIND_PRESENCE, KIND_INVITE, KIND_ANSWER, KIND_DECLINE, KIND_HELLO] {
             if let Some(body) = self.open(k, message) {
                 return Some((k, body));
             }
@@ -853,6 +991,78 @@ mod tests {
         let mut key = [n.wrapping_add(9); 32];
         key[0] = n;
         Book::new(Identity { id, key, name: name.into() })
+    }
+
+    #[test]
+    fn watch_cancellation_handles_reordering_and_new_requests() {
+        let mut inbox = WatchInbox::default(); let a = [1; 16]; let b = [2; 16];
+        inbox.receive(a, 1000, "old".into(), 1000);
+        inbox.cancel(a, 1001, "old".into(), 1001);
+        assert!(inbox.pending.is_empty());
+        inbox.receive(a, 1000, "old".into(), 1002);
+        assert!(inbox.pending.is_empty());
+        inbox.cancel(a, 1003, "ahead".into(), 1003);
+        inbox.receive(a, 1002, "ahead".into(), 1004);
+        assert!(inbox.pending.is_empty());
+        inbox.receive(a, 1004, "new".into(), 1004);
+        inbox.cancel(b, 1005, "new".into(), 1005);
+        inbox.cancel(a, 1001, "old".into(), 1005);
+        assert_eq!(inbox.pending[0].2, "new");
+        inbox.cancel(a, 1, "new".into(), 1005);
+        assert_eq!(inbox.pending.len(), 1);
+        inbox.prune(2000); assert!(inbox.pending.is_empty()); assert!(inbox.cancelled.is_empty());
+    }
+    #[test]
+    fn watch_cancel_is_authenticated_and_distinct_from_request() {
+        let mut a = fixed(60, "A"); let mut b = fixed(61, "B");
+        let hello = a.add(&b.code()).unwrap(); b.take_hellos(&[hello.body]);
+        let (_, nonce) = a.request_watch(&b.me.id, 1000).unwrap();
+        let cancel = a.cancel_watch(&b.me.id, &nonce, 1001).unwrap();
+        assert!(matches!(b.open_pair(&a.me.id, &cancel.body), Some(PairEvent::WatchCancel { unix: 1001, nonce: got }) if got == nonce));
+        assert!(a.open_pair(&b.me.id, &cancel.body).is_none());
+        assert!(a.cancel_watch(&b.me.id, "bad", 1001).is_none());
+        assert!(parse_pair(KIND_WATCH_CANCEL, "1001\nnot-a-valid-nonce").is_none());
+    }
+
+    #[test]
+    fn watch_requests_are_authenticated_and_separate_from_offers() {
+        let mut a = fixed(62, "Зритель"); let mut b = fixed(63, "Хост");
+        let hello = a.add(&b.code()).unwrap(); b.take_hellos(&[hello.body]);
+        let (msg, nonce) = a.request_watch(&b.me.id, 1000).unwrap();
+        assert!(matches!(b.open_pair(&a.me.id, &msg.body), Some(PairEvent::WatchRequest { unix: 1000, nonce: got }) if got == nonce));
+        assert!(a.open_pair(&b.me.id, &msg.body).is_none());
+        let channel = pair_channel(&a.me.id, &b.me.id, &a.friends[0].pair);
+        assert!(channel.open(KIND_INVITE, &msg.body).is_none());
+        assert!(parse_pair(KIND_WATCH, "1000\nnot-a-valid-nonce").is_none());
+        let (_, other) = a.request_watch(&b.me.id, 1000).unwrap(); assert_ne!(other, nonce);
+        let decline = b.decline(&a.me.id, &nonce).unwrap();
+        assert!(matches!(a.open_pair(&b.me.id, &decline.body), Some(PairEvent::Decline { nonce: got }) if got == nonce));
+    }
+
+    #[test]
+    fn profiles_are_encrypted_bounded_and_survive_restart() {
+        let mut a = fixed(60, "Аня"); let mut b = fixed(61, "Борис");
+        let hello = b.add(&a.code()).unwrap(); a.take_hellos(&[hello.body]);
+        let p = Profile { name: "Аня".into(), status: "Смотрим кино".into(), avatar: 7, photo: vec![42; 1600] };
+        a.profiles.insert(a.me.id, p.clone());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let msg = a.profile_message(&b.me.id, now).unwrap();
+        assert!(msg.body.len() <= 4096);
+        assert!(!msg.body.contains("Смотрим"));
+        assert!(a.open_pair(&b.me.id, &msg.body).is_none(), "own messages ignored");
+        assert!(matches!(b.open_pair(&a.me.id, &msg.body), Some(PairEvent::Profile { profile, .. }) if profile == p));
+        assert_eq!(b.profiles.get(&a.me.id), Some(&p));
+        b.rename(&a.me.id, "Моя подруга");
+        b.open_pair(&a.me.id, &msg.body);
+        assert_eq!(b.friends[0].name, "Моя подруга");
+        let dir = std::env::temp_dir().join(format!("ss-profiles-{}-{}", std::process::id(), now));
+        save_book(&dir, &b); let loaded = load_book(&dir);
+        assert_eq!(loaded.profiles.get(&a.me.id), Some(&p));
+        for f in ["identity.txt", "friends.txt", "profiles.txt"] { std::fs::remove_file(dir.join(f)).unwrap(); }
+        std::fs::remove_dir(dir).unwrap();
+        assert!(Profile::decode(&"x".repeat(2801)).is_none());
+        let bad = Profile { photo: vec![0; 1601], ..p };
+        assert!(Profile::decode(&bad.encode()).is_none());
     }
 
     #[test]
@@ -1131,6 +1341,19 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_budget_leaves_room_for_invitations() {
+        for n in 1..=MAX_FRIENDS {
+            let interval = presence_interval_secs(n);
+            let posts = n as u64 * (86400 / interval + 1);
+            assert!(posts <= 480 + n as u64);
+            assert!(presence_due(None, n));
+            assert!(!presence_due(Some(interval - 1), n));
+            assert!(presence_due(Some(interval), n));
+            assert!(online_ttl_secs(n) > interval * 2);
+        }
+    }
+
+    #[test]
     fn polling_stays_inside_the_relay_limit() {
         for n in 0..=12 {
             let gap = relay_gap_ms(n);
@@ -1144,7 +1367,8 @@ mod tests {
             let budget = 60 + t / 5000;
             assert!(req <= budget, "n={n}: {req} requests in {t} ms, budget {budget}");
             // A short list still beats at least once a minute.
-            if n <= 4 {
+            if n <= 3 {
+                // Profile publication is one extra bounded operation per friend.
                 assert!(cycle_secs(n) <= 60, "n={n} cycle {}", cycle_secs(n));
             }
         }
@@ -1163,6 +1387,7 @@ mod tests {
                 now_ms += poll_gap_ms(n, step < ops * 6) + 200;
                 match relay_op(n, step) {
                     RelayOp::Presence(i) => {
+                        if !presence_due(last_post[i].map(|t| (now_ms - t) / 1000), n) { continue; }
                         if let Some(prev) = last_post[i] {
                             assert!(now_ms - prev < online_ttl_secs(n) * 1000);
                         }
@@ -1175,7 +1400,7 @@ mod tests {
                         last_poll[i] = Some(now_ms);
                         last_seen[i] = last_post[i];
                     }
-                    RelayOp::Inbox => {}
+                    RelayOp::Inbox | RelayOp::Profile(_) => {}
                 }
                 if step >= ops * 2 {
                     for seen in &last_seen {
@@ -1188,7 +1413,7 @@ mod tests {
         assert_eq!(relay_op(0, usize::MAX), RelayOp::Inbox);
     }
 
-    /// Two fresh profiles over the real ntfy.sh (needs the internet): add, hello, presence both ways,
+    /// Two fresh profiles over the configured public relay (needs the internet): add, hello, presence both ways,
     /// invite, answer — the same calls the window makes. `cargo test -- --ignored real_relay`.
     #[test]
     #[ignore]
@@ -1238,6 +1463,33 @@ mod tests {
         let lines = poll(&pair, &since);
         let answer = lines.iter().find_map(|l| a.open_pair(&b.me.id, &l.message));
         assert_eq!(answer, Some(PairEvent::Answer { nonce: got.nonce.clone(), code: "Ccode-real".into() }));
+        let since = next_since(&since, &lines).to_string();
+        let profile = Profile { name: a.me.name.clone(), status: "Тест профиля".into(), avatar: 7, photo: vec![42; 1600] };
+        a.profiles.insert(a.me.id, profile.clone());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let msg = a.profile_message(&b.me.id, now).unwrap();
+        assert!(msg.body.len() <= 4096);
+        crate::ntfy::post(&msg.topic, &msg.body).expect("post profile");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let lines = poll(&pair, &since);
+        assert!(lines.iter().any(|l| matches!(b.open_pair(&a.me.id, &l.message), Some(PairEvent::Profile { profile: got, .. }) if got == profile)));
+        let since = next_since(&since, &lines).to_string();
+        let (request, nonce) = b.request_watch(&a.me.id, now).unwrap();
+        crate::ntfy::post(&request.topic, &request.body).expect("post watch request");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let lines = poll(&pair, &since);
+        assert!(lines.iter().any(|l| matches!(a.open_pair(&b.me.id, &l.message), Some(PairEvent::WatchRequest { nonce: got, .. }) if got == nonce)));
+        let mut inbox = WatchInbox::default();
+        for l in &lines { if let Some(PairEvent::WatchRequest { unix, nonce }) = a.open_pair(&b.me.id, &l.message) { inbox.receive(b.me.id, unix, nonce, now); } }
+        assert_eq!(inbox.pending.len(), 1);
+        let since = next_since(&since, &lines).to_string();
+        let cancel = b.cancel_watch(&a.me.id, &nonce, now).unwrap();
+        crate::ntfy::post(&cancel.topic, &cancel.body).expect("post cancel");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let lines = poll(&pair, &since);
+        for l in &lines { if let Some(PairEvent::WatchCancel { unix, nonce }) = a.open_pair(&b.me.id, &l.message) { inbox.cancel(b.me.id, unix, nonce, now); } }
+        assert!(inbox.pending.is_empty());
+
     }
 
     #[test]
