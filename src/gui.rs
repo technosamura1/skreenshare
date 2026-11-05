@@ -1066,6 +1066,8 @@ struct GuiApp {
     friend_pending_invites: Vec<(friends::Invite, [u8; 16])>,
     /// The invitation that answers our own «попросить трансляцию»: joined at once, no second «Смотреть».
     friend_auto_join: Option<(friends::Invite, [u8; 16])>,
+    /// The friend whose invitation the current «Смотреть» session came from (a repeat invitation is not a new card).
+    join_from: Option<[u8; 16]>,
     watch_requests: friends::WatchInbox,
     watch_cancel_wait: Option<([u8; 16], String)>,
     watch_cancel_post: Option<([u8; 16], String, Receiver<Result<(), String>>)>,
@@ -1209,6 +1211,7 @@ impl GuiApp {
             friend_last_seen: HashMap::new(),
             friend_pending_invites: Vec::new(),
             friend_auto_join: None,
+            join_from: None,
             watch_requests: friends::WatchInbox::default(),
             watch_cancel_wait: None,
             watch_cancel_post: None,
@@ -2180,7 +2183,24 @@ impl GuiApp {
                 for line in &lines {
                     let Some(ev) = self.book.open_pair(&id, &line.message) else { continue };
                     match ev {
-                        PairEvent::WatchRequest { unix, nonce } => self.watch_requests.receive(id, unix, nonce, now),
+                        PairEvent::WatchRequest { unix, nonce } => {
+                            // They ask while we already stream to them (or are picking the screen for them): the
+                            // request and our invitation crossed. No card to answer — just make sure they have an
+                            // invitation (their side joins by itself because it asked).
+                            let host_live = self.host.as_ref().is_some_and(Session::active);
+                            if self.broadcast_target == Some(id) && (host_live || self.host.is_none()) {
+                                if host_live && !self.friend_rush_ids.contains_key(&id) {
+                                    if let InviteSend::Waiting = self.send_invite(id, false) {
+                                        if !self.friend_invite_wait.contains(&id) {
+                                            self.friend_invite_wait.push(id);
+                                        }
+                                        self.friend_invite_since.get_or_insert_with(Instant::now);
+                                    }
+                                }
+                            } else {
+                                self.watch_requests.receive(id, unix, nonce, now);
+                            }
+                        }
                         PairEvent::WatchCancel { unix, nonce } => self.watch_requests.cancel(id, unix, nonce, now),
                         PairEvent::Profile { .. } => {
                             friends::save_book(&friends::profile_dir(), &self.book);
@@ -2191,6 +2211,11 @@ impl GuiApp {
                         PairEvent::Invite(inv) => {
                             // We asked this friend to stream: their invitation is the «yes», so we just watch.
                             let asked = self.watch_sent.remove(&id).is_some_and(|(_, t)| t.elapsed() < Duration::from_secs(friends::INVITE_TTL_SECS));
+                            // Already watching this friend: a repeated invitation (requests crossed) is not news.
+                            let watching_them = self.join_from == Some(id) && self.join.as_ref().is_some_and(Session::active);
+                            if watching_them {
+                                continue;
+                            }
                             if friends::invite_fresh(inv.unix, now)
                                 && !self.friend_pending_invites.iter().any(|(i, fid)| i.nonce == inv.nonce && *fid == id)
                             {
@@ -2609,6 +2634,7 @@ impl GuiApp {
 
     /// «Смотреть» on an invitation, pressed or implied (we had asked for this stream ourselves).
     fn accept_invite(&mut self, ctx: &egui::Context, inv: friends::Invite, from_id: [u8; 16]) {
+        self.join_from = Some(from_id);
         self.friend_rush_ids.insert(from_id, Instant::now() + Duration::from_secs(120));
         self.join_media_key = self.book.friends.iter().find(|f| f.id == from_id).map(|f| f.pair);
         self.friend_answer = if inv.kind == InviteKind::Offer { Some((from_id, inv.nonce.clone())) } else { None };
@@ -2709,6 +2735,8 @@ impl GuiApp {
     }
 
     fn send_invite(&mut self, friend_id: [u8; 16], just_started: bool) -> InviteSend {
+        // We are inviting them: their own «попросить трансляцию» is answered by this, no card for it.
+        self.watch_requests.pending.retain(|(fid, _, _)| *fid != friend_id);
         let Some(s) = self.host.as_ref().filter(|s| !s.ended) else { return InviteSend::Waiting };
         let (kind, code) = if let Some(room) = &s.room {
             (InviteKind::Room, room.clone())
