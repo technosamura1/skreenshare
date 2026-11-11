@@ -32,26 +32,51 @@ struct Palette {
     #[allow(dead_code)]
     glass: bool,
     anim: bool,
+    /// Accent fill (always under white text), its hover and pressed shades.
     accent: Color32,
-    /// Page background: a vertical gradient from `bg` (top) to `bg2` (bottom).
+    accent_hover: Color32,
+    accent_press: Color32,
+    /// The accent as text: links, the selection frame, the tab underline, the focus ring.
+    accent_text: Color32,
+    /// Soft accent background of a selected card.
+    accent_soft: Color32,
+    /// Window background (`bg2` is kept equal: the page is flat).
     bg: Color32,
     bg2: Color32,
     /// Sidebar and status bar.
     side: Color32,
-    /// Hairlines around cards, fields and the sidebar.
+    /// 1 px borders.
     border: Color32,
     card: Color32,
+    /// A row inside a card under the pointer.
     card_hover: Color32,
+    /// Text fields and the track of the segmented switch.
     field: Color32,
     text: Color32,
     muted: Color32,
+    /// Section labels and hints inside fields.
+    faint: Color32,
+    nav_hover: Color32,
+    nav_on: Color32,
+    /// Ordinary button, avatar backing, a switch that is off.
+    btn: Color32,
+    btn_hover: Color32,
+    btn_press: Color32,
+    /// The chosen option of the segmented switch.
+    raise: Color32,
+    /// Backing of thumbnails and the preview.
+    #[allow(dead_code)]
+    thumb: Color32,
     green: Color32,
     yellow: Color32,
+    /// Danger fill ("Остановить", "Отключиться", the counter), its hover and pressed shades.
     red: Color32,
-    /// Neutral big button ("Смотреть").
-    tile2: Color32,
-    /// Fill of a standard widget under the pointer.
-    widget_hover: Color32,
+    red_hover: Color32,
+    red_press: Color32,
+    /// Error text and the frame of an error banner, and the banner's background.
+    red_text: Color32,
+    #[allow(dead_code)]
+    red_soft: Color32,
 }
 
 const fn rgb(c: u32) -> Color32 {
@@ -61,80 +86,81 @@ const fn rgb(c: u32) -> Color32 {
 impl Palette {
     fn make(look: lg::Look, glass: bool) -> Palette {
         use lg::Accent;
-        // (on dark, on light)
-        let (dark, light) = match look.accent {
-            Accent::Blue => (0x2f86f6, 0x1f66e0),
-            Accent::Purple => (0x7f5cf0, 0x6a45e0),
-            Accent::Green => (0x17a06a, 0x12855a),
-            Accent::Teal => (0x14a3a8, 0x0e7f86),
-            Accent::Orange => (0xf0812a, 0xd0620c),
-            Accent::Pink => (0xe2559a, 0xc23a7d),
-            Accent::Grey => (0x8c939c, 0x5d646d),
+        // fill, hover, press, text on dark, text on light, soft on dark, soft on light
+        let a: [u32; 7] = match look.accent {
+            Accent::Indigo => [0x4a5ee0, 0x3f51c9, 0x3546b0, 0x9aa7ff, 0x3546b0, 0x2f3558, 0xe3e7fd],
+            Accent::Teal => [0x127a6e, 0x0f695f, 0x0c5850, 0x4fd1c1, 0x0c5850, 0x1f3f3b, 0xd9f0ec],
+            Accent::Orange => [0xb9500a, 0xa04508, 0x883a07, 0xffa25e, 0x883a07, 0x4a3222, 0xfbe6d6],
         };
-        let accent = rgb(if look.light { light } else { dark });
-        let mut p = if look.mono {
-            // Black, greys and white: no blue tint anywhere.
-            Palette {
-                light: false,
-                glass,
-                anim: look.anim,
-                accent,
-                bg: rgb(0x1a1a1a),
-                bg2: rgb(0x111111),
-                side: rgb(0x0c0c0c),
-                border: rgb(0x343434),
-                card: rgb(0x212121),
-                card_hover: rgb(0x2c2c2c),
-                field: rgb(0x161616),
-                text: rgb(0xf2f2f2),
-                muted: rgb(0x9c9c9c),
-                green: rgb(0x3ecf8e),
-                yellow: rgb(0xf0b43c),
-                red: rgb(0xf0605f),
-                tile2: rgb(0x2e2e2e),
-                widget_hover: rgb(0x3a3a3a),
-            }
-        } else if look.light {
+        let mut p = if look.light {
             Palette {
                 light: true,
                 glass,
                 anim: look.anim,
-                accent,
-                bg: rgb(0xf1f4f9),
-                bg2: rgb(0xe6ebf3),
-                side: rgb(0xdde4ee),
-                border: rgb(0xcdd6e4),
+                accent: rgb(a[0]),
+                accent_hover: rgb(a[1]),
+                accent_press: rgb(a[2]),
+                accent_text: rgb(a[4]),
+                accent_soft: rgb(a[6]),
+                bg: rgb(0xf2f3f5),
+                bg2: rgb(0xf2f3f5),
+                side: rgb(0xe3e5e8),
+                border: rgb(0xd0d3d9),
                 card: rgb(0xffffff),
-                card_hover: rgb(0xeef2f8),
-                field: rgb(0xe9eef5),
-                text: rgb(0x172030),
-                muted: rgb(0x566478),
-                green: rgb(0x14804f),
-                yellow: rgb(0x935f00),
-                red: rgb(0xc42b2b),
-                tile2: rgb(0xdbe3ee),
-                widget_hover: rgb(0xd3dcea),
+                card_hover: rgb(0xebedef),
+                field: rgb(0xf2f3f5),
+                text: rgb(0x1f2124),
+                muted: rgb(0x4e5058),
+                faint: rgb(0x5c5e66),
+                nav_hover: rgb(0xd7dadf),
+                nav_on: rgb(0xc8ccd2),
+                btn: rgb(0xe3e5e8),
+                btn_hover: rgb(0xd7dadf),
+                btn_press: rgb(0xc8ccd2),
+                raise: rgb(0xffffff),
+                thumb: rgb(0xe3e5e8),
+                green: rgb(0x1a8f4c),
+                yellow: rgb(0xb77a00),
+                red: rgb(0xcf3537),
+                red_hover: rgb(0xb82c2e),
+                red_press: rgb(0xa12628),
+                red_text: rgb(0xb3261e),
+                red_soft: rgb(0xfbe4e4),
             }
         } else {
             Palette {
                 light: false,
                 glass,
                 anim: look.anim,
-                accent,
-                bg: rgb(0x1c1d20),
-                bg2: rgb(0x1c1d20),
-                side: rgb(0x141518),
-                border: rgb(0x33353b),
-                card: rgb(0x242529),
-                card_hover: rgb(0x2c2d33),
-                field: rgb(0x191a1e),
-                text: rgb(0xecedef),
-                muted: rgb(0xa0a3ad),
-                green: rgb(0x3ecf8e),
-                yellow: rgb(0xf0b43c),
-                red: rgb(0xf0605f),
-                tile2: rgb(0x303138),
-                widget_hover: rgb(0x363840),
+                accent: rgb(a[0]),
+                accent_hover: rgb(a[1]),
+                accent_press: rgb(a[2]),
+                accent_text: rgb(a[3]),
+                accent_soft: rgb(a[5]),
+                bg: rgb(0x1e1f22),
+                bg2: rgb(0x1e1f22),
+                side: rgb(0x2b2d31),
+                border: rgb(0x3f4147),
+                card: rgb(0x313338),
+                card_hover: rgb(0x3a3c41),
+                field: rgb(0x1e1f22),
+                text: rgb(0xf2f3f5),
+                muted: rgb(0xb5bac1),
+                faint: rgb(0x9ba1aa),
+                nav_hover: rgb(0x35373c),
+                nav_on: rgb(0x404249),
+                btn: rgb(0x404249),
+                btn_hover: rgb(0x4a4d54),
+                btn_press: rgb(0x55585f),
+                raise: rgb(0x4a4d54),
+                thumb: rgb(0x232428),
+                green: rgb(0x23a55a),
+                yellow: rgb(0xf0b232),
+                red: rgb(0xcf3537),
+                red_hover: rgb(0xb82c2e),
+                red_press: rgb(0xa12628),
+                red_text: rgb(0xff8a8c),
+                red_soft: rgb(0x4a2a2d),
             }
         };
         if glass {
@@ -145,7 +171,7 @@ impl Palette {
             p.card = a(p.card, 178);
             p.card_hover = a(p.card_hover, 205);
             p.field = a(p.field, 200);
-            p.tile2 = a(p.tile2, 205);
+            p.btn = a(p.btn, 205);
         }
         p
     }
@@ -197,8 +223,16 @@ fn c_yellow() -> Color32 {
 fn c_red() -> Color32 {
     pal().red
 }
+/// Fill of an ordinary (neutral) button.
 fn c_tile2() -> Color32 {
-    pal().tile2
+    pal().btn
+}
+/// Error text: readable on cards in both themes (the danger fill itself is for buttons).
+fn c_red_text() -> Color32 {
+    pal().red_text
+}
+fn c_faint() -> Color32 {
+    pal().faint
 }
 
 /// Animation length in seconds, or 0 when animations are switched off.
@@ -232,24 +266,23 @@ fn on_fill(fill: Color32) -> Color32 {
     }
 }
 
-/// A fill nudged towards white (dark fills) or black (light fills) by `t` (0..1): the hover highlight.
-fn hot(fill: Color32, t: f32) -> Color32 {
-    let to = if luminance(fill) > 0.45 { Color32::BLACK } else { Color32::WHITE };
-    fill.lerp_to_gamma(to, 0.11 * t)
-}
-
 /// 0..1 hover progress of a widget (instant when animations are off).
 fn hover_t(ctx: &egui::Context, resp: &egui::Response) -> f32 {
     ctx.animate_bool_with_time(resp.id.with("hv"), resp.hovered(), anim_secs(0.14))
 }
 
-/// The accent as seen on a dark/light surface as text or an icon: a little lighter on dark so it stays readable.
-fn accent_text() -> Color32 {
-    let a = c_accent();
-    if pal().light {
-        a
+/// Hover and pressed shades of a button fill: the exact ones for the accent, the danger and the neutral fills,
+/// a nudge towards black for anything else.
+fn fill_states(fill: Color32) -> (Color32, Color32) {
+    let pl = pal();
+    if fill == pl.accent {
+        (pl.accent_hover, pl.accent_press)
+    } else if fill == pl.red {
+        (pl.red_hover, pl.red_press)
+    } else if fill == pl.btn || fill == pl.card_hover {
+        (pl.btn_hover, pl.btn_press)
     } else {
-        a.lerp_to_gamma(Color32::WHITE, 0.28)
+        (fill.lerp_to_gamma(Color32::BLACK, 0.10), fill.lerp_to_gamma(Color32::BLACK, 0.20))
     }
 }
 
@@ -262,31 +295,45 @@ fn apply_theme(ctx: &egui::Context, look: lg::Look, glass: bool) {
         s.visuals = if look.light { egui::Visuals::light() } else { egui::Visuals::dark() };
         let v = &mut s.visuals;
         v.panel_fill = pl.bg;
-        v.window_fill = if glass { rgb(0x242529) } else { pl.card };
+        v.window_fill = if glass { rgb(if look.light { 0xffffff } else { 0x313338 }) } else { pl.card };
+        v.window_stroke = Stroke::new(1.0, pl.border);
+        v.window_corner_radius = CornerRadius::same(12);
+        v.menu_corner_radius = CornerRadius::same(8);
+        let float = egui::epaint::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(71) };
+        v.window_shadow = float;
+        v.popup_shadow = float;
         v.extreme_bg_color = pl.field;
         v.override_text_color = Some(pl.text);
+        v.hyperlink_color = pl.accent_text;
         v.selection.bg_fill = pl.accent;
-        v.selection.stroke = Stroke::new(1.5, accent_text());
-        for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
-            w.corner_radius = CornerRadius::same(10);
+        v.selection.stroke = Stroke::new(1.5, pl.accent_text);
+        for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open, &mut v.widgets.noninteractive] {
+            w.corner_radius = CornerRadius::same(8);
         }
         v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pl.border);
-        v.widgets.inactive.weak_bg_fill = pl.card_hover;
-        v.widgets.inactive.bg_fill = pl.card_hover;
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, pl.border.lerp_to_gamma(pl.muted, 0.35));
-        v.widgets.hovered.weak_bg_fill = pl.widget_hover;
-        v.widgets.hovered.bg_fill = pl.widget_hover;
-        v.widgets.hovered.bg_stroke = Stroke::new(1.0, pl.muted.gamma_multiply(0.6));
-        v.widgets.active.weak_bg_fill = pl.accent;
+        v.widgets.inactive.weak_bg_fill = pl.btn;
+        v.widgets.inactive.bg_fill = pl.btn;
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, pl.border);
+        v.widgets.hovered.weak_bg_fill = pl.btn_hover;
+        v.widgets.hovered.bg_fill = pl.btn_hover;
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, pl.border);
+        v.widgets.hovered.expansion = 0.0;
+        v.widgets.active.weak_bg_fill = pl.btn_press;
+        v.widgets.active.bg_fill = pl.btn_press;
+        v.widgets.active.bg_stroke = Stroke::new(1.0, pl.border);
+        v.widgets.active.expansion = 0.0;
+        v.widgets.open.weak_bg_fill = pl.btn_hover;
+        v.widgets.open.bg_fill = pl.btn_hover;
         s.animation_time = if look.anim { 0.12 } else { 0.0 };
-        s.spacing.item_spacing = Vec2::new(10.0, 10.0);
+        s.spacing.item_spacing = Vec2::new(8.0, 10.0);
         s.spacing.button_padding = Vec2::new(14.0, 8.0);
+        s.spacing.interact_size.y = 36.0;
         s.spacing.slider_width = 260.0;
         use egui::TextStyle::*;
-        s.text_styles.insert(Body, FontId::proportional(14.5));
-        s.text_styles.insert(Button, FontId::proportional(14.5));
-        s.text_styles.insert(Small, FontId::proportional(12.5));
-        s.text_styles.insert(Monospace, FontId::monospace(14.5));
+        s.text_styles.insert(Body, FontId::proportional(14.0));
+        s.text_styles.insert(Button, FontId::proportional(14.0));
+        s.text_styles.insert(Small, FontId::proportional(12.0));
+        s.text_styles.insert(Monospace, FontId::monospace(14.0));
     });
 }
 
@@ -354,14 +401,19 @@ fn glow(p: &egui::Painter, rect: egui::Rect, rad: u8, col: Color32, alpha: f32, 
     p.add(sh.as_shape(rect, CornerRadius::same(rad)));
 }
 
-/// Shadow of a card: strong on dark, very light on light.
-fn card_shadow() -> egui::epaint::Shadow {
-    egui::epaint::Shadow {
-        offset: [0, 6],
-        blur: 22,
-        spread: 0,
-        color: Color32::from_black_alpha(if pal().light { 22 } else { 80 }),
-    }
+/// Shadow of a card that floats over the page (requests, invitations): 0 8 24, 28 % black.
+fn float_shadow() -> egui::epaint::Shadow {
+    egui::epaint::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(71) }
+}
+
+/// Frame of a floating card: card fill, 1 px border, radius 12, padding 16, a soft shadow.
+fn float_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(if pal().glass { rgb(if pal().light { 0xffffff } else { 0x313338 }) } else { c_card() })
+        .stroke(Stroke::new(1.0, c_border()))
+        .corner_radius(12)
+        .shadow(float_shadow())
+        .inner_margin(Margin::same(16))
 }
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -373,8 +425,8 @@ pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("screenshare")
-            .with_inner_size([960.0, 660.0])
-            .with_min_inner_size([800.0, 560.0])
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([1024.0, 740.0])
             .with_transparent(glass)
             .with_icon(Arc::new(egui::IconData {
                 rgba: crate::icon::rgba().to_vec(),
@@ -743,7 +795,7 @@ fn lamp(ui: &egui::Ui, c: egui::Pos2, r: f32, level: Option<netq::Level>, alpha:
 /// moves over it and fades out ~3 s after the last movement.
 fn preview_block(ui: &mut egui::Ui, on: &mut bool, s: &Session, can_change: bool) -> PvAction {
     let mut action = PvAction::None;
-    if ui.checkbox(on, "Превью трансляции").changed() {
+    if switch(ui, on, "Превью трансляции").changed() {
         save_show_preview(*on);
     }
     if !*on || !s.connected || s.ended {
@@ -848,6 +900,8 @@ enum Page {
     /// Gamepad test (reached from the settings).
     Pads,
     /// "Удалённое управление": the full card, reached from the sidebar panel ("Подробнее").
+    /// The full control card on its own page (no longer linked: the card is on the broadcast page).
+    #[allow(dead_code)]
     Control,
 }
 
@@ -1147,7 +1201,7 @@ impl GuiApp {
             egui::TextureOptions::LINEAR,
         );
         GuiApp {
-            page: if first_run { Page::Welcome } else { Page::Host },
+            page: if first_run { Page::Welcome } else { Page::Friends },
             settings_tab: 0,
             broadcast_target: None,
             manual_broadcast: false,
@@ -1529,7 +1583,7 @@ impl eframe::App for GuiApp {
         let welcome = self.page == Page::Welcome;
         if !welcome {
             egui::Panel::bottom("status")
-                .exact_size(32.0)
+                .exact_size(28.0)
                 .show_separator_line(false)
                 .frame(egui::Frame::new().fill(c_side()).inner_margin(Margin::symmetric(16, 0)))
                 .show(ui, |ui| {
@@ -1538,13 +1592,13 @@ impl eframe::App for GuiApp {
                     self.status_bar(ui);
                 });
             egui::Panel::left("side")
-                .exact_size(216.0)
+                .exact_size(220.0)
                 .resizable(false)
                 .show_separator_line(false)
-                .frame(egui::Frame::new().fill(c_side()).inner_margin(Margin { left: 16, right: 16, top: 20, bottom: 14 }))
+                .frame(egui::Frame::new().fill(c_side()).inner_margin(Margin { left: 12, right: 12, top: 16, bottom: 12 }))
                 .show(ui, |ui| {
                     let r = ui.max_rect();
-                    ui.painter().vline(r.right() + 16.0 - 0.5, ui.ctx().content_rect().y_range(), Stroke::new(1.0, c_border()));
+                    ui.painter().vline(r.right() + 12.0 - 0.5, ui.ctx().content_rect().y_range(), Stroke::new(1.0, c_border()));
                     self.sidebar(ui);
                 });
         }
@@ -1563,10 +1617,18 @@ impl eframe::App for GuiApp {
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             page_bg(ui.painter(), ui.max_rect());
-            // Requests remain reachable even when the current page is scrolled down.
-            egui::Frame::new().inner_margin(Margin::symmetric(24, 8)).show(ui, |ui| {
-                self.control_ask(ui);
-                if self.host.as_ref().is_some_and(|s| s.active() && s.ctrl.is_some_and(|c| c.on)) {
+            // Requests float in the top right corner, over whatever page is open (and however far it is scrolled).
+            egui::Area::new(egui::Id::unique("float-cards"))
+                .order(egui::Order::Foreground)
+                .anchor(Align2::RIGHT_TOP, [-16.0, 16.0])
+                .show(ui.ctx(), |ui| {
+                    ui.set_max_width(340.0);
+                    self.control_ask(ui);
+                    self.watch_request_card(ui);
+                    self.friend_invite_card(ui);
+                });
+            if self.host.as_ref().is_some_and(|s| s.active() && s.ctrl.is_some_and(|c| c.on)) {
+                egui::Frame::new().inner_margin(Margin { left: 40, right: 40, top: 12, bottom: 0 }).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("Зрителю разрешено управление").color(c_yellow()));
                         if ui.button("Забрать управление").clicked() {
@@ -1576,17 +1638,15 @@ impl eframe::App for GuiApp {
                             }
                         }
                     });
-                }
-                self.watch_request_card(ui);
-                self.friend_invite_card(ui);
-            });
+                });
+            }
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                // A centred column, at most 800 px wide, with air around it.
+                // A column at most 800 px wide, 40 px from the sidebar and 32 px from the top.
                 let avail = ui.available_width();
-                let w = (avail - 2.0 * 24.0).clamp(280.0, 1000.0);
-                let left = ((avail - w) / 2.0).max(0.0);
+                let w = (avail - 2.0 * 40.0).clamp(280.0, 800.0);
+                let left = 40.0_f32.min(((avail - w) / 2.0).max(0.0));
                 let sp = ui.spacing().item_spacing;
-                ui.add_space(24.0);
+                ui.add_space(32.0);
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.add_space(left);
@@ -1643,14 +1703,10 @@ impl GuiApp {
             return;
         }
         let mut answer = None;
-        egui::Frame::new()
-            .fill(c_card())
-            .stroke(Stroke::new(2.0, c_yellow()))
-            .corner_radius(14)
-            .inner_margin(Margin::same(14))
+        float_frame()
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new("Зритель просит управление").font(bold(17.0)));
+                ui.label(RichText::new("Зритель просит управление").font(bold(16.0)));
                 ui.label(
                     RichText::new("Разрешите — и он сможет управлять вашим компьютером мышью, клавиатурой и геймпадом (что именно — на странице «Удалённое управление»). Забрать управление в любой момент: Ctrl+Alt+Shift+F12.")
                         .color(c_muted())
@@ -1658,7 +1714,7 @@ impl GuiApp {
                 );
                 ui.add_space(6.0);
                 ui.columns(2, |c| {
-                    if big_button_i(&mut c[0], Some(Ico::Check), "Разрешить", c_green(), true) {
+                    if big_button_i(&mut c[0], Some(Ico::Check), "Разрешить", c_accent(), true) {
                         answer = Some(true);
                     }
                     if big_button_i(&mut c[1], Some(Ico::Cross), "Отклонить", c_card_hover(), true) {
@@ -1692,38 +1748,55 @@ impl GuiApp {
 
 /// One row of the sidebar: icon, label, a soft accent plate and a bar on the left when selected.
 /// A sidebar item. Always clickable: what is running keeps running while another tab is open.
-fn nav_item(ui: &mut egui::Ui, ico: Ico, label: &str, selected: bool, live: Option<Color32>) -> bool {
-    let sense = Sense::click();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), sense);
+fn nav_item(ui: &mut egui::Ui, ico: Ico, label: &str, selected: bool, live: Option<Color32>, count: usize) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let t = hover_t(ui.ctx(), &resp);
-    let st = ui.ctx().animate_bool_with_time(resp.id.with("nav"), selected, anim_secs(0.18));
-    let a = c_accent();
+    let st = ui.ctx().animate_bool_with_time(resp.id.with("nav"), selected, anim_secs(0.14));
+    let pl = pal();
     let p = ui.painter();
-    let dim = 1.0;
     if t > 0.0 && st < 1.0 {
-        let h = if pal().light { Color32::from_black_alpha(16) } else { Color32::from_white_alpha(13) };
-        p.rect_filled(rect, 10.0, h.gamma_multiply(t * (1.0 - st)));
+        p.rect_filled(rect, 8.0, pl.nav_hover.gamma_multiply(t * (1.0 - st)));
     }
     if st > 0.0 {
-        p.rect_filled(rect, 10.0, a.gamma_multiply((if pal().light { 0.14 } else { 0.24 }) * st));
-        p.rect_stroke(rect, 10.0, Stroke::new(1.0, a.gamma_multiply(0.40 * st)), egui::StrokeKind::Inside);
-        let hh = 11.0 * st;
-        p.rect_filled(
-            egui::Rect::from_min_max(egui::pos2(rect.left() + 1.0, rect.center().y - hh), egui::pos2(rect.left() + 4.0, rect.center().y + hh)),
-            2.0,
-            accent_text(),
-        );
+        p.rect_filled(rect, 8.0, pl.nav_on.gamma_multiply(st));
     }
     let ink = c_muted().lerp_to_gamma(c_text(), t.max(st));
-    let ico_col = ink.lerp_to_gamma(accent_text(), st).gamma_multiply(dim);
-    draw_ico(p, ico, egui::pos2(rect.left() + 26.0, rect.center().y), 18.0, ico_col);
-    let font = if selected { bold(14.5) } else { FontId::proportional(14.5) };
-    p.text(egui::pos2(rect.left() + 48.0, rect.center().y), Align2::LEFT_CENTER, label, font, ink.gamma_multiply(dim));
-    if let Some(c) = live {
-        let dot = egui::pos2(rect.right() - 16.0, rect.center().y);
-        p.circle_filled(dot, 8.0, c.gamma_multiply(0.22));
-        p.circle_filled(dot, 4.0, c);
+    draw_ico(p, ico, egui::pos2(rect.left() + 19.0, rect.center().y), 18.0, ink);
+    let font = if selected { bold(14.0) } else { FontId::proportional(14.0) };
+    p.text(egui::pos2(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, label, font, ink);
+    if count > 0 {
+        // the red counter: something waits for an answer
+        let c = egui::pos2(rect.right() - 19.0, rect.center().y);
+        p.circle_filled(c, 9.0, pl.red);
+        p.text(c, Align2::CENTER_CENTER, count.min(9).to_string(), bold(11.0), Color32::WHITE);
+    } else if let Some(c) = live {
+        p.circle_filled(egui::pos2(rect.right() - 16.0, rect.center().y), 4.0, c);
+    }
+    resp.clicked()
+}
+
+/// The small round button that flips the theme: a sun on the dark theme, a crescent on the light one.
+fn theme_button(ui: &mut egui::Ui) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if pal().light { "Тёмная тема" } else { "Светлая тема" });
+    let t = hover_t(ui.ctx(), &resp);
+    let pl = pal();
+    let p = ui.painter();
+    let back = if resp.is_pointer_button_down_on() { pl.btn_press } else { pl.btn.lerp_to_gamma(pl.btn_hover, t) };
+    p.rect_filled(rect, 8.0, back);
+    let c = rect.center();
+    let ink = c_muted().lerp_to_gamma(c_text(), t);
+    if pl.light {
+        p.circle_filled(c, 6.5, ink);
+        p.circle_filled(c + Vec2::new(3.5, -3.0), 5.5, back);
+    } else {
+        p.circle_stroke(c, 3.6, Stroke::new(1.6, ink));
+        for i in 0..8 {
+            let a = std::f32::consts::TAU * i as f32 / 8.0;
+            let d = Vec2::new(a.cos(), a.sin());
+            p.line_segment([c + d * 6.2, c + d * 8.2], Stroke::new(1.6, ink));
+        }
     }
     resp.clicked()
 }
@@ -1732,15 +1805,12 @@ impl GuiApp {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing.y = 4.0;
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 11.0;
-            ui.add(egui::Image::new((self.logo.id(), Vec2::splat(38.0))).corner_radius(10));
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(RichText::new("screenshare").font(bold(17.0)));
-                ui.label(RichText::new("Экран · звук · друзья").color(c_muted()).size(11.5));
-            });
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.add_space(6.0);
+            ui.add(egui::Image::new((self.logo.id(), Vec2::splat(28.0))).corner_radius(8));
+            ui.label(RichText::new("screenshare").font(bold(16.0)));
         });
-        ui.add_space(24.0);
+        ui.add_space(16.0);
         let test_live = self.test.as_ref().map(|(h, c, _, _)| {
             if h.error.is_some() || c.error.is_some() {
                 c_red()
@@ -1753,146 +1823,74 @@ impl GuiApp {
         let dot = |s: &Option<Session>| s.as_ref().filter(|s| s.active()).map(|s| if s.connected { c_green() } else { c_accent() });
         let host_live = dot(&self.host);
         let join_live = dot(&self.join);
-        if nav_item(ui, Ico::Monitor, "Транслировать", self.page == Page::Host, host_live) && self.page != Page::Host {
+        let now_friends = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let n_friends = self.book.friends.len();
+        let friend_live = if self.book.friends.iter().any(|f| friends::is_online(self.friend_last_seen.get(&f.id).copied(), now_friends, n_friends)) {
+            Some(c_green())
+        } else {
+            None
+        };
+        if nav_item(ui, Ico::Friends, "Друзья", matches!(self.page, Page::Friends | Page::Profile), friend_live, 0) {
+            self.page = Page::Friends;
+        }
+        // The red counter: someone asked us to start a show (answered on this tab).
+        let asks = self.watch_requests.pending.len();
+        if nav_item(ui, Ico::Monitor, "Транслировать", matches!(self.page, Page::Host | Page::Control), host_live, asks) && self.page != Page::Host {
             if !self.host.as_ref().is_some_and(Session::active) { self.host = None; self.broadcast_target = None; self.manual_broadcast = false; }
             self.windows = wincap::list_windows();
             self.thumbs.last_list = Instant::now();
             self.page = Page::Host;
         }
-        if nav_item(ui, Ico::Eye, "Смотреть", self.page == Page::Join, join_live) {
+        // The red counter: invitations to watch that wait for an answer.
+        let invites = self.friend_pending_invites.len();
+        if nav_item(ui, Ico::Eye, "Смотреть", self.page == Page::Join, join_live, invites) {
             self.join_media_key = None;
             self.page = Page::Join;
         }
-        let now_friends = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        let n_friends = self.book.friends.len();
-        let friend_live = if !self.friend_pending_invites.is_empty() {
-            Some(c_accent())
-        } else if self.book.friends.iter().any(|f| friends::is_online(self.friend_last_seen.get(&f.id).copied(), now_friends, n_friends)) {
-            Some(c_green())
-        } else {
-            None
-        };
-        if nav_item(ui, Ico::Friends, "Друзья", self.page == Page::Friends, friend_live) {
-            self.page = Page::Friends;
-        }
-        // Remote control lives here, under the two main items: the switch and a status line, the rest on its own page.
-        // Whatever does not fit the height at the smallest window size scrolls.
-        ui.add_space(10.0);
-        let room = (ui.available_height() - (2.0 * 42.0 + 4.0 + 8.0 + 88.0)).max(60.0);
-        let mut open = false;
-        egui::ScrollArea::vertical().max_height(room).auto_shrink([false, true]).show(ui, |ui| {
-            // Unindented: the sidebar is narrow, an indent pushed the card over its right edge.
-            egui::CollapsingHeader::new("Управление зрителя").default_open(false).show_unindented(ui, |ui| open = self.side_control(ui));
-        });
-        if open {
-            self.page = Page::Control;
+        // The emergency hotkey takes control away whatever page is open (the switches are on the broadcast page).
+        if let Some(s) = self.host.as_mut().filter(|s| !s.ended && s.revoke_event) {
+            self.ctl.allow = false;
+            s.revoke_event = false;
+            s.proc.send(&lg::control_line(false, self.ctl.pad, self.ctl.kbm));
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             let me = self.book.profiles.get(&self.book.me.id).cloned().unwrap_or_default();
             let mut open = false;
-            egui::Frame::new().fill(c_field()).corner_radius(10).inner_margin(10).show(ui, |ui| {
+            let mut flip = false;
+            egui::Frame::new().fill(c_field()).corner_radius(8).inner_margin(8).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     open |= crate::profileui::avatar(ui, &me, self.book.me.id, 36.0).clicked();
                     ui.vertical(|ui| {
-                        ui.set_width(110.0);
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.set_width((ui.available_width() - 40.0).max(40.0));
                         open |= ui.add(egui::Label::new(RichText::new(&self.book.me.name).font(bold(14.0))).truncate().sense(Sense::click())).on_hover_text("Изменить профиль").clicked();
-                        ui.label(RichText::new("● В сети").color(c_green()).size(11.5));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let (r, _) = ui.allocate_exact_size(Vec2::new(8.0, 16.0), Sense::hover());
+                            ui.painter().circle_filled(r.center(), 4.0, c_green());
+                            ui.label(RichText::new("В сети").color(c_muted()).size(12.0));
+                        });
                     });
+                    flip = theme_button(ui);
                 });
             });
             if open { self.open_profile(); }
-            if nav_item(ui, Ico::Info, "О программе", self.page == Page::About, None) {
+            if flip {
+                let look = self.look.with_theme(if self.look.light { lg::Theme::Dark } else { lg::Theme::Light });
+                let ctx = ui.ctx().clone();
+                self.set_look(&ctx, look);
+            }
+            ui.add_space(4.0);
+            if nav_item(ui, Ico::Info, "О программе", self.page == Page::About, None, 0) {
                 self.page = Page::About;
             }
-            if nav_item(ui, Ico::Gear, "Настройки", matches!(self.page, Page::Settings | Page::Test | Page::Pads), test_live) {
+            if nav_item(ui, Ico::Gear, "Настройки", matches!(self.page, Page::Settings | Page::Test | Page::Pads), test_live, 0) {
                 self.page = Page::Settings;
             }
         });
-    }
-
-    /// The compact "Удалённое управление" panel of the sidebar: the main switch, what is allowed, the driver and the
-    /// viewer's state; "Подробнее" opens the full page. Returns true when that was clicked. Changes go to a running
-    /// show exactly as the full card sends them.
-    fn side_control(&mut self, ui: &mut egui::Ui) -> bool {
-        let before = self.ctl;
-        let (st, revoked_now) = match self.host.as_ref().filter(|s| !s.ended) {
-            Some(s) => (s.ctrl, s.revoke_event),
-            None => (None, false),
-        };
-        if revoked_now {
-            self.ctl.allow = false;
-        }
-        let on_page = self.page == Page::Control;
-        let mut open = false;
-        let ctl = &mut self.ctl;
-        let vigem = self.vigem.0;
-        egui::Frame::new()
-            .fill(c_card())
-            .stroke(Stroke::new(1.0, if on_page { c_accent().gamma_multiply(0.6) } else { c_border() }))
-            .corner_radius(12)
-            .inner_margin(Margin::same(12))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.spacing_mut().item_spacing.y = 6.0;
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-                    draw_ico(ui.painter(), Ico::Pad, r.center(), 20.0, c_text());
-                    ui.label(RichText::new("Управление").font(bold(14.5)));
-                });
-                ui.checkbox(&mut ctl.allow, "Разрешить зрителю");
-                // The two devices can be allowed one by one; both are greyed out while the main switch is off.
-                ui.add_enabled_ui(ctl.allow, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.horizontal(|ui| {
-                        ui.add_space(18.0);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.checkbox(&mut ctl.pad, "Геймпад");
-                            ui.checkbox(&mut ctl.kbm, "Мышь и клавиатура");
-                        });
-                    });
-                });
-                if !ctl.allow {
-                    ui.label(RichText::new("Сейчас выключено").color(c_muted()).size(12.5));
-                } else if !ctl.pad && !ctl.kbm {
-                    ui.label(RichText::new("Ничего не выбрано").color(c_yellow()).size(12.5));
-                }
-                if st.is_some_and(|c| c.active) && ctl.allow {
-                    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(150.0), 22.0), Sense::hover());
-                    ui.painter().rect_filled(r, 11.0, c_red().gamma_multiply(0.22));
-                    ui.painter().circle_filled(r.left_center() + Vec2::new(12.0, 0.0), 4.5, c_red());
-                    ui.painter().text(r.left_center() + Vec2::new(24.0, 0.0), egui::Align2::LEFT_CENTER, "Зритель управляет", egui::FontId::proportional(13.0), c_red());
-                } else if st.is_some_and(|c| c.revoked) && !ctl.allow {
-                    ui.label(RichText::new("Отключено аварийным сочетанием").color(c_red()).size(12.5));
-                }
-                if ctl.pad {
-                    // Icon + text that wraps under itself: one line was wider than the card in the narrow sidebar.
-                    let (text, col, ico) = if vigem {
-                        ("Драйвер геймпада есть", c_green(), Ico::Check)
-                    } else {
-                        ("Нет драйвера геймпада", c_yellow(), Ico::Warn)
-                    };
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                        draw_ico(ui.painter(), ico, r.center(), 14.0, col);
-                        ui.add(egui::Label::new(RichText::new(text).color(col).size(12.5)).wrap());
-                    });
-                }
-                let w = ui.available_width();
-                if ui.add_sized([w, 28.0], egui::Button::new(RichText::new("Подробнее").size(13.0))).clicked() {
-                    open = true;
-                }
-            });
-        if self.ctl != before || revoked_now {
-            if let Some(s) = self.host.as_mut().filter(|s| !s.ended) {
-                s.revoke_event = false;
-                s.proc.send(&lg::control_line(self.ctl.allow, self.ctl.pad, self.ctl.kbm));
-            }
-        }
-        open
     }
 
     /// "Удалённое управление": the full card (devices, driver and its install button, the emergency hotkey).
@@ -1932,7 +1930,7 @@ impl GuiApp {
                 None => (None, "Нет активных подключений".to_string()),
             };
             lamp(ui, r.center(), 4.5, level, 1.0);
-            ui.add(egui::Label::new(RichText::new(text).color(c_muted()).size(12.5)).truncate());
+            ui.add(egui::Label::new(RichText::new(text).color(c_muted()).size(12.0)).truncate());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).color(c_muted()).size(12.0));
             });
@@ -1943,67 +1941,97 @@ impl GuiApp {
 /// Height taken on the host page by everything except the picker's cards (head, card margins, settings line, button).
 const HOST_FIXED_H: f32 = 270.0;
 
-/// A row of equal segments (title + small line), one of them chosen. Returns the value that was clicked.
+/// The segmented switch: a recessed track with equal options, the chosen one raised. Options may carry a small
+/// second line. Returns the value that was clicked.
 fn segmented(ui: &mut egui::Ui, items: &[(&str, &str, u32)], cur: u32) -> Option<u32> {
-    let gap = 8.0;
-    let n = items.len() as f32;
-    let w = ((ui.available_width() - gap * (n - 1.0)) / n).floor();
+    let two = items.iter().any(|(_, sub, _)| !sub.is_empty());
+    let opt_h = if two { 46.0 } else { 30.0 };
+    let pad = 3.0;
+    let n = items.len().max(1) as f32;
+    let (outer, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), opt_h + 2.0 * pad), Sense::hover());
+    let pl = pal();
+    ui.painter().rect_filled(outer, 8.0, pl.field);
+    ui.painter().rect_stroke(outer, 8.0, Stroke::new(1.0, pl.border), egui::StrokeKind::Inside);
+    let w = (outer.width() - 2.0 * pad) / n;
     let mut out = None;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        for (title, sub, v) in items {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 52.0), Sense::click());
-            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-            let t = hover_t(ui.ctx(), &resp);
-            let on = *v == cur;
-            let st = ui.ctx().animate_bool_with_time(resp.id.with("seg"), on, anim_secs(0.15));
-            let fill = hot(c_field().lerp_to_gamma(c_accent(), st), t);
-            let fg = if st > 0.5 { on_fill(c_accent()) } else { c_text() };
-            let sub_col = if st > 0.5 { on_fill(c_accent()).gamma_multiply(0.85) } else { c_muted() };
-            let p = ui.painter();
-            p.rect_filled(rect, 12.0, fill);
-            p.rect_stroke(rect, 12.0, Stroke::new(1.0, c_border().lerp_to_gamma(c_accent(), st.max(t * 0.6))), egui::StrokeKind::Inside);
-            let g1 = p.layout_no_wrap(title.to_string(), bold(14.5), fg);
-            let g2 = p.layout_no_wrap(sub.to_string(), FontId::proportional(12.5), sub_col);
-            let total = g1.size().y + 2.0 + g2.size().y;
+    for (i, (title, sub, v)) in items.iter().enumerate() {
+        let rect = egui::Rect::from_min_size(egui::pos2(outer.left() + pad + w * i as f32, outer.top() + pad), Vec2::new(w, opt_h));
+        let resp = ui.interact(rect, ui.scope_id().with(("seg", outer.min.y as i32, i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let t = hover_t(ui.ctx(), &resp);
+        let on = *v == cur;
+        let st = ui.ctx().animate_bool_with_time(resp.id.with("seg"), on, anim_secs(0.12));
+        let p = ui.painter();
+        if st > 0.0 {
+            p.rect_filled(rect, 6.0, pl.raise.gamma_multiply(st));
+        }
+        let fg = pl.muted.lerp_to_gamma(pl.text, st.max(t));
+        let g1 = p.layout_no_wrap(title.to_string(), if on { bold(14.0) } else { FontId::proportional(14.0) }, fg);
+        if two {
+            let g2 = p.layout_no_wrap(sub.to_string(), FontId::proportional(12.0), pl.muted);
+            let total = g1.size().y + 1.0 + g2.size().y;
             let y = rect.center().y - total / 2.0;
             let (x1, x2) = (rect.center().x - g1.size().x / 2.0, rect.center().x - g2.size().x / 2.0);
             let h1 = g1.size().y;
             p.galley(egui::pos2(x1, y), g1, fg);
-            p.galley(egui::pos2(x2, y + h1 + 2.0), g2, sub_col);
-            if resp.clicked() {
-                out = Some(*v);
-            }
+            p.galley(egui::pos2(x2, y + h1 + 1.0), g2, pl.muted);
+        } else {
+            p.galley(egui::pos2(rect.center().x - g1.size().x / 2.0, rect.center().y - g1.size().y / 2.0), g1, fg);
         }
-    });
+        if resp.clicked() {
+            out = Some(*v);
+        }
+    }
     out
 }
 
-/// A pill you can switch on (selected = accent fill), with an optional colour dot. Hover and selection are smooth.
+/// A button you can switch on (chosen = soft accent fill with an accent frame), with an optional colour dot.
 fn chip(ui: &mut egui::Ui, label: &str, on: bool, swatch: Option<Color32>) -> bool {
-    let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(14.5), c_text());
-    let dot = if swatch.is_some() { 20.0 } else { 0.0 };
-    let size = Vec2::new(galley.size().x + 30.0 + dot, 34.0);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(14.0), c_text());
+    let dot = if swatch.is_some() { 22.0 } else { 0.0 };
+    let size = Vec2::new(galley.size().x + 28.0 + dot, 36.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let t = hover_t(ui.ctx(), &resp);
-    let st = ui.ctx().animate_bool_with_time(resp.id.with("on"), on, anim_secs(0.15));
-    let base = c_field();
-    let fill = hot(base.lerp_to_gamma(c_accent(), st), t);
-    let fg = if st > 0.5 { on_fill(c_accent()) } else { c_text() };
+    let st = ui.ctx().animate_bool_with_time(resp.id.with("on"), on, anim_secs(0.12));
+    let pl = pal();
+    let base = if resp.is_pointer_button_down_on() { pl.btn_press } else { pl.btn.lerp_to_gamma(pl.btn_hover, t) };
     let p = ui.painter();
-    p.rect_filled(rect, 10.0, fill);
-    let edge = c_border().lerp_to_gamma(c_accent(), st.max(t * 0.6));
-    p.rect_stroke(rect, 10.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
-    let mut x = rect.left() + 15.0;
+    p.rect_filled(rect, 8.0, base.lerp_to_gamma(pl.accent_soft, st));
+    if st > 0.0 {
+        p.rect_stroke(rect, 8.0, Stroke::new(1.5, pl.accent_text.gamma_multiply(st)), egui::StrokeKind::Inside);
+    }
+    let mut x = rect.left() + 14.0;
     if let Some(c) = swatch {
-        let ring = if st > 0.5 { on_fill(c_accent()) } else { c_muted() };
-        p.circle_filled(egui::pos2(x + 6.0, rect.center().y), 6.5, ring);
-        p.circle_filled(egui::pos2(x + 6.0, rect.center().y), 5.0, c);
+        p.circle_filled(egui::pos2(x + 7.0, rect.center().y), 7.0, c);
         x += dot;
     }
-    p.galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, fg);
+    p.galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, c_text());
     resp.clicked()
+}
+
+/// A switch (40 x 24, an 18 px knob) with its label to the right; the label wraps. Clicking either flips it.
+fn switch(ui: &mut egui::Ui, on: &mut bool, text: &str) -> egui::Response {
+    let wrap = (ui.available_width() - 52.0).max(80.0);
+    let galley = ui.painter().layout(text.to_string(), FontId::proportional(14.0), c_text(), wrap);
+    let size = Vec2::new(52.0 + galley.size().x, galley.size().y.max(24.0));
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let t = hover_t(ui.ctx(), &resp);
+    let st = ui.ctx().animate_bool_with_time(resp.id.with("sw"), *on, anim_secs(0.12));
+    let pl = pal();
+    let dim = if ui.is_enabled() { 1.0 } else { 0.45 };
+    let track = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.center().y - 12.0), Vec2::new(40.0, 24.0));
+    let off = pl.btn.lerp_to_gamma(pl.btn_hover, t);
+    let onc = pl.accent.lerp_to_gamma(pl.accent_hover, t);
+    let p = ui.painter();
+    p.rect_filled(track, 12.0, off.lerp_to_gamma(onc, st).gamma_multiply(dim));
+    p.circle_filled(egui::pos2(track.left() + 12.0 + 16.0 * st, track.center().y), 9.0, Color32::WHITE.gamma_multiply(dim));
+    p.galley(egui::pos2(rect.left() + 52.0, rect.center().y - galley.size().y / 2.0), galley, c_text());
+    resp
 }
 
 /// One sparkline: title and current value on top, the last 60 s below with a round upper bound.
@@ -2348,14 +2376,6 @@ impl GuiApp {
     fn friends_page(&mut self, ui: &mut egui::Ui) {
         page_head(ui, Ico::Friends, "Друзья", "Добавляйте друзей один раз — потом просто приглашайте на трансляцию");
 
-        ui.columns(2, |cols| {
-            if big_button_i(&mut cols[0], Some(Ico::Monitor), "Транслировать", c_accent(), true) {
-                if !self.host.as_ref().is_some_and(Session::active) { self.host = None; self.broadcast_target = None; self.manual_broadcast = false; }
-                self.page = Page::Host;
-            }
-            if big_button_i(&mut cols[1], Some(Ico::Eye), "Смотреть", c_card_hover(), true) { self.page = Page::Join; }
-        });
-        ui.add_space(12.0);
         if let Some(e) = &self.friend_error { error_text(ui, e); }
         if let Some(ok) = &self.friend_ok { ui.label(RichText::new(ok).color(c_green()).size(13.0)); }
         ui.horizontal(|ui| {
@@ -2445,10 +2465,9 @@ impl GuiApp {
             }
         }
 
-        egui::CollapsingHeader::new("Добавить друга или поделиться своим кодом")
-            .default_open(self.book.friends.is_empty()).show(ui, |ui| {
+        {
         section(ui, |ui| {
-            ui.label(RichText::new("Ваш код друга").font(bold(16.0)));
+            ui.label(RichText::new("Мой код друга").font(bold(16.0)));
             ui.label(
                 RichText::new("Этот код можно отправить другу. Или попросите его код и вставьте ниже — достаточно одного из двух.")
                     .color(c_muted())
@@ -2501,7 +2520,7 @@ impl GuiApp {
             }
         });
 
-            });
+        }
         if let Some(id) = self.friend_rename_id {
             section(ui, |ui| {
                 ui.label(RichText::new("Переименовать друга").font(bold(15.0)));
@@ -2595,11 +2614,7 @@ impl GuiApp {
             || self.join.as_ref().is_some_and(Session::active) || self.test.is_some();
         let mut watch = false;
         let mut decline = false;
-        egui::Frame::new()
-            .fill(c_accent().gamma_multiply(0.1))
-            .stroke(Stroke::new(2.0, c_accent()))
-            .corner_radius(14)
-            .inner_margin(Margin::same(14))
+        float_frame()
             .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     let extra = self.friend_pending_invites.len().saturating_sub(1);
@@ -2608,7 +2623,7 @@ impl GuiApp {
                     } else {
                         format!("{fname} приглашает посмотреть трансляцию · ещё {extra}")
                     };
-                    ui.label(RichText::new(title).font(bold(17.0)));
+                    ui.label(RichText::new(title).font(bold(16.0)));
                     ui.label(RichText::new(if busy { "Приглашение сохранено. Завершите текущую сессию, чтобы принять его." } else { "Нажмите «Смотреть» — подключение без кодов." }).color(c_muted()).size(13.0));
                     ui.add_space(6.0);
                     ui.columns(2, |cols| {
@@ -2905,43 +2920,30 @@ fn big_button(ui: &mut egui::Ui, text: &str, fill: Color32, enabled: bool) -> bo
     big_button_i(ui, None, text, fill, enabled)
 }
 
-/// The big button. `fill` = the neutral card colour gives a quiet outlined button; any other fill (accent, red,
-/// green) gives the gradient "primary" look with a soft glow that grows on hover and sinks when pressed.
+/// The big button (44 px high, radius 8): `fill` is the accent, the danger red or the neutral card colour; hover
+/// and press use the exact shades of the palette, a disabled one is 45 % opaque.
 fn big_button_i(ui: &mut egui::Ui, ico: Option<Ico>, text: &str, fill: Color32, enabled: bool) -> bool {
     let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 50.0), sense);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), sense);
     let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
     let t = if enabled { hover_t(ui.ctx(), &resp) } else { 0.0 };
     let down = enabled && resp.is_pointer_button_down_on();
-    let neutral = fill == c_card_hover();
+    let neutral = fill == c_card_hover() || fill == pal().btn;
+    let base = if neutral { pal().btn } else { fill };
+    let (hover, press) = fill_states(base);
+    let dim = if enabled { 1.0 } else { 0.45 };
     let p = ui.painter();
-    let text_color;
-    if neutral {
-        let mut f = hot(fill, t);
-        if down {
-            f = fill.gamma_multiply(0.85);
-        }
-        p.rect_filled(rect, 12.0, if enabled { f } else { fill.gamma_multiply(0.5) });
-        let edge = c_border().lerp_to_gamma(c_muted(), 0.5 * t);
-        p.rect_stroke(rect, 12.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
-        text_color = if enabled { c_text() } else { c_muted().gamma_multiply(0.7) };
-    } else if enabled {
-        let flat = if down { fill.lerp_to_gamma(Color32::BLACK, 0.12) } else { fill.lerp_to_gamma(Color32::WHITE, 0.08 * t) };
-        p.rect_filled(rect, 9.0, flat);
-        text_color = on_fill(fill);
-    } else {
-        p.rect_filled(rect, 12.0, fill.gamma_multiply(0.35));
-        text_color = on_fill(fill).gamma_multiply(0.45);
-    }
-    let galley = p.layout_no_wrap(text.to_string(), bold(16.0), text_color);
-    let icon_w = if ico.is_some() { 28.0 } else { 0.0 };
+    let f = if down { press } else { base.lerp_to_gamma(hover, t) };
+    p.rect_filled(rect, 8.0, f.gamma_multiply(dim));
+    let text_color = (if neutral { c_text() } else { Color32::WHITE }).gamma_multiply(dim);
+    let galley = p.layout_no_wrap(text.to_string(), bold(15.0), text_color);
+    let icon_w = if ico.is_some() { 26.0 } else { 0.0 };
     let total = galley.size().x + icon_w;
-    let dy = if down { 1.0 } else { 0.0 };
     let x0 = rect.center().x - total / 2.0;
     if let Some(i) = ico {
-        draw_ico(p, i, egui::pos2(x0 + 9.0, rect.center().y + dy), 18.0, text_color);
+        draw_ico(p, i, egui::pos2(x0 + 9.0, rect.center().y), 18.0, text_color);
     }
-    p.galley(egui::pos2(x0 + icon_w, rect.center().y - galley.size().y / 2.0 + dy), galley, text_color);
+    p.galley(egui::pos2(x0 + icon_w, rect.center().y - galley.size().y / 2.0), galley, text_color);
     enabled && resp.clicked()
 }
 
@@ -2959,28 +2961,27 @@ fn crumb(ui: &mut egui::Ui, label: &str) -> bool {
     r.clicked()
 }
 
-/// Header of a page: a flat icon tile, the title and a one-line subtitle.
-fn page_head(ui: &mut egui::Ui, ico: Ico, t: &str, sub: &str) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 16.0;
-        let (r, _) = ui.allocate_exact_size(Vec2::splat(54.0), Sense::hover());
-        let p = ui.painter();
-        let a = c_accent();
-        p.rect_filled(r, 12.0, a);
-        draw_ico(p, ico, r.center(), 26.0, on_fill(a));
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
-            ui.add_space(2.0);
-            ui.label(RichText::new(t).font(bold(26.0)));
+/// Header of a page: the title (24 / bold) and a one-line subtitle.
+fn page_head(ui: &mut egui::Ui, _ico: Ico, t: &str, sub: &str) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.label(RichText::new(t).font(bold(24.0)));
+        if !sub.is_empty() {
             ui.label(RichText::new(sub).color(c_muted()).size(14.0));
-        });
+        }
     });
-    ui.add_space(14.0);
+    ui.add_space(10.0);
 }
 
+/// A small upper-case label over a group of controls (12 / semibold, a little letter spacing).
+fn group_label(ui: &mut egui::Ui, text: &str) {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&text.to_uppercase(), 0.0, egui::TextFormat { font_id: bold(12.0), color: c_faint(), extra_letter_spacing: 0.5, ..Default::default() });
+    ui.label(job);
+}
 
 fn section(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    section_pad(ui, 20, add)
+    section_pad(ui, 16, add)
 }
 
 /// `section` with its own inner margin (the denser cards).
@@ -2988,14 +2989,13 @@ fn section_pad(ui: &mut egui::Ui, margin: i8, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(c_card())
         .stroke(Stroke::new(1.0, c_border()))
-        .corner_radius(16)
-        .shadow(card_shadow())
+        .corner_radius(12)
         .inner_margin(Margin::same(margin))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
         });
-    ui.add_space(8.0);
+    ui.add_space(6.0);
 }
 
 /// A collapsible block ("Дополнительно", "Подробности"): closed by default.
@@ -3039,7 +3039,7 @@ fn control_card(ui: &mut egui::Ui, ctl: &mut CtlUi, vigem: bool, drv: &DrvUi, li
                 let (r, _) = ui.allocate_exact_size(Vec2::new(150.0, 22.0), Sense::hover());
                 ui.painter().rect_filled(r, 11.0, c_red().gamma_multiply(0.22));
                 ui.painter().circle_filled(r.left_center() + Vec2::new(12.0, 0.0), 4.5, c_red());
-                ui.painter().text(r.left_center() + Vec2::new(24.0, 0.0), egui::Align2::LEFT_CENTER, "Зритель управляет", egui::FontId::proportional(13.0), c_red());
+                ui.painter().text(r.left_center() + Vec2::new(24.0, 0.0), egui::Align2::LEFT_CENTER, "Зритель управляет", egui::FontId::proportional(13.0), c_red_text());
             }
         });
         ui.label(
@@ -3048,11 +3048,11 @@ fn control_card(ui: &mut egui::Ui, ctl: &mut CtlUi, vigem: bool, drv: &DrvUi, li
                 .size(13.0),
         );
         ui.add_space(4.0);
-        ui.checkbox(&mut ctl.allow, "Разрешить управление зрителю");
+        switch(ui, &mut ctl.allow, "Разрешить управление зрителю");
         if ctl.allow {
             ui.indent("ctl_dev", |ui| {
-                ui.checkbox(&mut ctl.pad, "Геймпад");
-                ui.checkbox(&mut ctl.kbm, "Мышь и клавиатура");
+                switch(ui, &mut ctl.pad, "Геймпад");
+                switch(ui, &mut ctl.kbm, "Мышь и клавиатура");
             });
             ui.add_space(2.0);
             ui.label(
@@ -3224,8 +3224,8 @@ fn status_head(ui: &mut egui::Ui, s: &Session, headline: &str) {
 fn warn_line(ui: &mut egui::Ui, text: &str) {
     ui.horizontal_top(|ui| {
         let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-        draw_ico(ui.painter(), Ico::Warn, r.center() + Vec2::new(0.0, 3.0), 15.0, c_red());
-        ui.add(egui::Label::new(RichText::new(text).color(c_red())).wrap());
+        draw_ico(ui.painter(), Ico::Warn, r.center() + Vec2::new(0.0, 3.0), 15.0, c_red_text());
+        ui.add(egui::Label::new(RichText::new(text).color(c_red_text())).wrap());
     });
 }
 
@@ -3361,7 +3361,7 @@ fn fps_hint(ui: &mut egui::Ui) {
 }
 
 fn error_text(ui: &mut egui::Ui, e: &str) {
-    ui.label(RichText::new(e).color(c_red()));
+    ui.label(RichText::new(e).color(c_red_text()));
 }
 
 fn spinner_line(ui: &mut egui::Ui, text: &str) {
@@ -3728,18 +3728,18 @@ impl GuiApp {
         if with_audio {
             ui.add_space(6.0);
             ui.label(RichText::new("Звук").font(bold(15.0)));
-            ui.checkbox(&mut self.audio, "Передавать звук компьютера");
+            switch(ui, &mut self.audio, "Передавать звук компьютера");
             if self.audio {
                 if matches!(self.choice, Choice::Window(_)) {
-                    ui.checkbox(&mut self.audio_prefs.window_only, "Звук только из этого окна");
+                    switch(ui, &mut self.audio_prefs.window_only, "Звук только из этого окна");
                 }
-                ui.checkbox(&mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе зритель услышит себя с эхом");
+                switch(ui, &mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе зритель услышит себя с эхом");
             }
         }
         if with_easy {
             ui.add_space(6.0);
             ui.label(RichText::new("Подключение").font(bold(15.0)));
-            ui.checkbox(&mut self.easy, "Простое подключение (beta): один короткий код вместо двух длинных");
+            switch(ui, &mut self.easy, "Простое подключение (beta): один короткий код вместо двух длинных");
             if self.easy {
                 ui.label(
                     RichText::new("Коды обмениваются через публичный сервер ntfy-me.com в зашифрованном виде. Обычные коды тоже останутся — на случай, если не сработает.")
@@ -3958,8 +3958,8 @@ impl GuiApp {
                 }
             }
         });
-        ui.checkbox(&mut look.anim, "Плавные анимации");
-        ui.checkbox(&mut look.sounds, "Звуковые сигналы: подключение, отключение, ошибка").on_hover_text(
+        switch(ui, &mut look.anim, "Плавные анимации");
+        switch(ui, &mut look.sounds, "Звуковые сигналы: подключение, отключение, ошибка").on_hover_text(
             "Тихие короткие звуки. Пока идёт трансляция, они молчат (звук компьютера уходит в трансляцию) — отключение и ошибки звучат уже после остановки.",
         );
         let r = ui.add_enabled(self.glass_ok, egui::Checkbox::new(
@@ -4020,7 +4020,7 @@ impl GuiApp {
     fn busy_notice(&mut self, ui: &mut egui::Ui, what: lg::Occupied) {
         let state = |s: &Session| -> (Color32, String) {
             if let Some(e) = &s.error {
-                (c_red(), lg::friendly_error(e).0.to_string())
+                (c_red_text(), lg::friendly_error(e).0.to_string())
             } else if s.connected && !s.stats.is_empty() {
                 match &s.net {
                     Some((l, t, _)) => (level_color(*l), t.clone()),
@@ -4079,56 +4079,90 @@ impl GuiApp {
         }
     }
 
-    fn broadcast_recipients(&mut self, ui: &mut egui::Ui) {
-        page_head(ui, Ico::Friends, "Кому транслировать", "Сначала выберите друга, затем экран или окно");
-        ui.add(egui::TextEdit::singleline(&mut self.friend_search).hint_text("Найти друга").desired_width(f32::INFINITY));
-        let now = unix_now();
-        let query = self.friend_search.trim().to_lowercase();
-        let mut friends = self.book.friends.clone();
-        friends.sort_by_key(|f| (!friends::is_online(self.friend_last_seen.get(&f.id).copied(), now, self.book.friends.len()), f.name.to_lowercase()));
-        let mut selected = None;
-        for f in friends.iter().filter(|f| f.name.to_lowercase().contains(&query)) {
-            let profile = self.book.profiles.get(&f.id).cloned().unwrap_or_default();
-            let online = friends::is_online(self.friend_last_seen.get(&f.id).copied(), now, self.book.friends.len());
-            section(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    crate::profileui::avatar(ui, &profile, ("broadcast", f.id), 40.0);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&f.name).font(bold(15.0)));
-                        ui.label(RichText::new(if online { "В сети" } else { "Не в сети — приглашение будет доступно 15 минут" }).color(c_muted()).size(12.0));
-                    });
-                    if ui.button("Выбрать →").clicked() { selected = Some(f.id); }
-                });
-            });
+    /// "Кому": a friend from the list (invited without codes) or anyone, by a code.
+    fn recipients_card(&mut self, ui: &mut egui::Ui) {
+        if self.book.friends.len() == 1 && self.broadcast_target.is_none() && !self.manual_broadcast {
+            self.broadcast_target = Some(self.book.friends[0].id);
         }
-        if self.book.friends.is_empty() {
-            ui.label("Сначала добавьте друга на главном экране.");
-            if ui.button("К друзьям").clicked() { self.page = Page::Friends; }
-        }
-        if let Some(id) = selected {
-            self.broadcast_target = Some(id);
-            self.windows = wincap::list_windows();
-            self.start_error = None;
-        }
-        ui.add_space(12.0);
-        egui::CollapsingHeader::new("Подключение по коду — если друга нет в списке")
-            .default_open(false).show(ui, |ui| {
-                ui.label(RichText::new("Выберите источник, затем раскройте «Подключение по коду», чтобы передать код зрителю.").color(c_muted()));
-                if ui.button("Выбрать экран для подключения по коду").clicked() {
-                    self.manual_broadcast = true;
-                    self.windows = wincap::list_windows();
+        section(ui, |ui| {
+            ui.label(RichText::new("Кому").font(bold(16.0)));
+            let items = [("Другу", "", 0), ("По коду", "", 1)];
+            if let Some(v) = segmented(ui, &items, self.manual_broadcast as u32) {
+                self.manual_broadcast = v == 1;
+                if self.manual_broadcast {
+                    self.broadcast_target = None;
                 }
-            });
+                self.start_error = None;
+            }
+            if self.manual_broadcast {
+                ui.label(
+                    RichText::new("После запуска появится код — передайте его зрителю, он введёт его во вкладке «Смотреть».")
+                        .color(c_muted())
+                        .size(13.0),
+                );
+                return;
+            }
+            if self.book.friends.is_empty() {
+                ui.label(RichText::new("Друзей пока нет. Добавьте друга — или выберите «По коду».").color(c_muted()).size(13.0));
+                if ui.button("К друзьям").clicked() {
+                    self.page = Page::Friends;
+                }
+                return;
+            }
+            if self.book.friends.len() > 5 {
+                ui.add(egui::TextEdit::singleline(&mut self.friend_search).hint_text("Найти друга").desired_width(f32::INFINITY));
+            }
+            let now = unix_now();
+            let n = self.book.friends.len();
+            let query = if n > 5 { self.friend_search.trim().to_lowercase() } else { String::new() };
+            let mut friends = self.book.friends.clone();
+            friends.sort_by_key(|f| (!friends::is_online(self.friend_last_seen.get(&f.id).copied(), now, n), f.name.to_lowercase()));
+            let mut selected = None;
+            ui.spacing_mut().item_spacing.y = 6.0;
+            for f in friends.iter().filter(|f| f.name.to_lowercase().contains(&query)) {
+                let profile = self.book.profiles.get(&f.id).cloned().unwrap_or_default();
+                let online = friends::is_online(self.friend_last_seen.get(&f.id).copied(), now, n);
+                let on = self.broadcast_target == Some(f.id);
+                let pl = pal();
+                egui::Frame::new()
+                    .fill(if on { pl.accent_soft } else { pl.field })
+                    .stroke(if on { Stroke::new(1.5, pl.accent_text) } else { Stroke::new(1.0, pl.border) })
+                    .corner_radius(8)
+                    .inner_margin(Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            crate::profileui::avatar(ui, &profile, ("broadcast", f.id), 36.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.label(RichText::new(&f.name).font(bold(14.0)));
+                                ui.label(
+                                    RichText::new(if online { "В сети" } else { "Не в сети — приглашение подождёт 15 минут" })
+                                        .color(if online { c_green() } else { c_muted() })
+                                        .size(12.0),
+                                );
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if on {
+                                    ui.label(RichText::new("Выбран").font(bold(13.0)).color(pl.accent_text));
+                                } else if ui.button("Выбрать").clicked() {
+                                    selected = Some(f.id);
+                                }
+                            });
+                        });
+                    });
+            }
+            if let Some(id) = selected {
+                self.broadcast_target = Some(id);
+                self.start_error = None;
+            }
+        });
     }
 
     fn host_page(&mut self, ui: &mut egui::Ui) {
         if let Some(b) = self.tab_busy(lg::Tab::Host) {
             page_head(ui, Ico::Monitor, "Транслировать экран", "Сейчас занято другим");
             self.busy_notice(ui, b);
-            return;
-        }
-        if self.host.is_none() && self.broadcast_target.is_none() && !self.manual_broadcast {
-            self.broadcast_recipients(ui);
             return;
         }
         let live = self.host.as_ref().is_some_and(|s| s.connected && s.active());
@@ -4143,36 +4177,35 @@ impl GuiApp {
             } else if self.host.as_ref().is_some_and(|s| s.active()) {
                 "Идёт подключение"
             } else {
-                "Выберите, что транслировать, и нажмите «Начать трансляцию»"
+                "Выберите, кому и что показать, и нажмите «Начать трансляцию»"
             },
         );
 
         if self.host.is_none() {
-            let who = self.broadcast_target.and_then(|id| self.book.friends.iter().find(|f| f.id == id)).map(|f| f.name.clone());
-            ui.horizontal(|ui| {
-                if ui.button("‹ Кому транслировать").clicked() { self.broadcast_target = None; self.manual_broadcast = false; }
-                ui.label(RichText::new(who.map(|n| format!("Получатель: {n}")).unwrap_or_else(|| "Подключение по коду".into())).color(c_muted()));
-            });
-            if self.broadcast_target.is_none() && !self.manual_broadcast { return; }
+            self.recipients_card(ui);
         }
         let Some(s) = &mut self.host else {
             section(ui, |ui| {
                 ui.label(RichText::new("Что транслировать").font(bold(15.0)));
                 // The cards give way so that quality and the start button stay on the screen (at 1024x740 and up).
-                let room = ui.ctx().content_rect().height() - 32.0 - HOST_FIXED_H - 64.0;
+                let room = ui.ctx().content_rect().height() - 32.0 - HOST_FIXED_H - 64.0 - 150.0;
                 self.pick_source_h(ui, room.clamp(170.0, 352.0));
             });
             if let Some(e) = &self.start_error {
                 error_text(ui, e);
             }
-            if big_button_i(ui, Some(Ico::Play), "Начать трансляцию", c_accent(), !self.monitors.is_empty()) {
+            if self.settings_line(ui) {
+                self.settings_tab = 0;
+                self.page = Page::Settings;
+            }
+            let ready = self.manual_broadcast || self.broadcast_target.is_some();
+            if big_button_i(ui, Some(Ico::Play), "Начать трансляцию", c_accent(), !self.monitors.is_empty() && ready) {
                 let ctx = ui.ctx().clone();
                 if let Some(id) = self.broadcast_target { self.start_inviting_friend(&ctx, id); }
                 else { self.start_host(&ctx); }
             }
-            if self.settings_line(ui) {
-                self.settings_tab = 0;
-                self.page = Page::Settings;
+            if !ready {
+                ui.vertical_centered(|ui| ui.label(RichText::new("Сначала выберите друга или «По коду».").color(c_muted()).size(13.0)));
             }
             return;
         };
@@ -4213,6 +4246,10 @@ impl GuiApp {
                     graph_panel(ui, &s.graph, true);
                 });
             });
+            if big_button_i(ui, Some(Ico::Stop), "Остановить", c_red(), true) {
+                self.go_home();
+                return;
+            }
             // Switching without stopping: the same cards as at the start.
             let mut picked = None;
             if !self.monitors.is_empty() {
@@ -4248,17 +4285,16 @@ impl GuiApp {
                 fold(ui, "Дополнительно", |ui| {
                     ui.label(RichText::new("Звук").font(bold(15.0)));
                     if matches!(self.choice, Choice::Window(_)) {
-                        ui.checkbox(&mut self.audio_prefs.window_only, "Звук только из этого окна");
+                        switch(ui, &mut self.audio_prefs.window_only, "Звук только из этого окна");
                     }
-                    ui.checkbox(&mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе зритель услышит себя с эхом");
+                    switch(ui, &mut self.audio_prefs.exclude_voice, "Не передавать звук Discord").on_hover_text("Иначе зритель услышит себя с эхом");
                 });
                 if self.audio_prefs != before {
                     s.proc.send(&self.audio_prefs.line());
                 }
             }
-            if big_button_i(ui, Some(Ico::Stop), "Остановить", c_red(), true) {
-                self.go_home();
-                return;
+            if control_card(ui, &mut self.ctl, self.vigem.0, &self.drv, Some(&mut *s)) {
+                start_driver_install(&mut self.drv);
             }
             let mut act = PvAction::None;
             if let Some(s) = &self.host {
@@ -4310,14 +4346,9 @@ impl GuiApp {
                 if let Some(e) = &self.friend_error { error_text(ui, e); }
                 if let Some(ok) = &self.friend_ok { ui.label(RichText::new(ok).color(c_muted())); }
             });
-        } else {
-            section(ui, |ui| {
-                ui.label(RichText::new("Подключение по коду").font(bold(20.0)));
-                ui.label(RichText::new("Код и поле ответа находятся в раскрывающемся блоке ниже.").color(c_muted()));
-            });
         }
-        egui::CollapsingHeader::new("Подключение по коду — дополнительный способ")
-            .id_salt("broadcast-code-fallback").default_open(false).show(ui, |ui| {
+        let by_friend = self.broadcast_target.is_some();
+        let mut codes = |ui: &mut egui::Ui| {
         if let Some(room) = s.room.clone() {
             section(ui, |ui| {
                 step(ui, 1, "Передайте зрителю этот код");
@@ -4338,14 +4369,22 @@ impl GuiApp {
             classic_host_codes(ui, s, &mut self.input, &mut self.copied_at);
             connect_card(ui, s);
         }
-            });
+        };
+        if by_friend {
+            egui::CollapsingHeader::new("Подключение по коду — дополнительный способ")
+                .id_salt("broadcast-code-fallback").default_open(false).show(ui, |ui| codes(ui));
+        } else {
+            codes(ui);
+        }
         if big_button_i(ui, Some(Ico::Cross), "Отмена", c_card_hover(), true) {
             self.go_home();
         }
     }
 
     fn watch_friend_picker(&mut self, ui: &mut egui::Ui) {
-        ui.add(egui::TextEdit::singleline(&mut self.friend_search).hint_text("Найти друга").desired_width(f32::INFINITY));
+        if self.book.friends.len() > 5 {
+            ui.add(egui::TextEdit::singleline(&mut self.friend_search).hint_text("Найти друга").desired_width(f32::INFINITY));
+        }
         if let Some(e) = &self.friend_error { error_text(ui, e); }
         if let Some(ok) = &self.friend_ok { ui.label(RichText::new(ok).color(c_muted())); }
         if self.book.friends.is_empty() {
@@ -4354,7 +4393,7 @@ impl GuiApp {
         }
         let retry = crate::ntfy::retry_after_seconds();
         if retry > 0 { ui.label(RichText::new(format!("Пауза сервера: ещё {retry} с. Затем можно повторить запрос.")).color(c_muted())); }
-        let query = self.friend_search.trim().to_lowercase();
+        let query = if self.book.friends.len() > 5 { self.friend_search.trim().to_lowercase() } else { String::new() };
         let peers = self.book.friends.clone();
         self.watch_sent.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(friends::INVITE_TTL_SECS));
         let mut request = None;
@@ -4395,7 +4434,7 @@ impl GuiApp {
             }
         }
         ui.label(RichText::new("Друг сам подтвердит запуск и выберет, что показать. Для запросов нужна новая версия у обоих.").color(c_muted()).size(12.0));
-        ui.add_space(12.0);
+        ui.add_space(8.0);
     }
 
     fn watch_request_card(&mut self, ui: &mut egui::Ui) {
@@ -4405,14 +4444,17 @@ impl GuiApp {
         let name = self.book.friends.iter().find(|f| f.id == id).map(|f| f.name.clone()).unwrap_or_else(|| "Друг".into());
         let busy = self.host.as_ref().is_some_and(Session::active) || self.join.as_ref().is_some_and(Session::active) || self.test.is_some();
         let mut accept = false; let mut decline = false;
-        egui::Frame::new().fill(c_card()).stroke(Stroke::new(1.0, c_accent())).corner_radius(12).inner_margin(14).show(ui, |ui| {
+        float_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.label(RichText::new(format!("{name} просит вас начать трансляцию")).font(bold(16.0)));
-            ui.label(if busy { "Завершите текущую сессию, чтобы выбрать экран." } else { "Вы сами выберете экран или окно. Передача начнётся только после подтверждения." });
-            ui.horizontal_wrapped(|ui| {
-                accept = ui.add_enabled(!busy, egui::Button::new("Выбрать экран")).clicked();
-                decline = ui.button("Отклонить").clicked();
+            ui.label(RichText::new(if busy { "Завершите текущую сессию, чтобы выбрать экран." } else { "Вы сами выберете экран или окно. Передача начнётся только после подтверждения." }).color(c_muted()).size(13.0));
+            ui.add_space(6.0);
+            ui.columns(2, |c| {
+                accept = big_button_i(&mut c[0], Some(Ico::Monitor), "Выбрать экран", c_accent(), !busy);
+                decline = big_button_i(&mut c[1], Some(Ico::Cross), "Отклонить", c_card_hover(), true);
             });
         });
+        ui.add_space(8.0);
         if accept {
             self.invite_friend(ui.ctx(), id);
             self.watch_requests.pending.retain(|(fid, _, n)| !(*fid == id && *n == nonce));
@@ -4429,7 +4471,7 @@ impl GuiApp {
             return;
         }
         let live = self.join.as_ref().is_some_and(|s| s.connected && s.active());
-        page_head(ui, Ico::Eye, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Выберите друга и попросите его начать трансляцию" });
+        page_head(ui, Ico::Eye, "Смотреть", if live { "Вы смотрите трансляцию" } else { "Введите код трансляции или попросите друга начать её" });
 
         if let Some(s) = &mut self.join {
             if s.connected && !s.ended {
@@ -4496,9 +4538,17 @@ impl GuiApp {
             return;
         }
         if self.join.is_none() {
-            self.watch_friend_picker(ui);
-            egui::CollapsingHeader::new("Подключение по коду — дополнительный способ")
-                .id_salt("watch-code-fallback").default_open(false).show(ui, |ui| self.join_code_form(ui));
+            if !self.book.friends.is_empty() {
+                group_label(ui, "Попросить у друга");
+                self.watch_friend_picker(ui);
+                group_label(ui, "Или по коду");
+            }
+            self.join_code_form(ui);
+            if self.book.friends.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("Добавьте друга во вкладке «Друзья» — и сможете просить трансляцию без кодов.").color(c_muted()).size(13.0))
+                });
+            }
             return;
         }
         self.join_code_form(ui);
@@ -4507,8 +4557,10 @@ impl GuiApp {
     fn join_code_form(&mut self, ui: &mut egui::Ui) {
         let have_reply = self.join.as_ref().is_some_and(|s| s.code.is_some());
         if !have_reply {
+            let checking = self.join.as_ref().is_some_and(|s| s.bad_code.is_none());
+            let mut go = false;
             section(ui, |ui| {
-                step(ui, 1, "Введите код трансляции");
+                ui.label(RichText::new("Код трансляции").font(bold(16.0)));
                 // A code just copied from the messenger goes in by itself.
                 if !self.clip_checked && self.input.is_empty() && self.join.is_none() {
                     self.clip_checked = true;
@@ -4523,22 +4575,15 @@ impl GuiApp {
                 if let Some(e) = &self.start_error {
                     error_text(ui, e);
                 }
-                if self.join.as_ref().is_some_and(|s| s.bad_code.is_none()) {
+                if checking {
                     spinner_line(ui, "Проверяю код...");
-                } else if big_button_i(ui, Some(Ico::Eye), "Смотреть", c_accent(), !self.input.trim().is_empty()) || enter {
-                    if let Some(s) = &mut self.join {
-                        let code = self.input.trim().to_string();
-                        s.bad_code = None;
-                        s.proc.send(&code);
-                    } else {
-                        let ctx = ui.ctx().clone();
-                        self.start_join(&ctx);
-                    }
+                } else {
+                    go = enter;
                 }
             });
             if self.join.is_none() {
-                section_pad(ui, 14, |ui| {
-                    ui.label(RichText::new("Режим").font(bold(15.0)));
+                section(ui, |ui| {
+                    ui.label(RichText::new("Режим").font(bold(16.0)));
                     let items = [("Кино", "звук и губы совпадают", 0), ("Игра", "минимальная задержка", 1)];
                     if let Some(v) = segmented(ui, &items, self.game as u32) {
                         self.game = v == 1;
@@ -4556,8 +4601,8 @@ impl GuiApp {
                     ui.label(RichText::new("Переключить во время просмотра: F3").color(c_muted()).size(12.5));
                 });
                 fold(ui, "Дополнительно", |ui| {
-                    ui.checkbox(&mut self.fullscreen, "Открыть на весь экран");
-                    if ui.checkbox(&mut self.on_top, "Окно просмотра поверх всех окон").changed() {
+                    switch(ui, &mut self.fullscreen, "Открыть на весь экран");
+                    if switch(ui, &mut self.on_top, "Окно просмотра поверх всех окон").changed() {
                         crate::volume::write_setting("viewer_on_top", if self.on_top { "1" } else { "0" });
                     }
                     ui.label(
@@ -4566,6 +4611,19 @@ impl GuiApp {
                             .size(12.5),
                     );
                 });
+            }
+            if !checking {
+                go |= big_button_i(ui, Some(Ico::Eye), "Смотреть", c_accent(), !self.input.trim().is_empty());
+            }
+            if go && !self.input.trim().is_empty() {
+                if let Some(s) = &mut self.join {
+                    let code = self.input.trim().to_string();
+                    s.bad_code = None;
+                    s.proc.send(&code);
+                } else {
+                    let ctx = ui.ctx().clone();
+                    self.start_join(&ctx);
+                }
             }
         } else {
             let s = self.join.as_mut().unwrap();
@@ -4637,7 +4695,7 @@ impl GuiApp {
         // One short line per side; the numbers are in "Подробности".
         let line = |ui: &mut egui::Ui, name: &str, s: &Session| {
             let (color, text) = if let Some(e) = &s.error {
-                (c_red(), lg::friendly_error(e).0.to_string())
+                (c_red_text(), lg::friendly_error(e).0.to_string())
             } else if s.ended {
                 (c_muted(), "остановлено".to_string())
             } else if s.connected && !s.stats.is_empty() {

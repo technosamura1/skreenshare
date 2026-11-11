@@ -273,13 +273,13 @@ impl Ctl {
     }
 }
 
-const BG: u32 = 0x00_0D_11_18;
-const FG: u32 = 0x00_E8_EA_EE;
-const DIM: u32 = 0x00_6A_6F_7B;
-const ACCENT: u32 = 0x00_2F_86_F6;
-const RED: u32 = 0x00_F0_5A_5A;
-const GREEN: u32 = 0x00_3E_CF_8E;
-const YELLOW: u32 = 0x00_F0_B4_3C;
+const BG: u32 = 0x00_2B_2D_31;
+const FG: u32 = 0x00_F2_F3_F5;
+const DIM: u32 = 0x00_80_84_8E;
+const ACCENT: u32 = 0x00_4A_5E_E0;
+const RED: u32 = 0x00_CF_35_37;
+const GREEN: u32 = 0x00_23_A5_5A;
+const YELLOW: u32 = 0x00_F0_B2_32;
 
 struct Cv<'a> {
     buf: &'a mut [u32],
@@ -433,10 +433,9 @@ pub fn draw(buf: &mut [u32], w: i32, h: i32, b: &Bar, st: &State) {
     }
     let mut c = Cv { buf, w, h, k: st.opacity.clamp(0.0, 1.0) };
     let s = b.s;
-    c.round(b.x, b.y, b.w, b.h, 18 * s, BG, 0.88);
-    // glassy 1px border, brighter on the top edge
-    c.outline(b.x, b.y, b.w, b.h, 18 * s, s.max(1), 0x00_8F_A6_C8, 0.22);
-    c.rect(b.x + 18 * s, b.y + s.max(1), b.w - 36 * s, s.max(1), FG, 0.06);
+    // a flat grey pill: 92 % opaque, a 1 px border, fully rounded ends
+    c.round(b.x, b.y, b.w, b.h, b.h / 2, BG, 0.92);
+    c.outline(b.x, b.y, b.w, b.h, b.h / 2, s.max(1), 0x00_3F_41_47, 1.0);
 
     let hov = |c: &mut Cv, r: (i32, i32, i32, i32), on: bool| {
         if on {
