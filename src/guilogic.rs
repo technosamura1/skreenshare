@@ -139,67 +139,56 @@ pub fn friendly_error(raw: &str) -> (&'static str, &'static str) {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Accent {
-    Blue,
-    Purple,
-    Green,
+    Indigo,
     Teal,
     Orange,
-    Pink,
-    Grey,
 }
 
 impl Accent {
-    pub const ALL: [Accent; 7] = [Accent::Blue, Accent::Purple, Accent::Green, Accent::Teal, Accent::Orange, Accent::Pink, Accent::Grey];
+    pub const ALL: [Accent; 3] = [Accent::Indigo, Accent::Teal, Accent::Orange];
     pub fn key(self) -> &'static str {
         match self {
-            Accent::Blue => "blue",
-            Accent::Purple => "purple",
-            Accent::Green => "green",
+            Accent::Indigo => "indigo",
             Accent::Teal => "teal",
             Accent::Orange => "orange",
-            Accent::Pink => "pink",
-            Accent::Grey => "grey",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
-            Accent::Blue => "Синий",
-            Accent::Purple => "Фиолетовый",
-            Accent::Green => "Зелёный",
+            Accent::Indigo => "Индиго",
             Accent::Teal => "Бирюзовый",
             Accent::Orange => "Оранжевый",
-            Accent::Pink => "Розовый",
-            Accent::Grey => "Серый",
         }
     }
+    /// Unknown means indigo; the accents of older versions map to the nearest one that is left.
     pub fn parse(s: Option<&str>) -> Accent {
-        let s = s.map(str::trim);
-        Accent::ALL.into_iter().find(|a| Some(a.key()) == s).unwrap_or(Accent::Blue)
+        match s.map(str::trim) {
+            Some("teal") | Some("green") => Accent::Teal,
+            Some("orange") => Accent::Orange,
+            _ => Accent::Indigo,
+        }
     }
 }
 
-/// The theme: dark, light, or monochrome (black, greys and white; v0.12.8).
+/// The theme: dark or light (the monochrome theme of older versions reads as dark).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
     Dark,
     Light,
-    Mono,
 }
 
 impl Theme {
-    pub const ALL: [Theme; 3] = [Theme::Dark, Theme::Light, Theme::Mono];
+    pub const ALL: [Theme; 2] = [Theme::Dark, Theme::Light];
     pub fn key(self) -> &'static str {
         match self {
             Theme::Dark => "dark",
             Theme::Light => "light",
-            Theme::Mono => "mono",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             Theme::Dark => "Тёмная",
             Theme::Light => "Светлая",
-            Theme::Mono => "Монохромная",
         }
     }
 }
@@ -208,8 +197,6 @@ impl Theme {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Look {
     pub light: bool,
-    /// Monochrome: black and greys instead of the blue-tinted dark theme (`light` is false then).
-    pub mono: bool,
     pub accent: Accent,
     /// Animations on (off = every change is instant and nothing repaints by itself).
     pub anim: bool,
@@ -221,7 +208,7 @@ pub struct Look {
 
 impl Default for Look {
     fn default() -> Look {
-        Look { light: false, mono: false, accent: Accent::Blue, anim: true, sounds: true, glass: false }
+        Look { light: false, accent: Accent::Indigo, anim: true, sounds: true, glass: false }
     }
 }
 
@@ -229,15 +216,13 @@ impl Look {
     pub fn theme(&self) -> Theme {
         if self.light {
             Theme::Light
-        } else if self.mono {
-            Theme::Mono
         } else {
             Theme::Dark
         }
     }
 
     pub fn with_theme(self, t: Theme) -> Look {
-        Look { light: t == Theme::Light, mono: t == Theme::Mono, ..self }
+        Look { light: t == Theme::Light, ..self }
     }
 
     /// Reads the keys `theme`, `accent`, `anim`, `sounds`, `glass`; anything unknown means the default.
@@ -252,7 +237,6 @@ impl Look {
         let theme = get(text, "theme");
         Look {
             light: theme.as_deref().map(str::trim) == Some("light"),
-            mono: theme.as_deref().map(str::trim) == Some("mono"),
             accent: Accent::parse(get(text, "accent").as_deref()),
             anim: flag("anim", d.anim),
             sounds: flag("sounds", d.sounds),
@@ -616,10 +600,13 @@ mod tests {
     #[test]
     fn look_defaults_and_parsing() {
         assert_eq!(Look::from_ini(""), Look::default());
-        let l = Look::from_ini("theme=light\naccent=purple\nanim=0\nsounds=0\nglass=1\n");
-        assert_eq!(l, Look { light: true, mono: false, accent: Accent::Purple, anim: false, sounds: false, glass: true });
-        assert!(Look::from_ini("theme=mono\naccent=grey\n").mono);
-        assert_eq!(Look::from_ini("theme=mono\naccent=grey\n").accent, Accent::Grey);
+        let l = Look::from_ini("theme=light\naccent=teal\nanim=0\nsounds=0\nglass=1\n");
+        assert_eq!(l, Look { light: true, accent: Accent::Teal, anim: false, sounds: false, glass: true });
+        // the monochrome theme and the accents of older versions read as the nearest ones that are left
+        assert!(!Look::from_ini("theme=mono\naccent=grey\n").light);
+        assert_eq!(Look::from_ini("theme=mono\naccent=grey\n").accent, Accent::Indigo);
+        assert_eq!(Look::from_ini("accent=green\n").accent, Accent::Teal);
+        assert_eq!(Look::from_ini("accent=orange\n").accent, Accent::Orange);
         let l = Look::from_ini("theme=weird\naccent=chartreuse\nanim=maybe\n");
         assert_eq!(l, Look::default());
         for a in Accent::ALL {
