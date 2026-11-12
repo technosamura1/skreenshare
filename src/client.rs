@@ -1105,7 +1105,7 @@ struct App {
     /// Zoom of the picture (1 = all of it) and the top-left corner of the visible part, as fractions of the picture.
     zoom: f32,
     zoom_origin: (f32, f32),
-    /// The middle button is held: the zoomed picture is dragged (last pointer position).
+    /// The left or the middle button is held on the zoomed picture: it is dragged (last pointer position).
     pan: Option<(i32, i32)>,
     last_click: Option<Instant>,
     /// Level and mute of the sound (None when there is no audio output).
@@ -1313,7 +1313,7 @@ impl App {
         self.zoom_origin = crate::scale::zoom_about(self.zoom_origin, self.zoom, nz, at);
         self.zoom = nz;
         self.toast = Some((
-            if nz > 1.0 { format!("Масштаб {:.0}% · зажмите колесо, чтобы двигать картинку", nz * 100.0) } else { "Масштаб 100%".to_string() },
+            if nz > 1.0 { format!("Масштаб {:.0}% · тяните картинку левой кнопкой мыши", nz * 100.0) } else { "Масштаб 100%".to_string() },
             Instant::now(),
         ));
         self.redraw();
@@ -1763,13 +1763,14 @@ impl ApplicationHandler<UserEv> for App {
                 self.wake_bar();
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                self.pan = None;
                 if self.drag {
                     self.drag = false;
                     self.save_volume();
                     self.last_move = Instant::now();
                 }
             }
-            // The middle button drags the zoomed picture.
+            // The middle button drags the zoomed picture too (it also works with the laser or a sticker on the pointer).
             WindowEvent::MouseInput { state, button: MouseButton::Middle, .. } => {
                 self.pan = (state == ElementState::Pressed && self.zoom > 1.0).then_some(self.cursor);
             }
@@ -1819,6 +1820,10 @@ impl ApplicationHandler<UserEv> for App {
                     }
                     Hit::Outside => {
                         let now = Instant::now();
+                        // Zoomed in: holding the button drags the picture (a double click still toggles full screen).
+                        if self.zoom > 1.0 {
+                            self.pan = Some(self.cursor);
+                        }
                         // A click on the picture puts the bar away at once (no waiting for it to fade).
                         if self.bar_drawn {
                             self.last_move = now - Duration::from_secs(60);
