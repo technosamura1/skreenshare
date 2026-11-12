@@ -308,6 +308,16 @@ impl InputHost {
         !allowed && !self.denied(now) && self.asked_at.lock().unwrap().is_some_and(|t| now.saturating_duration_since(t) < ASK_TTL)
     }
 
+    /// «Разрешить» / «Отклонить» pressed on the banner over the screen. With the GUI running it decides (it knows
+    /// which devices the owner allows) and answers with its usual `CONTROL` line; without it this is the answer.
+    pub fn banner_answer(&self, yes: bool) {
+        if !crate::ui::ctl_answer(yes) {
+            self.apply_request(if yes { "CONTROL on=1 pad=1 kbm=1" } else { "CONTROL deny=1" });
+        }
+        // The banner goes away at once, not when the answer has made its round.
+        *self.asked_at.lock().unwrap() = None;
+    }
+
     /// What the stream shows right now (called for every frame: the window may have been resized or switched).
     /// The picture's place, shared (the laser pointer overlay reads it too).
     pub fn region_handle(&self) -> Arc<Mutex<Option<Region>>> {

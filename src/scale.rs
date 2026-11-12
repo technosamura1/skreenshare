@@ -64,9 +64,100 @@ pub fn blit_fit(dst: &mut [u32], ww: usize, wh: usize, src: &[u32], sw: usize, s
     }
 }
 
+/// Zoom limits of the viewer (1 = the whole picture).
+pub const ZOOM_MAX: f32 = 8.0;
+
+/// Keeps the top-left corner of the zoomed view (a fraction of the picture, per axis) inside the picture.
+pub fn clamp_origin(origin: (f32, f32), z: f32) -> (f32, f32) {
+    let max = (1.0 - 1.0 / z.max(1.0)).max(0.0);
+    (origin.0.clamp(0.0, max), origin.1.clamp(0.0, max))
+}
+
+/// New origin after the zoom changes from `z` to `new_z` so that the point under the pointer stays under it.
+/// `at` is the pointer as a fraction (0..1) of the area the picture is drawn in.
+pub fn zoom_about(origin: (f32, f32), z: f32, new_z: f32, at: (f32, f32)) -> (f32, f32) {
+    let (z, new_z) = (z.max(1.0), new_z.max(1.0));
+    let p = (origin.0 + at.0 / z, origin.1 + at.1 / z);
+    clamp_origin((p.0 - at.0 / new_z, p.1 - at.1 / new_z), new_z)
+}
+
+/// Like `blit_fit`, but shows only the part of `src` that starts at `origin` (fractions of the picture) and is
+/// 1/`z` of it wide and high, magnified into the same fitted, centred rectangle (bilinear).
+pub fn blit_zoom(dst: &mut [u32], ww: usize, wh: usize, src: &[u32], sw: usize, sh: usize, z: f32, origin: (f32, f32)) {
+    if dst.len() < ww * wh {
+        return;
+    }
+    dst[..ww * wh].fill(0);
+    if sw == 0 || sh == 0 || src.len() < sw * sh {
+        return;
+    }
+    let (tw, th) = fit_size(sw, sh, ww, wh);
+    if tw == 0 || th == 0 {
+        return;
+    }
+    let z = z.max(1.0);
+    let origin = clamp_origin(origin, z);
+    let (ox, oy) = ((ww - tw) / 2, (wh - th) / 2);
+    let (x0f, y0f) = (origin.0 * sw as f32, origin.1 * sh as f32);
+    let (kx, ky) = (sw as f32 / z / tw as f32, sh as f32 / z / th as f32);
+    let xs: Vec<(usize, u32)> = (0..tw)
+        .map(|x| {
+            let fx = (x0f + (x as f32 + 0.5) * kx - 0.5).max(0.0);
+            let x0 = (fx as usize).min(sw - 1);
+            (x0, (((fx - x0 as f32) * 256.0) as u32).min(256))
+        })
+        .collect();
+    for y in 0..th {
+        let fy = (y0f + (y as f32 + 0.5) * ky - 0.5).max(0.0);
+        let y0 = (fy as usize).min(sh - 1);
+        let y1 = (y0 + 1).min(sh - 1);
+        let wy = (((fy - y0 as f32) * 256.0) as u32).min(256);
+        let (r0, r1) = (&src[y0 * sw..(y0 + 1) * sw], &src[y1 * sw..(y1 + 1) * sw]);
+        let row = &mut dst[(oy + y) * ww + ox..(oy + y) * ww + ox + tw];
+        for (d, &(x0, wx)) in row.iter_mut().zip(&xs) {
+            let x1 = (x0 + 1).min(sw - 1);
+            *d = lerp(lerp(r0[x0], r0[x1], wx), lerp(r1[x0], r1[x1], wx), wy);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoom_keeps_the_point_under_the_pointer_and_stays_inside() {
+        // zooming in at the centre: the centre of the picture stays in the centre
+        let o = zoom_about((0.0, 0.0), 1.0, 2.0, (0.5, 0.5));
+        assert!((o.0 - 0.25).abs() < 1e-6 && (o.1 - 0.25).abs() < 1e-6);
+        // the point under the pointer is the same before and after
+        let (z, nz, at, o0) = (2.0, 3.0, (0.8, 0.3), (0.25, 0.25));
+        let o1 = zoom_about(o0, z, nz, at);
+        assert!((o0.0 + at.0 / z - (o1.0 + at.0 / nz)).abs() < 1e-5);
+        assert!((o0.1 + at.1 / z - (o1.1 + at.1 / nz)).abs() < 1e-5);
+        // a corner cannot leave the picture, and zoom 1 always shows everything
+        assert_eq!(zoom_about((0.0, 0.0), 1.0, 4.0, (1.0, 1.0)), (0.75, 0.75));
+        assert_eq!(zoom_about((0.6, 0.6), 4.0, 1.0, (0.1, 0.9)), (0.0, 0.0));
+        assert_eq!(clamp_origin((-1.0, 2.0), 2.0), (0.0, 0.5));
+    }
+
+    #[test]
+    fn blit_zoom_magnifies_the_chosen_part() {
+        // 8x8 picture: columns 0..2 are 1, the rest 2; zoom 2 on the right half fills the window with 2
+        let src: Vec<u32> = (0..64).map(|i| if i % 8 < 3 { 1 } else { 2 }).collect();
+        let mut dst = vec![9u32; 64];
+        blit_zoom(&mut dst, 8, 8, &src, 8, 8, 2.0, (0.5, 0.0));
+        assert!(dst.iter().all(|&p| p == 2), "{dst:?}");
+        // the left half shows both values, magnified: the 1s take more than their 3 columns
+        blit_zoom(&mut dst, 8, 8, &src, 8, 8, 2.0, (0.0, 0.0));
+        assert!(dst[..8].iter().filter(|&&p| p == 1).count() >= 5, "{:?}", &dst[..8]);
+        // zoom 1 is the plain picture
+        let mut dst = vec![9u32; 64];
+        blit_zoom(&mut dst, 8, 8, &src, 8, 8, 1.0, (0.0, 0.0));
+        assert_eq!(dst, src);
+        // short buffers are left alone
+        blit_zoom(&mut [0u32; 3], 8, 8, &src, 8, 8, 2.0, (0.0, 0.0));
+    }
 
     #[test]
     fn fit_keeps_aspect() {

@@ -234,6 +234,15 @@ pub fn ctrl_status(text: &str) {
     }
 }
 
+/// The owner answered the viewer's request for control on the banner over the screen (`@CTLANS allow` / `deny`):
+/// the GUI does what its own «Разрешить» / «Отклонить» do. False = there is no GUI to tell.
+pub fn ctl_answer(yes: bool) -> bool {
+    if ipc() {
+        println!("@CTLANS {}", if yes { "allow" } else { "deny" });
+    }
+    ipc()
+}
+
 static AUDIO_REQ: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// The newest `AUDIO ...` line from the GUI, if one arrived since the last call.

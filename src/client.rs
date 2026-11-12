@@ -1039,6 +1039,10 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         proxy,
         start_fullscreen: !o.windowed,
         on_top: o.on_top,
+        wheel_zoom: crate::volume::ini_get(&crate::volume::read_settings(), "viewer_wheel").map(str::trim) != Some("volume"),
+        zoom: 1.0,
+        zoom_origin: (0.0, 0.0),
+        pan: None,
         last_click: None,
         volume: player.as_ref().map(|p| p.volume.clone()),
         no_audio_note: if !o.audio {
@@ -1096,6 +1100,13 @@ struct App {
     start_fullscreen: bool,
     /// «Поверх всех окон»: the window level, toggled with T and remembered in gui.ini.
     on_top: bool,
+    /// The wheel zooms the picture (true) or changes the volume (false); Ctrl + wheel does the other one.
+    wheel_zoom: bool,
+    /// Zoom of the picture (1 = all of it) and the top-left corner of the visible part, as fractions of the picture.
+    zoom: f32,
+    zoom_origin: (f32, f32),
+    /// The middle button is held: the zoomed picture is dragged (last pointer position).
+    pan: Option<(i32, i32)>,
     last_click: Option<Instant>,
     /// Level and mute of the sound (None when there is no audio output).
     volume: Option<Arc<VolumeCtl>>,
@@ -1268,7 +1279,44 @@ impl App {
         let (ox, oy) = ((size.width as f64 - dw) / 2.0, (size.height as f64 - dh) / 2.0);
         let fx = ((pos.x - ox) / dw).clamp(0.0, 1.0);
         let fy = ((pos.y - oy) / dh).clamp(0.0, 1.0);
+        // Zoomed in: only a part of the picture is on screen.
+        let (z, o) = (self.zoom.max(1.0) as f64, self.zoom_origin);
+        let fx = (o.0 as f64 + fx / z).clamp(0.0, 1.0);
+        let fy = (o.1 as f64 + fy / z).clamp(0.0, 1.0);
         Some(((fx * 65535.0).round() as u16, (fy * 65535.0).round() as u16))
+    }
+
+    /// Where the pointer is inside the area the picture is drawn in (0..1 both ways), and that area's size in pixels.
+    fn shown_frac(&self) -> Option<((f32, f32), (f32, f32))> {
+        let size = self.window.as_ref()?.inner_size();
+        let (pw, ph) = {
+            let p = self.sh.picture.lock().unwrap();
+            (p.w as usize, p.h as usize)
+        };
+        let (tw, th) = crate::scale::fit_size(pw, ph, size.width as usize, size.height as usize);
+        if tw == 0 || th == 0 {
+            return None;
+        }
+        let (ox, oy) = ((size.width as f32 - tw as f32) / 2.0, (size.height as f32 - th as f32) / 2.0);
+        let fx = ((self.cursor.0 as f32 - ox) / tw as f32).clamp(0.0, 1.0);
+        let fy = ((self.cursor.1 as f32 - oy) / th as f32).clamp(0.0, 1.0);
+        Some(((fx, fy), (tw as f32, th as f32)))
+    }
+
+    /// One wheel step of zoom around the pointer.
+    fn zoom_by(&mut self, steps: f32) {
+        let Some((at, _)) = self.shown_frac() else { return };
+        let mut nz = (self.zoom * 1.2f32.powf(steps)).clamp(1.0, crate::scale::ZOOM_MAX);
+        if nz < 1.04 {
+            nz = 1.0;
+        }
+        self.zoom_origin = crate::scale::zoom_about(self.zoom_origin, self.zoom, nz, at);
+        self.zoom = nz;
+        self.toast = Some((
+            if nz > 1.0 { format!("Масштаб {:.0}% · зажмите колесо, чтобы двигать картинку", nz * 100.0) } else { "Масштаб 100%".to_string() },
+            Instant::now(),
+        ));
+        self.redraw();
     }
 
     fn toggle_control(&mut self) {
@@ -1457,7 +1505,7 @@ impl ApplicationHandler<UserEv> for App {
             return;
         }
         let mut attrs = Window::default_attributes()
-            .with_title("screenshare — F11 или двойной клик: полный экран / окно")
+            .with_title("screenshare — F, F11 или двойной клик: полный экран / окно")
             .with_window_icon(crate::icon::window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         if self.start_fullscreen {
@@ -1618,6 +1666,13 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
                 match event.logical_key {
                     Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
+                    // F (by its place on the keyboard, any layout): full screen and back, like F11.
+                    _ if !self.mods.control_key()
+                        && !self.mods.alt_key()
+                        && matches!(event.physical_key, winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyF)) =>
+                    {
+                        self.toggle_fullscreen()
+                    }
                     Key::Named(NamedKey::Escape) if self.armed.is_some() || self.picker || self.laser => {
                         self.laser = false; self.input.laser(None);
                         self.armed = None;
@@ -1642,6 +1697,17 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let moved = (position.x as i32 - self.cursor.0).abs() + (position.y as i32 - self.cursor.1).abs() >= 2;
                 self.cursor = (position.x as i32, position.y as i32);
+                if let (Some(from), Some((_, (tw, th)))) = (self.pan, self.shown_frac()) {
+                    if self.zoom > 1.0 {
+                        let o = self.zoom_origin;
+                        let (dx, dy) = ((from.0 - self.cursor.0) as f32, (from.1 - self.cursor.1) as f32);
+                        self.zoom_origin = crate::scale::clamp_origin((o.0 + dx / tw / self.zoom, o.1 + dy / th / self.zoom), self.zoom);
+                        self.pan = Some(self.cursor);
+                        self.redraw();
+                    } else {
+                        self.pan = None;
+                    }
+                }
                 if self.laser {
                     self.input.laser(self.picture_spot(position));
                 }
@@ -1703,13 +1769,19 @@ impl ApplicationHandler<UserEv> for App {
                     self.last_move = Instant::now();
                 }
             }
-            // Wheel: volume in 5% steps, anywhere in the window.
+            // The middle button drags the zoomed picture.
+            WindowEvent::MouseInput { state, button: MouseButton::Middle, .. } => {
+                self.pan = (state == ElementState::Pressed && self.zoom > 1.0).then_some(self.cursor);
+            }
+            // Wheel: zoom around the pointer or volume in 5% steps (the setting decides; Ctrl + wheel is the other one).
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => (p.y / 40.0) as f32,
                 };
-                if let Some(v) = &self.volume {
+                if self.wheel_zoom != self.mods.control_key() {
+                    self.zoom_by(dy);
+                } else if let Some(v) = &self.volume {
                     v.set_level(volume::clamp_level(((v.level() + dy * 0.05) * 20.0).round() / 20.0));
                     v.set_muted(false);
                     volume::save(v);
@@ -1896,6 +1968,8 @@ impl App {
         let (pw, ph) = (p.w as usize, p.h as usize);
         if pw == 0 || p.px.len() < pw * ph {
             buf.fill(0);
+        } else if self.zoom > 1.0 {
+            crate::scale::blit_zoom(&mut buf, ww, wh, &p.px, pw, ph, self.zoom, self.zoom_origin);
         } else if !crate::scale::matches_window(pw, ph, ww, wh) {
             // The window was resized and the decoder has not caught up yet: stretch smoothly instead of black bars.
             crate::scale::blit_fit(&mut buf, ww, wh, &p.px, pw, ph);

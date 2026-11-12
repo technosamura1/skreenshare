@@ -419,6 +419,10 @@ fn float_frame() -> egui::Frame {
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub fn run() -> eframe::Result {
+    // Already running (maybe hidden in the tray): that window comes up instead of a second copy.
+    if crate::tray::activate_existing() {
+        return Ok(());
+    }
     let look = lg::Look::from_ini(&crate::volume::read_settings());
     // Glass is decided once per start: a transparent window cannot be switched on later.
     let glass = look.glass && crate::glass::supported();
@@ -448,6 +452,8 @@ pub fn run() -> eframe::Result {
                 _ => 0,
             };
             crate::glass::apply(hwnd, !look.light, glass);
+            let wake = cc.egui_ctx.clone();
+            crate::tray::start(hwnd, move || wake.request_repaint());
             Ok(Box::new(GuiApp::new(&cc.egui_ctx, look, glass, hwnd)))
         }),
     )
@@ -582,6 +588,8 @@ struct Session {
     /// Host: what the control thread reports (`@CTRL`), and a one-shot flag that the owner just revoked control.
     ctrl: Option<lg::CtrlStatus>,
     revoke_event: bool,
+    /// Host: the owner answered the request for control on the banner over the screen (true = allow).
+    banner_answer: Option<bool>,
 }
 
 impl Session {
@@ -617,6 +625,7 @@ impl Session {
             cue_end: false,
             ctrl: None,
             revoke_event: false,
+            banner_answer: None,
         })
     }
 
@@ -656,6 +665,9 @@ impl Session {
                     }
                     self.ctrl = Some(c);
                 }
+            } else if let Some(a) = l.strip_prefix("@CTLANS ") {
+                // «Разрешить» / «Отклонить» pressed on the banner over the streamed screen.
+                self.banner_answer = Some(a.trim() == "allow");
             } else if let Some(p) = l.strip_prefix("@PREVIEW ") {
                 self.preview_raw = Some(p.to_string()); // only the newest picture matters
             } else if let Some(t) = l.strip_prefix("@PVLABEL ") {
@@ -1059,6 +1071,10 @@ struct GuiApp {
     fullscreen: bool,
     /// The viewer window stays above all other windows (`viewer_on_top` in gui.ini; T while watching).
     on_top: bool,
+    /// The wheel in the viewer zooms the picture (true) or changes the volume (false). Remembered.
+    wheel_zoom: bool,
+    /// The close button hides the window into the tray instead of quitting. Remembered.
+    tray: bool,
     /// Viewer mode «Игра» (low latency) instead of «Кино» (lip sync). Remembered.
     game: bool,
     host: Option<Session>,
@@ -1225,6 +1241,8 @@ impl GuiApp {
             audio_prefs: audiosel::AudioPrefs::default(),
             fullscreen: true,
             on_top: load_on_top(),
+            wheel_zoom: crate::volume::ini_get(&crate::volume::read_settings(), "viewer_wheel").map(str::trim) != Some("volume"),
+            tray: crate::volume::ini_get(&crate::volume::read_settings(), "tray").map(str::trim) != Some("0"),
             game: crate::volume::ini_get(&crate::volume::read_settings(), "viewer_mode") == Some("game"),
             host: None,
             badge: Default::default(),
@@ -1478,8 +1496,22 @@ impl eframe::App for GuiApp {
     /// every `ui` and also while the window is minimized — `ui` is not called then, and the friends' relay used
     /// to stop with it (no invitation arrived, the host never got the viewer's answer).
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // The close button: into the tray (the icon by the clock brings the window back, its menu quits).
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.tray && crate::tray::ready() && !crate::tray::quitting() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                crate::tray::hide(self.hwnd);
+            } else {
+                crate::tray::stop();
+            }
+        }
         for s in [&mut self.host, &mut self.join].into_iter().flatten() {
             s.poll();
+        }
+        // Answered on the banner over the screen: the same as the card's buttons (works with the window hidden).
+        if let Some(yes) = self.host.as_mut().and_then(|s| s.banner_answer.take()) {
+            self.answer_control(yes);
+            ctx.request_repaint();
         }
         self.flush_invite_wait();
         // Red dot on our taskbar button while the screen is being shown to someone.
@@ -1690,6 +1722,10 @@ impl GuiApp {
         let flash_invite = invites > self.friend_invites_flashed;
         self.friend_invites_flashed = invites;
         if flash_ask || flash_invite {
+            // Hidden in the tray: the window comes back (without taking the focus) so the request can be answered.
+            if crate::tray::hidden(self.hwnd) {
+                crate::tray::reveal(self.hwnd, false);
+            }
             flash_taskbar(self.hwnd);
             ctx.request_repaint();
         }
@@ -1723,7 +1759,15 @@ impl GuiApp {
                 });
             });
         ui.add_space(10.0);
-        if let (Some(yes), Some(s)) = (answer, self.host.as_mut()) {
+        if let Some(yes) = answer {
+            self.answer_control(yes);
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(250));
+    }
+
+    /// The owner's answer to the viewer's request for control, from the card here or from the banner over the screen.
+    fn answer_control(&mut self, yes: bool) {
+        if let Some(s) = self.host.as_mut() {
             if yes {
                 self.ctl.allow = true;
                 if !self.ctl.pad && !self.ctl.kbm {
@@ -1740,7 +1784,6 @@ impl GuiApp {
                 c.asked = false;
             }
         }
-        ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
 }
 
@@ -3892,9 +3935,11 @@ impl GuiApp {
         section(ui, |ui| {
             ui.label(RichText::new("В окне просмотра").font(bold(16.0)));
             for (k, t) in [
-                ("F11 · двойной клик", "полный экран и обратно"),
+                ("F · F11 · двойной клик", "полный экран и обратно"),
                 ("Esc", "выйти из полного экрана"),
-                ("Колесо мыши", "громкость, шаг 5%"),
+                ("Колесо мыши", "масштаб к указателю или громкость (выбор в «Смотреть» → «Дополнительно»)"),
+                ("Ctrl + колесо", "второе действие колеса"),
+                ("Зажатое колесо", "двигать увеличенную картинку"),
                 ("M", "выключить и включить звук"),
                 ("T", "окно поверх всех остальных"),
             ] {
@@ -3958,6 +4003,12 @@ impl GuiApp {
                 }
             }
         });
+        if switch(ui, &mut self.tray, "Крестик сворачивает окно в трей (значок рядом с часами)")
+            .on_hover_text("Программа продолжает работать, а на панели задач остаётся только окно просмотра. Открыть — клик по значку, выйти — правый клик по нему → «Выход».")
+            .changed()
+        {
+            crate::volume::write_setting("tray", if self.tray { "1" } else { "0" });
+        }
         switch(ui, &mut look.anim, "Плавные анимации");
         switch(ui, &mut look.sounds, "Звуковые сигналы: подключение, отключение, ошибка").on_hover_text(
             "Тихие короткие звуки. Пока идёт трансляция, они молчат (звук компьютера уходит в трансляцию) — отключение и ошибки звучат уже после остановки.",
@@ -4602,6 +4653,18 @@ impl GuiApp {
                 });
                 fold(ui, "Дополнительно", |ui| {
                     switch(ui, &mut self.fullscreen, "Открыть на весь экран");
+                    ui.label(RichText::new("Колесо мыши в окне просмотра").font(bold(14.0)));
+                    let wheel = [("Масштаб", "приближает к указателю", 1), ("Громкость", "шаг 5%", 0)];
+                    if let Some(v) = segmented(ui, &wheel, self.wheel_zoom as u32) {
+                        self.wheel_zoom = v == 1;
+                        crate::volume::write_setting("viewer_wheel", if self.wheel_zoom { "zoom" } else { "volume" });
+                    }
+                    ui.label(
+                        RichText::new("С зажатым Ctrl колесо делает второе действие. При увеличении картинку можно двигать, зажав колесо.")
+                            .color(c_muted())
+                            .size(12.5),
+                    );
+                    ui.add_space(4.0);
                     if switch(ui, &mut self.on_top, "Окно просмотра поверх всех окон").changed() {
                         crate::volume::write_setting("viewer_on_top", if self.on_top { "1" } else { "0" });
                     }
