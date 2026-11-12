@@ -4,7 +4,7 @@
 // into a bitmap handed to UpdateLayeredWindow; the window only covers what is drawn, and hides when idle.
 use crate::annot::{self, Board};
 use crate::inputhost::{self, Region};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::{w, Result};
@@ -94,10 +94,49 @@ fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
-/// The banner at the top of the streamed screen while the viewer asks for control.
-const BANNER: &str = "Зритель просит управление — разрешите или отклоните в окне screenshare";
+/// The banner at the top of the streamed screen while the viewer asks for control: the question and two buttons,
+/// so it can be answered right there (the same request is also a card in the screenshare window).
+const BANNER: &str = "Зритель просит управление";
 const BANNER_W: f32 = 760.0;
 const BANNER_H: f32 = 54.0;
+const BTN_W: f32 = 132.0;
+const BTN_H: f32 = 38.0;
+const BTN_GAP: f32 = 8.0;
+
+/// The two buttons inside a banner whose left edge is at `left`: («Разрешить», «Отклонить») as (from, to) in x.
+fn banner_buttons(left: f32) -> ((f32, f32), (f32, f32)) {
+    let right = left + BANNER_W - BTN_GAP;
+    ((right - 2.0 * BTN_W - BTN_GAP, right - BTN_W - BTN_GAP), (right - BTN_W, right))
+}
+
+/// Which button a click at `x` (from the banner's left edge) lands on: 1 = allow, 2 = deny, 0 = neither.
+fn banner_hit(x: f32) -> u8 {
+    let (allow, deny) = banner_buttons(0.0);
+    if x >= allow.0 && x < allow.1 {
+        1
+    } else if x >= deny.0 && x < deny.1 {
+        2
+    } else {
+        0
+    }
+}
+
+/// The last click on the banner (see `banner_hit`), picked up by the drawing loop.
+static BANNER_CLICK: AtomicU8 = AtomicU8::new(0);
+
+/// The drawing window lets every click through; the banner's buttons need one that does not. This is an (almost)
+/// invisible window laid exactly over the banner that only takes the clicks. It never becomes the active window.
+unsafe extern "system" fn click_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if m == WM_LBUTTONUP {
+        let x = (l.0 & 0xFFFF) as i16 as f32;
+        let hit = banner_hit(x);
+        if hit != 0 {
+            BANNER_CLICK.store(hit, Ordering::Relaxed);
+        }
+        return LRESULT(0);
+    }
+    unsafe { DefWindowProcW(h, m, w, l) }
+}
 
 fn run(
     board: &Mutex<Board>,
@@ -139,6 +178,39 @@ fn run(
         *exclusion.lock().unwrap() = Some(excluded);
         h
     };
+    let clicks = unsafe {
+        let inst = GetModuleHandleW(None)?;
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(click_proc),
+            hInstance: inst.into(),
+            lpszClassName: w!("ScreenshareAnnotClicks"),
+            hCursor: LoadCursorW(None, IDC_HAND).unwrap_or_default(),
+            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+        let h = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            w!("ScreenshareAnnotClicks"),
+            w!("screenshare control request"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            Some(inst.into()),
+            None,
+        )?;
+        // 1/255 opaque: takes clicks, cannot be seen.
+        let _ = SetLayeredWindowAttributes(h, COLORREF(0), 1, LWA_ALPHA);
+        if !debug_visible {
+            let _ = crate::captureexclude::apply(h);
+        }
+        h
+    };
+    let mut clicks_shown = false;
     let mut gfx: Option<Gfx> = None;
     let mut shown = false;
     let mut last_drawn: Option<(Option<(i32, i32)>, usize, bool)> = None;
@@ -152,9 +224,21 @@ fn run(
                 DispatchMessageW(&m);
             }
         }
+        // «Разрешить» / «Отклонить» pressed on the banner.
+        match (BANNER_CLICK.swap(0, Ordering::Relaxed), input) {
+            (1, Some(i)) => i.banner_answer(true),
+            (2, Some(i)) => i.banner_answer(false),
+            _ => {}
+        }
         let now = Instant::now();
         let reg = *region.lock().unwrap();
         let asking = input.is_some_and(|i| i.asking(now));
+        if !asking && clicks_shown {
+            unsafe {
+                let _ = ShowWindow(clicks, SW_HIDE);
+            }
+            clicks_shown = false;
+        }
         let mut b = board.lock().unwrap();
         let can_draw = capture_safe.load(Ordering::Acquire);
         let busy = can_draw && ((enabled.load(Ordering::Relaxed) && b.busy(now)) || asking);
@@ -258,6 +342,12 @@ fn run(
             }
             // Stay above windows that came to the top since.
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            // The click window sits exactly over the banner, above the drawing.
+            if let Some((x, y)) = banner {
+                let (bl, bt) = ((x - BANNER_W / 2.0).round() as i32, (y - BANNER_H / 2.0).round() as i32);
+                let _ = SetWindowPos(clicks, Some(HWND_TOPMOST), bl, bt, BANNER_W as i32, BANNER_H as i32, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                clicks_shown = true;
+            }
         }
         // Next frame with the screen's own refresh (60/144 Hz): a plain sleep is 15.6 ms steps on Windows.
         if unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
@@ -265,6 +355,7 @@ fn run(
         }
     }
     unsafe {
+        let _ = DestroyWindow(clicks);
         let _ = DestroyWindow(hwnd);
         if let Some(g) = gfx {
             let _ = DeleteDC(g.dc);
@@ -358,15 +449,29 @@ fn draw(g: &Gfx, (l, t, w, h): (i32, i32, i32, i32), laser: Option<(i32, i32)>, 
         }
         if let Some((x, y)) = banner {
             let (x, y) = (x - ox, y - oy);
-            let brush = rt.CreateSolidColorBrush(&color(0.07, 0.09, 0.13, 0.94), None)?;
+            // The launcher's dark card: #2b2d31 with a #3f4147 border, an accent and a neutral button.
+            let brush = rt.CreateSolidColorBrush(&color(0.169, 0.176, 0.192, 0.97), None)?;
             let r = D2D_RECT_F { left: x - BANNER_W / 2.0, top: y - BANNER_H / 2.0, right: x + BANNER_W / 2.0, bottom: y + BANNER_H / 2.0 };
-            let rr = D2D1_ROUNDED_RECT { rect: r, radiusX: 14.0, radiusY: 14.0 };
+            let rr = D2D1_ROUNDED_RECT { rect: r, radiusX: 12.0, radiusY: 12.0 };
             rt.FillRoundedRectangle(&rr, &brush);
-            brush.SetColor(&color(0.94, 0.71, 0.24, 1.0));
-            rt.DrawRoundedRectangle(&rr, &brush, 2.0, None);
+            brush.SetColor(&color(0.247, 0.255, 0.278, 1.0));
+            rt.DrawRoundedRectangle(&rr, &brush, 1.5, None);
+            let (allow, deny) = banner_buttons(r.left);
+            let button = |(from, to): (f32, f32)| D2D_RECT_F { left: from, top: y - BTN_H / 2.0, right: to, bottom: y + BTN_H / 2.0 };
+            let (ra, rd) = (button(allow), button(deny));
+            brush.SetColor(&color(0.290, 0.369, 0.878, 1.0));
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: ra, radiusX: 8.0, radiusY: 8.0 }, &brush);
+            brush.SetColor(&color(0.251, 0.259, 0.286, 1.0));
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rd, radiusX: 8.0, radiusY: 8.0 }, &brush);
+            brush.SetColor(&color(0.949, 0.953, 0.961, 1.0));
+            let label = |text: &str, rect: &D2D_RECT_F| {
+                let txt: Vec<u16> = text.encode_utf16().collect();
+                rt.DrawText(&txt, &g.text, rect, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            };
+            label(BANNER, &D2D_RECT_F { left: r.left + 16.0, top: r.top, right: allow.0 - 16.0, bottom: r.bottom });
             brush.SetColor(&color(1.0, 1.0, 1.0, 1.0));
-            let txt: Vec<u16> = BANNER.encode_utf16().collect();
-            rt.DrawText(&txt, &g.text, &r, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            label("Разрешить", &ra);
+            label("Отклонить", &rd);
         }
         if let Some((x, y)) = laser {
             let (x, y) = (x as f32 - ox, y as f32 - oy);
@@ -416,4 +521,23 @@ pub fn demo(region: Region) {
         std::thread::sleep(Duration::from_millis(10));
     }
     std::thread::sleep(annot::REACTION_LIFE);
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::*;
+
+    #[test]
+    fn banner_buttons_sit_inside_the_banner_and_take_their_own_clicks() {
+        let (allow, deny) = banner_buttons(0.0);
+        assert!(allow.0 > BANNER_W / 2.0, "the question has the left half and more");
+        assert!(allow.1 <= deny.0 && deny.1 <= BANNER_W, "side by side, inside the banner");
+        assert_eq!(banner_hit((allow.0 + allow.1) / 2.0), 1);
+        assert_eq!(banner_hit((deny.0 + deny.1) / 2.0), 2);
+        // the text, the gap between the buttons and the right margin answer nothing
+        assert_eq!(banner_hit(100.0), 0);
+        assert_eq!(banner_hit((allow.1 + deny.0) / 2.0), 0);
+        assert_eq!(banner_hit(BANNER_W - 1.0), 0);
+        assert!(BTN_H < BANNER_H);
+    }
 }

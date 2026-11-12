@@ -54,6 +54,7 @@ mod selftest;
 mod source;
 mod stickers;
 mod taskbar;
+mod tray;
 mod thumbs;
 mod ui;
 mod video;
