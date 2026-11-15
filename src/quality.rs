@@ -52,6 +52,18 @@ pub fn fit(w: u32, h: u32, limit: u16) -> (u32, u32) {
     (nw.max(2), nh.max(2))
 }
 
+/// The most "Авто" sends for a picture `h` pixels high, Mbit/s. HEVC needs far less than the old flat 60 for a
+/// clean picture, and tens of megabits of UDP to one address for minutes on end is what home routers and
+/// providers tend to throttle or drop.
+pub fn auto_mbps(h: u32) -> f64 {
+    match h {
+        0..=720 => 8.0,
+        721..=1080 => 14.0,
+        1081..=1440 => 22.0,
+        _ => 35.0,
+    }
+}
+
 /// Viewer -> host: ver u8 = 1 | wanted height u16 LE | window height u16 LE.
 pub fn encode(viewer: u16, win_h: u16, out: &mut Vec<u8>) {
     out.push(1);
@@ -106,6 +118,15 @@ mod tests {
         assert_eq!(fit(3840, 2160, NATIVE), (3840, 2160));
         let (w, h) = fit(1366, 768, 720);
         assert!(w % 2 == 0 && h % 2 == 0 && h == 720, "{w}x{h}");
+    }
+
+    #[test]
+    fn auto_bitrate_grows_with_the_picture() {
+        assert_eq!(auto_mbps(720), 8.0);
+        assert_eq!(auto_mbps(1080), 14.0);
+        assert_eq!(auto_mbps(1440), 22.0);
+        assert_eq!(auto_mbps(2160), 35.0);
+        assert!(auto_mbps(600) <= auto_mbps(900) && auto_mbps(900) <= auto_mbps(1200) && auto_mbps(1200) <= auto_mbps(1600));
     }
 
     #[test]
