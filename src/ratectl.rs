@@ -160,6 +160,18 @@ impl RateControl {
         }
     }
 
+    /// "Авто" ties the cap to the stream's resolution (quality.rs), which the viewer can change while watching:
+    /// a lower cap applies at once, a higher one is climbed to by the ordinary logic while the link is clean.
+    pub fn set_max(&mut self, max: f64) {
+        self.max = max.max(Self::MIN);
+        if self.cur > self.max {
+            self.cur = self.max;
+        }
+        if self.cur >= self.max {
+            self.ramp = None;
+        }
+    }
+
     /// True when quality was recently cut: the lamp says "снизил качество".
     pub fn recently_cut(&self, now: Instant) -> bool {
         self.cut_at.is_some_and(|t| now.duration_since(t) < Duration::from_secs(30))

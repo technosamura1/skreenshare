@@ -716,11 +716,20 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     let mut stat_encode_peak = Duration::ZERO;
     let mut stat_bytes0 = 0u64;
     let mut flash = crate::avsync::FlashEdge::default();
+    // "Авто": the cap follows the stream's resolution; a chosen number is the streamer's own cap and stays.
+    // A software encoder may lower either (`enc_cap`).
+    let mut enc_cap: Option<f64> = None;
+    let rate_cap = |h: u32, enc_cap: Option<f64>| {
+        let m = if o.auto_bitrate { (o.bitrate_mbps as f64).min(crate::quality::auto_mbps(h)) } else { o.bitrate_mbps as f64 };
+        enc_cap.map_or(m, |c| m.min(c))
+    };
     let mut rc = if o.auto_bitrate {
-        RateControl::new_auto(o.bitrate_mbps as f64, Instant::now())
+        RateControl::new_auto(rate_cap(crate::quality::fit(canvas.0, canvas.1, limit).1, None), Instant::now())
     } else {
         RateControl::new(o.bitrate_mbps as f64, Instant::now())
     };
+    sh.send_rate.store(pacer_rate(rc.cur, o.max_send_mbps), Ordering::Relaxed);
+    let mut stat_n = 0u32;
     let rate_mode = |rc: &RateControl| if rc.ramp.is_some() { "ramp" } else if o.auto_bitrate { "auto" } else { "fixed" };
     if o.auto_bitrate {
         ui::rate(rc.cur, rate_mode(&rc));
@@ -914,8 +923,20 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         let target = crate::quality::fit(canvas.0, canvas.1, limit);
         if enc.as_ref().is_some_and(|e| (e.width, e.height) != target) {
             enc = None;
+            enc_cap = None;
             dirty = true;
             force_key = true;
+        }
+        let rate_max = rate_cap(target.1, enc_cap);
+        if (rate_max - rc.max()).abs() > 1e-6 {
+            rc.set_max(rate_max);
+            if let Some(e) = enc.as_mut() {
+                e.set_bitrate((rc.cur * 1e6) as u64);
+            }
+            sh.send_rate.store(pacer_rate(rc.cur, o.max_send_mbps), Ordering::Relaxed);
+            if o.auto_bitrate {
+                ui::rate(rc.cur, rate_mode(&rc));
+            }
         }
         // Keyframe requests are a last resort on the client now; still served at most every 500 ms.
         if sh.keyreq.swap(false, Ordering::Relaxed) {
@@ -958,6 +979,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             };
             // Software encoding: its own frame rate and a bitrate the CPU can really produce.
             period = Duration::from_secs_f64(1.0 / e.fps as f64);
+            enc_cap = e.max_mbps;
             if let Some(cap) = e.max_mbps {
                 if cap < rc.max() {
                     rc.clamp_max(cap);
@@ -1039,7 +1061,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             let resent = sh.resent.load(Ordering::Relaxed);
             let glitches = crate::audio::CAPTURE_GLITCHES.load(Ordering::Relaxed);
             let skipped = sh.skipped_busy.load(Ordering::Relaxed);
-            ui::stat(&format!(
+            let line = format!(
                 "{enc_short} · {:.0} кадров/с (экран обновился {:.0}/с, отложено из-за сети {}) · {:.1} Мбит/с (качество {:.0}) · потери {:.1}% · дослано {} · подготовка {:.1}/{:.1} мс, кодирование {:.1}/{:.1} мс (ср/макс) · звук {}{}",
                 stat_frames as f64 / secs,
                 stat_updates as f64 / secs,
@@ -1054,7 +1076,15 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 stat_encode_peak.as_secs_f64() * 1000.0,
                 if sh.peer_opus.load(Ordering::Relaxed) { "Opus" } else { "обычный" },
                 if glitches > 0 { format!(" · пропуски в захвате звука: {glitches}") } else { String::new() },
-            ));
+            );
+            ui::stat(&line);
+            // Into the log too: every half a minute, and every time while packets are being lost. Without it a
+            // stream that went wrong on someone else's computer could not be told apart afterwards.
+            stat_n += 1;
+            if stat_n % 6 == 1 || loss > 0.02 {
+                let size = enc.as_ref().map_or(canvas, |e| (e.width, e.height));
+                net::conn_log(&format!("трансляция {}x{}: {line} · потолок {:.0} Мбит/с", size.0, size.1, rc.max()));
+            }
             stat_resent0 = resent;
             stat_updates = 0;
             stat_skipped0 = skipped;
