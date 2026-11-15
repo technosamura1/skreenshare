@@ -692,7 +692,6 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     let mut audio_check = Instant::now();
     let mut audio_dirty = false;
     let (mut pv, pv_thread) = Preview::new();
-    let mut scaler = BgraScaler::new();
     let mut scratch: Vec<u8> = Vec::new();
     let mut period = Duration::from_secs_f64(1.0 / o.fps as f64);
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -996,10 +995,15 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         let scaled = enc_size != (canvas.0 as usize, canvas.1 as usize);
         let (enc_buf, enc_stride) = e.input()?;
         let full_stride = canvas.0 as usize * 4;
-        if scaled {
+        // The whole screen is composed at its own size and then shrunk. A window is fitted straight into the
+        // encoder's picture instead: it used to be stretched to the monitor's size first (slow, one thread) and
+        // shrunk back afterwards, which left a 1080p window on a 4K monitor at about ten frames a second.
+        let via_full = scaled && matches!(cap, Cap::Screen(_));
+        if via_full {
             full.resize(full_stride * canvas.1 as usize, 0);
         }
-        let (buf, stride) = if scaled { (&mut full[..], full_stride) } else { (&mut *enc_buf, enc_stride) };
+        let (buf, stride, pic) =
+            if via_full { (&mut full[..], full_stride, canvas) } else { (&mut *enc_buf, enc_stride, (enc_size.0 as u32, enc_size.1 as u32)) };
         match &mut cap {
             Cap::Screen(c) => {
                 c.compose(buf, stride);
@@ -1013,18 +1017,20 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 } else {
                     crate::inputhost::Region::Window { canvas, content: size, hwnd: w.hwnd() }
                 });
-                crate::source::draw_letterboxed(src, size, buf, stride, canvas, &mut scratch, |s, sw, sh, d, dw, dh| {
-                    scaler.scale(s, sw, sh, sw as usize * 4, d, dw, dh, dw as usize * 4).map_err(|e| format!("{e:#}"))
+                crate::source::draw_letterboxed(src, size, buf, stride, pic, &mut scratch, |s, sw, sh, d, dw, dh| {
+                    // Threaded: smooth average when shrinking, bilinear when a small window is enlarged.
+                    crate::scale::shrink_bgra(s, sw as usize, sh as usize, sw as usize * 4, d, dw as usize, dh as usize, dw as usize * 4, cores.min(8));
+                    Ok(())
                 })
                 .map_err(|e| anyhow::anyhow!(e))?;
             }
         }
         if crate::avsync::enabled()
-            && flash.rising(crate::avsync::luma(buf, stride, canvas.0 as usize, canvas.1 as usize))
+            && flash.rising(crate::avsync::luma(buf, stride, pic.0 as usize, pic.1 as usize))
         {
             crate::avsync::log("host_video", crate::avsync::now_us());
         }
-        if scaled {
+        if via_full {
             crate::scale::shrink_bgra(&full, canvas.0 as usize, canvas.1 as usize, full_stride, enc_buf, enc_size.0, enc_size.1, enc_stride, cores.min(8));
         }
         let prep_time = t0.elapsed();
