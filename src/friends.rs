@@ -23,6 +23,9 @@ pub const KIND_PRESENCE: u8 = b'P';
 pub const KIND_INVITE: u8 = b'I';
 pub const KIND_ANSWER: u8 = b'Y';
 pub const KIND_DECLINE: u8 = b'N';
+/// The streamer stopped the show: an invitation to it (or to come back to it) is void (v0.15.0). Older versions
+/// ignore it.
+pub const KIND_END: u8 = b'E';
 
 /// How long an invitation stays tappable.
 pub const INVITE_TTL_SECS: u64 = 15 * 60;
@@ -92,6 +95,8 @@ pub enum PairEvent {
     WatchCancel { unix: u64, nonce: String },
     Answer { nonce: String, code: String },
     Decline { nonce: String },
+    /// The friend's show is over.
+    StreamEnd { unix: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -300,6 +305,11 @@ impl Book {
 
     pub fn answer(&self, id: &[u8; 16], nonce: &str, code: &str) -> Option<OutMsg> {
         self.pair_line(id, KIND_ANSWER, &format!("{nonce}\n{code}"))
+    }
+
+    /// «My show is over»: the friend's invitation card (and the way back into the show) goes away.
+    pub fn stream_end(&self, id: &[u8; 16], unix: u64) -> Option<OutMsg> {
+        self.pair_line(id, KIND_END, &unix.to_string())
     }
 
     pub fn decline(&self, id: &[u8; 16], nonce: &str) -> Option<OutMsg> {
@@ -777,6 +787,7 @@ fn parse_pair(kind: u8, body: &str) -> Option<PairEvent> {
             }
             Some(PairEvent::Decline { nonce: nonce.to_ascii_lowercase() })
         }
+        KIND_END => Some(PairEvent::StreamEnd { unix: body.trim().parse().ok()? }),
         _ => None,
     }
 }
@@ -815,7 +826,7 @@ impl Channel {
     }
 
     fn open_any(&self, message: &str) -> Option<(u8, String)> {
-        for k in [KIND_WATCH_CANCEL, KIND_WATCH, KIND_PROFILE, KIND_PRESENCE, KIND_INVITE, KIND_ANSWER, KIND_DECLINE, KIND_HELLO] {
+        for k in [KIND_WATCH_CANCEL, KIND_WATCH, KIND_PROFILE, KIND_PRESENCE, KIND_INVITE, KIND_ANSWER, KIND_DECLINE, KIND_END, KIND_HELLO] {
             if let Some(body) = self.open(k, message) {
                 return Some((k, body));
             }
@@ -1147,6 +1158,20 @@ mod tests {
         let again = b.add(&a.code()).unwrap();
         assert_eq!(a.take_hellos(&[again.body]), 1);
         assert_eq!(a.friends[0].pair, b.friends[0].pair);
+    }
+
+    #[test]
+    fn stream_end_reaches_the_friend_and_nobody_else() {
+        let mut a = Book::generate("A");
+        let mut b = Book::generate("B");
+        let hello = a.add(&b.code()).unwrap();
+        assert_eq!(b.take_hellos(&[hello.body]), 1);
+        let (a_id, b_id) = (a.me.id, b.me.id);
+        let end = a.stream_end(&b_id, 1_700_000_000).unwrap();
+        assert_eq!(b.open_pair(&a_id, &end.body), Some(PairEvent::StreamEnd { unix: 1_700_000_000 }));
+        // our own message read back from the shared topic is not an event for us
+        assert_eq!(a.open_pair(&b_id, &end.body), None);
+        assert!(a.stream_end(&[9u8; 16], 1).is_none());
     }
 
     #[test]

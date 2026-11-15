@@ -25,6 +25,8 @@ pub struct HostOpts {
     pub auto_bitrate: bool,
     pub bitrate_mbps: u32,
     pub fps: u32,
+    /// The streamer's ceiling for the stream's height (quality.rs): `AUTO` = follow the viewer.
+    pub max_height: u16,
     pub preset: String,
     pub max_send_mbps: u32,
     pub audio: bool,
@@ -81,6 +83,8 @@ struct Shared {
     backlog: AtomicUsize,
     /// Frames skipped because the sender was still busy (instead of encoding them and breaking the chain).
     skipped_busy: AtomicU64,
+    /// What the viewer asked for (PT_QUALITY): wanted height << 16 | height of its window. 0 = nothing yet.
+    viewer_quality: AtomicU32,
 }
 
 impl Shared {
@@ -464,6 +468,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         audio_hist: Mutex::new(None),
         backlog: AtomicUsize::new(0),
         skipped_busy: AtomicU64::new(0),
+        viewer_quality: AtomicU32::new(0),
     });
     {
         let sh = sh.clone();
@@ -548,6 +553,11 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     net::PT_INPUT if from == peer => input.on_input(body),
                 net::PT_ANNOT if from == peer => annot_view.on_packet(body),
                 net::PT_CTLREQ if from == peer => input.on_ctl_request(body),
+                    net::PT_QUALITY if from == peer => {
+                        if let Some((want, win_h)) = crate::quality::decode(body) {
+                            sh.viewer_quality.store((want as u32) << 16 | win_h as u32, Ordering::Relaxed);
+                        }
+                    }
                     net::PT_ANACK => {
                         // Resend audio the viewer is still missing (a few per request: it only asks for what it needs).
                         let hist = sh.audio_hist.lock().unwrap().clone();
@@ -573,6 +583,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                     }
                     net::PT_BYE => {
                         println!("Зритель отключился.");
+                        ui::viewer_left();
                         sh.running.store(false, Ordering::Relaxed);
                     }
                     _ => {}
@@ -687,6 +698,10 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let mut enc_short = String::new();
     let mut enc: Option<Encoder> = None;
+    // The picture is shrunk before the encoder when the stream is smaller than the screen (quality.rs): the screen
+    // is composed here at its own size first.
+    let mut full: Vec<u8> = Vec::new();
+    let mut limit = crate::quality::effective(o.max_height, crate::quality::AUTO, 0);
     let mut dirty = true;
     let mut force_key = true;
     let mut next_due = Instant::now();
@@ -884,6 +899,24 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
                 Err(e) => ui::source_status(&format!("Не удалось переключить ({e:#}) — продолжаю транслировать прежнее"), true),
             }
         }
+        // The viewer picked another resolution (or its window changed under "auto"): a new encoder at the new size.
+        // The stream goes on; the viewer follows the new size from the keyframe.
+        {
+            let q = sh.viewer_quality.load(Ordering::Relaxed);
+            let now_limit = crate::quality::effective(o.max_height, (q >> 16) as u16, q as u16);
+            if now_limit != limit {
+                limit = now_limit;
+                let (tw, th) = crate::quality::fit(canvas.0, canvas.1, limit);
+                net::conn_log(&format!("разрешение трансляции: {tw}x{th} (экран {}x{}, выбор зрителя {}, окно зрителя {})", canvas.0, canvas.1, crate::quality::label((q >> 16) as u16), q as u16));
+                dirty = true;
+            }
+        }
+        let target = crate::quality::fit(canvas.0, canvas.1, limit);
+        if enc.as_ref().is_some_and(|e| (e.width, e.height) != target) {
+            enc = None;
+            dirty = true;
+            force_key = true;
+        }
         // Keyframe requests are a last resort on the client now; still served at most every 500 ms.
         if sh.keyreq.swap(false, Ordering::Relaxed) {
             gate.request();
@@ -895,7 +928,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         let now = Instant::now();
         if !dirty || now < next_due {
             // Idle moment: the right time for a preview of the last sent frame (never delays an encode).
-            pv.maybe(enc.as_ref(), canvas, sh.now_ms(), 0);
+            pv.maybe(enc.as_ref(), enc.as_ref().map_or(canvas, |e| (e.width, e.height)), sh.now_ms(), 0);
             continue;
         }
         // The paced sender is still working through earlier frames (a big keyframe, retransmissions): don't pile more
@@ -909,8 +942,8 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         if enc.is_none() {
             let (e, note) = Encoder::open_best(
                 &EncoderConfig {
-                    width: canvas.0,
-                    height: canvas.1,
+                    width: target.0,
+                    height: target.1,
                     fps: o.fps,
                     bitrate: (rc.cur * 1e6) as u64,
                     preset: o.preset.clone(),
@@ -937,7 +970,14 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         }
         let e = enc.as_mut().unwrap();
         let t0 = Instant::now();
-        let (buf, stride) = e.input()?;
+        let enc_size = (e.width as usize, e.height as usize);
+        let scaled = enc_size != (canvas.0 as usize, canvas.1 as usize);
+        let (enc_buf, enc_stride) = e.input()?;
+        let full_stride = canvas.0 as usize * 4;
+        if scaled {
+            full.resize(full_stride * canvas.1 as usize, 0);
+        }
+        let (buf, stride) = if scaled { (&mut full[..], full_stride) } else { (&mut *enc_buf, enc_stride) };
         match &mut cap {
             Cap::Screen(c) => {
                 c.compose(buf, stride);
@@ -961,6 +1001,9 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
             && flash.rising(crate::avsync::luma(buf, stride, canvas.0 as usize, canvas.1 as usize))
         {
             crate::avsync::log("host_video", crate::avsync::now_us());
+        }
+        if scaled {
+            crate::scale::shrink_bgra(&full, canvas.0 as usize, canvas.1 as usize, full_stride, enc_buf, enc_size.0, enc_size.1, enc_stride, cores.min(8));
         }
         let prep_time = t0.elapsed();
         stat_prep += prep_time;
@@ -986,7 +1029,7 @@ fn stream(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, mut monitor: Monit
         force_key = false;
         dirty = false;
         pv.note_frame();
-        pv.maybe(enc.as_ref(), canvas, sh.now_ms(), 400); // busy stream: no idle moments, so make one here
+        pv.maybe(enc.as_ref(), enc.as_ref().map_or(canvas, |e| (e.width, e.height)), sh.now_ms(), 400); // busy stream: no idle moments, so make one here
         next_due = if now.duration_since(next_due) > period { now + period } else { next_due + period };
         stat_frames += 1;
 

@@ -46,6 +46,7 @@ mod plc;
 mod crypto;
 mod ntfy;
 mod preview;
+mod quality;
 mod ratectl;
 mod reassembly;
 mod scale;
@@ -73,6 +74,9 @@ screenshare — показ экрана напрямую, без серверо�
   screenshare host   [--monitor N] [--window HWND] [--bitrate МБИТ] [--fps N] [--preset p1..p7]
                      [--max-send МБИТ] [--no-audio] [--audio-all] [--keep-voice] [--auto-bitrate] [--exchange-dir ПАПКА]
                      [--control] [--no-control-pad] [--no-control-kbm]
+                     [--max-height 720|1080|1440|65535]
+                     --max-height — потолок разрешения трансляции (65535 — как на экране); без него «Авто»: по окну зрителя,
+                     не больше 1440p. Зритель может выбрать меньше прямо во время просмотра.
                      --bitrate по умолчанию 30 (окно программы даёт «Авто», 30 «Стандарт» и 60 «Высокое качество»), --max-send 100.
                      --auto-bitrate — «Авто»: старт с 20 Мбит/с и подъём до --bitrate (по умолчанию 60), пока нет потерь.
                      Звук окна: при показе окна берётся звук только его процесса; --audio-all — всегда весь звук,
@@ -163,6 +167,7 @@ fn host_opts(a: &mut Args) -> Result<host::HostOpts> {
         auto_bitrate,
         bitrate_mbps,
         fps: a.num("--fps", 60)?,
+        max_height: quality::sanitize(a.num::<u32>("--max-height", 0)?),
         preset: a.value("--preset")?.unwrap_or_else(|| "p4".into()),
         max_send_mbps: a.num("--max-send", 100)?,
         audio: !a.flag("--no-audio"),

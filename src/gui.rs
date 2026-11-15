@@ -590,6 +590,10 @@ struct Session {
     revoke_event: bool,
     /// Host: the owner answered the request for control on the banner over the screen (true = allow).
     banner_answer: Option<bool>,
+    /// Host: the viewer left by itself (not an error, not our stop): the show can go on for them to come back.
+    viewer_left: bool,
+    /// Viewer: the streamer ended the show.
+    peer_bye: bool,
 }
 
 impl Session {
@@ -626,6 +630,8 @@ impl Session {
             ctrl: None,
             revoke_event: false,
             banner_answer: None,
+            viewer_left: false,
+            peer_bye: false,
         })
     }
 
@@ -634,6 +640,10 @@ impl Session {
             let l = l.trim().to_string();
             if let Some(c) = l.strip_prefix("@CODE ") {
                 self.code = Some(c.to_string());
+            } else if l == "@VIEWERLEFT" {
+                self.viewer_left = true;
+            } else if l == "@HOSTBYE" {
+                self.peer_bye = true;
             } else if l == "@CONNECTED" {
                 self.connected = true;
                 self.connected_at = Some(Instant::now());
@@ -1063,6 +1073,8 @@ struct GuiApp {
     thumbs: ThumbStore,
     /// Mbit/s ceiling of the chosen preset; 0 = Авто (the default).
     bitrate: u32,
+    /// The streamer's ceiling for the stream's resolution (quality.rs: 0 auto, 720/1080/1440, 65535 as on the screen).
+    max_height: u32,
     /// Frames per second to stream: 30, 60 (the default) or 144. Remembered between runs.
     fps: u32,
     audio: bool,
@@ -1138,6 +1150,10 @@ struct GuiApp {
     friend_auto_join: Option<(friends::Invite, [u8; 16])>,
     /// The friend whose invitation the current «Смотреть» session came from (a repeat invitation is not a new card).
     join_from: Option<[u8; 16]>,
+    /// Viewer: the friend whose show we left by ourselves and since when; while their show goes on we can come back.
+    rejoin_from: Option<([u8; 16], Instant)>,
+    /// Streamer: the viewer left and the show waits for them to come back (since when this waiting code is out).
+    host_wait_back: Option<Instant>,
     watch_requests: friends::WatchInbox,
     watch_cancel_wait: Option<([u8; 16], String)>,
     watch_cancel_post: Option<([u8; 16], String, Receiver<Result<(), String>>)>,
@@ -1236,6 +1252,9 @@ impl GuiApp {
             windows: wincap::list_windows(),
             thumbs: ThumbStore::new(),
             bitrate: 0,
+            max_height: crate::quality::sanitize(
+                crate::volume::ini_get(&crate::volume::read_settings(), "max_height").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+            ) as u32,
             fps: load_fps(),
             audio: true,
             audio_prefs: audiosel::AudioPrefs::default(),
@@ -1284,6 +1303,8 @@ impl GuiApp {
             friend_pending_invites: Vec::new(),
             friend_auto_join: None,
             join_from: None,
+            rejoin_from: None,
+            host_wait_back: None,
             watch_requests: friends::WatchInbox::default(),
             watch_cancel_wait: None,
             watch_cancel_post: None,
@@ -1307,6 +1328,13 @@ impl GuiApp {
         self.clip_checked = false;
         match self.page {
             Page::Host => {
+                // The friend's invitation (and their way back into the show) is void from now on.
+                if let (Some(id), true) = (self.broadcast_target, self.host.is_some()) {
+                    if let Some(m) = self.book.stream_end(&id, unix_now()) {
+                        self.spawn_friend_post(m.topic, m.body, "Трансляция остановлена.".into());
+                    }
+                }
+                self.host_wait_back = None;
                 self.host = None;
                 self.broadcast_target = None;
                 self.manual_broadcast = false;
@@ -1315,12 +1343,61 @@ impl GuiApp {
                 self.friend_invite_autostart = false;
                 self.ctl.allow = false; // consent ends with the session
             }
-            Page::Join => self.join = None,
+            Page::Join => {
+                self.note_left_show();
+                self.join = None;
+            }
             Page::Test => self.test = None,
             _ => {}
         }
         self.input.clear();
         self.start_error = None;
+    }
+
+    /// Viewer: we are leaving (or have left) a friend's show by ourselves while it was running. Remember whose, so
+    /// that their «the show goes on» invitation is offered as a way back.
+    fn note_left_show(&mut self) {
+        let Some(id) = self.join_from else { return };
+        let left = self.join.as_ref().is_some_and(|s| s.connected && !s.peer_bye && s.error.is_none());
+        if left && self.rejoin_from.is_none_or(|(r, _)| r != id) {
+            self.rejoin_from = Some((id, Instant::now()));
+            // Look at the pair often for a while: the invitation back comes in a few seconds.
+            self.friend_rush_ids.insert(id, Instant::now() + Duration::from_secs(120));
+            self.friend_poll_i = 0;
+        }
+    }
+
+    /// The invitation back into the show we left, if it has arrived.
+    fn rejoin_invite(&self) -> Option<(friends::Invite, [u8; 16])> {
+        let (id, _) = self.rejoin_from?;
+        self.friend_pending_invites.iter().find(|(_, fid)| *fid == id).cloned()
+    }
+
+    /// Viewer: «the show goes on, come back» on the watch page. True when something was shown.
+    fn rejoin_card(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some((id, since)) = self.rejoin_from else { return false };
+        let name = self.book.friends.iter().find(|f| f.id == id).map(|f| f.name.clone()).unwrap_or_else(|| "Друг".into());
+        let inv = self.rejoin_invite();
+        if inv.is_none() && since.elapsed() > Duration::from_secs(45) {
+            return false;
+        }
+        let mut back = false;
+        section(ui, |ui| {
+            ui.label(RichText::new(format!("Трансляция «{name}» продолжается")).font(bold(16.0)));
+            if inv.is_some() {
+                ui.label(RichText::new("Вы вышли, а трансляция идёт дальше. Можно вернуться — без кодов и приглашений.").color(c_muted()).size(13.0));
+                ui.add_space(4.0);
+                back = big_button_i(ui, Some(Ico::Eye), "Вернуться к трансляции", c_accent(), true);
+            } else {
+                spinner_line(ui, "Готовим возвращение — пара секунд…");
+                ui.ctx().request_repaint_after(Duration::from_millis(300));
+            }
+        });
+        if let (true, Some((inv, from))) = (back, inv) {
+            let ctx = ui.ctx().clone();
+            self.accept_invite(&ctx, inv, from);
+        }
+        true
     }
 
     fn host_args(&self, sub: &str) -> Vec<String> {
@@ -1332,6 +1409,9 @@ impl GuiApp {
             a.extend(["--bitrate".to_string(), self.bitrate.to_string()]);
         }
         a.extend(["--fps".to_string(), self.fps.to_string()]);
+        if self.max_height != 0 {
+            a.extend(["--max-height".to_string(), self.max_height.to_string()]);
+        }
         if !self.audio {
             a.push("--no-audio".into());
         }
@@ -1392,6 +1472,9 @@ impl GuiApp {
             args.extend(["--room".to_string(), r.clone()]);
         }
         let media_key = self.join_media_key.take();
+        if media_key.is_none() {
+            self.join_from = None; // by a code, not from a friend: nothing to come back to
+        }
         self.join = None;
         match Session::start(ctx, args) {
             Ok(mut s) => {
@@ -1507,6 +1590,29 @@ impl eframe::App for GuiApp {
         }
         for s in [&mut self.host, &mut self.join].into_iter().flatten() {
             s.poll();
+        }
+        // The viewer left by itself: the show goes on and waits for them (a fresh code and an invitation back).
+        // The same again every 10 minutes of waiting, because a code lives for 15.
+        if let Some(id) = self.broadcast_target {
+            let left = self.host.as_ref().is_some_and(|s| s.ended && s.viewer_left && s.error.is_none());
+            let stale = self.host_wait_back.is_some_and(|t| t.elapsed() > Duration::from_secs(600))
+                && self.host.as_ref().is_some_and(|s| !s.ended && !s.connected);
+            if left || stale {
+                self.host = None;
+                self.host_wait_back = Some(Instant::now());
+                self.start_inviting_friend(ctx, id);
+                ctx.request_repaint();
+            }
+        }
+        if self.host.as_ref().is_some_and(|s| s.connected) || self.host.is_none() {
+            self.host_wait_back = None;
+        }
+        // Viewer: the window was closed or «Отключиться» pressed in it while the show was running.
+        if self.join.as_ref().is_some_and(|s| s.ended) {
+            self.note_left_show();
+        }
+        if self.rejoin_from.is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(friends::INVITE_TTL_SECS)) {
+            self.rejoin_from = None;
         }
         // Answered on the banner over the screen: the same as the card's buttons (works with the window hidden).
         if let Some(yes) = self.host.as_mut().and_then(|s| s.banner_answer.take()) {
@@ -2302,6 +2408,15 @@ impl GuiApp {
                                 s.proc.send(&code);
                             }
                         }
+                        PairEvent::StreamEnd { unix } => {
+                            // Their show is over: no invitation to it, no way back into it.
+                            if friends::invite_fresh(unix, now) {
+                                self.friend_pending_invites.retain(|(i, fid)| !(*fid == id && i.unix <= unix));
+                                if self.rejoin_from.is_some_and(|(r, _)| r == id) {
+                                    self.rejoin_from = None;
+                                }
+                            }
+                        }
                         PairEvent::Decline { nonce } => {
                             if self.watch_sent.get(&id).is_some_and(|(n, _)| *n == nonce) {
                                 self.watch_sent.remove(&id);
@@ -2661,16 +2776,19 @@ impl GuiApp {
             .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     let extra = self.friend_pending_invites.len().saturating_sub(1);
-                    let title = if extra == 0 {
+                    let back = self.rejoin_from.is_some_and(|(r, _)| r == from_id);
+                    let title = if back {
+                        format!("Трансляция «{fname}» продолжается")
+                    } else if extra == 0 {
                         format!("{fname} приглашает посмотреть трансляцию")
                     } else {
                         format!("{fname} приглашает посмотреть трансляцию · ещё {extra}")
                     };
                     ui.label(RichText::new(title).font(bold(16.0)));
-                    ui.label(RichText::new(if busy { "Приглашение сохранено. Завершите текущую сессию, чтобы принять его." } else { "Нажмите «Смотреть» — подключение без кодов." }).color(c_muted()).size(13.0));
+                    ui.label(RichText::new(if busy { "Приглашение сохранено. Завершите текущую сессию, чтобы принять его." } else if back { "Вы вышли, а трансляция идёт дальше. Можно вернуться." } else { "Нажмите «Смотреть» — подключение без кодов." }).color(c_muted()).size(13.0));
                     ui.add_space(6.0);
                     ui.columns(2, |cols| {
-                        if big_button_i(&mut cols[0], Some(Ico::Eye), "Смотреть", c_accent(), !busy) {
+                        if big_button_i(&mut cols[0], Some(Ico::Eye), if back { "Вернуться" } else { "Смотреть" }, c_accent(), !busy) {
                             watch = true;
                         }
                         if big_button_i(&mut cols[1], Some(Ico::Cross), "Отклонить", c_card_hover(), true) {
@@ -2693,6 +2811,7 @@ impl GuiApp {
     /// «Смотреть» on an invitation, pressed or implied (we had asked for this stream ourselves).
     fn accept_invite(&mut self, ctx: &egui::Context, inv: friends::Invite, from_id: [u8; 16]) {
         self.join_from = Some(from_id);
+        self.rejoin_from = None;
         self.friend_rush_ids.insert(from_id, Instant::now() + Duration::from_secs(120));
         self.join_media_key = self.book.friends.iter().find(|f| f.id == from_id).map(|f| f.pair);
         self.friend_answer = if inv.kind == InviteKind::Offer { Some((from_id, inv.nonce.clone())) } else { None };
@@ -3698,6 +3817,28 @@ impl GuiApp {
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
+                ui.label(RichText::new("Разрешение").font(bold(15.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new("потолок; зритель может выбрать меньше").color(c_muted()).size(13.0));
+                });
+            });
+            let n = crate::quality::NATIVE as u32;
+            let items = [("Авто", "по окну зрителя", 0), ("720p", "экономно", 720), ("1080p", "Full HD", 1080), ("1440p", "2K", 1440), ("Исходное", "как на экране", n)];
+            if let Some(v) = segmented(ui, &items, self.max_height) {
+                self.max_height = v;
+                crate::volume::write_setting("max_height", &v.to_string());
+            }
+            ui.label(
+                RichText::new(match self.max_height {
+                    0 => "Картинка уменьшается под окно зрителя, но не больше 1440p. На экране 4K это сильно разгружает видеокарту.",
+                    v if v == n => "Без уменьшения. На экране 4K рядом с игрой видеокарта может не успевать — тогда трансляция тормозит.",
+                    _ => "Экран больше этого размера уменьшается перед отправкой. Меньше — легче для видеокарты и интернета.",
+                })
+                .color(c_muted())
+                .size(12.5),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
                 ui.label(RichText::new("Плавность").font(bold(15.0)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(format!("до {} кадров/с", self.fps)).color(c_muted()).size(13.0));
@@ -3939,6 +4080,7 @@ impl GuiApp {
                 ("Esc", "выйти из полного экрана"),
                 ("Колесо мыши", "масштаб к указателю или громкость (выбор в «Смотреть» → «Дополнительно»)"),
                 ("Ctrl + колесо", "второе действие колеса"),
+                ("Q", "качество: Авто → 720p → 1080p → 1440p → исходное (или кнопка «Качество» над панелью)"),
                 ("Левая кнопка или зажатое колесо", "двигать увеличенную картинку"),
                 ("M", "выключить и включить звук"),
                 ("T", "окно поверх всех остальных"),
@@ -4391,9 +4533,23 @@ impl GuiApp {
         if let Some(id) = self.broadcast_target {
             let name = self.book.friends.iter().find(|f| f.id == id).map(|f| f.name.as_str()).unwrap_or("Друг");
             section(ui, |ui| {
-                ui.label(RichText::new(format!("Трансляция для {name}")).font(bold(20.0)));
-                spinner_line(ui, if s.code.is_some() { "Ожидаем принятия приглашения другом…" } else { "Подготавливаем приглашение…" });
-                ui.label(RichText::new("Коды пересылать не нужно. Приглашение появится в программе друга.").color(c_muted()));
+                let waiting_back = self.host_wait_back.is_some();
+                ui.label(RichText::new(if waiting_back { format!("{name} вышел — трансляция ждёт") } else { format!("Трансляция для {name}") }).font(bold(20.0)));
+                spinner_line(ui, if waiting_back {
+                    "Зритель может вернуться в любой момент…"
+                } else if s.code.is_some() {
+                    "Ожидаем принятия приглашения другом…"
+                } else {
+                    "Подготавливаем приглашение…"
+                });
+                ui.label(
+                    RichText::new(if waiting_back {
+                        "У него в программе есть кнопка «Вернуться». Нажмите «Отмена», чтобы закончить трансляцию совсем."
+                    } else {
+                        "Коды пересылать не нужно. Приглашение появится в программе друга."
+                    })
+                    .color(c_muted()),
+                );
                 if let Some(e) = &self.friend_error { error_text(ui, e); }
                 if let Some(ok) = &self.friend_ok { ui.label(RichText::new(ok).color(c_muted())); }
             });
@@ -4554,7 +4710,9 @@ impl GuiApp {
                         ui.label(RichText::new("Просмотр завершён").font(bold(20.0)));
                         ui.label(RichText::new(&s.status).color(c_muted()));
                     });
-                    ui.label(RichText::new("Вы остаётесь в сети и можете принять новое приглашение.").color(c_muted()));
+                    if !self.rejoin_card(ui) {
+                        ui.label(RichText::new("Вы остаётесь в сети и можете принять новое приглашение.").color(c_muted()));
+                    }
                     if big_button_i(ui, Some(Ico::Friends), "К друзьям", c_accent(), true) {
                         self.go_home(); self.page = Page::Friends;
                     }
@@ -4589,6 +4747,7 @@ impl GuiApp {
             return;
         }
         if self.join.is_none() {
+            self.rejoin_card(ui);
             if !self.book.friends.is_empty() {
                 group_label(ui, "Попросить у друга");
                 self.watch_friend_picker(ui);
