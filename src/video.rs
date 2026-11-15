@@ -662,6 +662,7 @@ pub struct BgraScaler {
 unsafe impl Send for BgraScaler {}
 
 impl BgraScaler {
+    #[allow(dead_code)]
     pub fn new() -> BgraScaler {
         BgraScaler { sws: ptr::null_mut(), key: (0, 0, 0, 0), flags: 4 }
     }
