@@ -42,6 +42,9 @@ pub const PT_RUMBLE: u8 = 0xAA;
 pub const PT_ANNOT: u8 = 0xAB;
 /// Viewer -> host: «I'd like to control» (ver u8 = 1 | want u8), about once a second while waiting (v0.12.8).
 pub const PT_CTLREQ: u8 = 0xAC;
+/// Viewer -> host: the resolution the viewer wants and the height of its window (quality.rs, v0.15.0), about once
+/// a second and at once when the choice changes. Old hosts ignore it.
+pub const PT_QUALITY: u8 = 0xAD;
 /// Encrypted video (v0.12.11). Clear header is the same as PT_VIDEO, then nonce and ciphertext.
 pub const PT_VIDEO_ENC: u8 = 0x94;
 /// Encrypted Opus audio. Nonce carries the datagram sequence, so two packets never share it.

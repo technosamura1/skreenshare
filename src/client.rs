@@ -173,6 +173,8 @@ struct Shared {
     shown_size: AtomicU64,
     /// Window client size, (w << 32) | h.
     win_size: AtomicU64,
+    /// The resolution the viewer picked (quality.rs; 0 = auto), sent to the host about once a second.
+    quality: std::sync::atomic::AtomicU32,
     picture: Mutex<Picture>,
     /// Frames waiting for the decoder (the channel can't tell us).
     qdepth: AtomicUsize,
@@ -325,6 +327,11 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         video_size: AtomicU64::new(0),
         shown_size: AtomicU64::new(0),
         win_size: AtomicU64::new((1280u64 << 32) | 720),
+        quality: std::sync::atomic::AtomicU32::new(
+            crate::quality::sanitize(
+                crate::volume::ini_get(&crate::volume::read_settings(), "viewer_quality").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+            ) as u32,
+        ),
         picture: Mutex::new(Picture { w: 0, h: 0, px: Vec::new(), flash: false, seq: 0 }),
         qdepth: AtomicUsize::new(0),
         dec_mode: AtomicU8::new(0),
@@ -473,6 +480,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                                 net::PT_RUMBLE if control && from == peer => input.on_rumble(body),
                                 net::PT_BYE => {
                                     println!("Трансляция остановлена на другой стороне.");
+                                    ui::host_bye();
                                     sh.running.store(false, Ordering::Relaxed);
                                 }
                                 _ => {}
@@ -568,9 +576,31 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
                 out.push(if audio_on { net::CAP_OPUS } else { 0 } | if control { net::CAP_INPUT } else { 0 } | if enc { net::CAP_ENC } else { 0 });
                 net::send_media(&sock, &out, peer);
             }
+            let mut quality_sent = u32::MAX;
+            let mut quality_win_h = 0u16;
+            let mut quality_logged = (u32::MAX, 0u16);
             while sh.running.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
                 tick += 1;
+                // The resolution we want and the height of our window ("auto" follows it): once a second, and at
+                // once when the choice changes.
+                let q = sh.quality.load(Ordering::Relaxed);
+                if q != quality_sent || tick % 10 == 2 {
+                    quality_sent = q;
+                    // A minimized window reports a zero size: "auto" keeps following the last real one.
+                    let h_now = (sh.win_size.load(Ordering::Relaxed) & 0xFFFF_FFFF).min(60_000) as u16;
+                    if h_now != 0 {
+                        quality_win_h = h_now;
+                    }
+                    let win_h = quality_win_h;
+                    if (q, win_h) != quality_logged {
+                        quality_logged = (q, win_h);
+                        net::conn_log(&format!("зритель: желаемое разрешение {}, высота окна {win_h}", crate::quality::label(q as u16)));
+                    }
+                    net::write_header(&mut out, net::PT_QUALITY, token);
+                    crate::quality::encode(q as u16, win_h, &mut out);
+                    net::send_media(&sock, &out, peer);
+                }
                 // Keyframe request: last resort, with a backoff so a bad moment doesn't become a request storm.
                 if keyreq.poll(Instant::now(), sh.waiting_key.load(Ordering::Relaxed)) {
                     net::write_header(&mut out, net::PT_KEYREQ, token);
@@ -1043,6 +1073,7 @@ fn view(sock: Arc<UdpSocket>, peer: SocketAddr, token: u32, o: ClientOpts) -> Re
         zoom: 1.0,
         zoom_origin: (0.0, 0.0),
         pan: None,
+        quality_menu: false,
         last_click: None,
         volume: player.as_ref().map(|p| p.volume.clone()),
         no_audio_note: if !o.audio {
@@ -1105,6 +1136,8 @@ struct App {
     /// Zoom of the picture (1 = all of it) and the top-left corner of the visible part, as fractions of the picture.
     zoom: f32,
     zoom_origin: (f32, f32),
+    /// The quality menu above the bar is open.
+    quality_menu: bool,
     /// The left or the middle button is held on the zoomed picture: it is dragged (last pointer position).
     pan: Option<(i32, i32)>,
     last_click: Option<Instant>,
@@ -1303,6 +1336,19 @@ impl App {
         Some(((fx, fy), (tw as f32, th as f32)))
     }
 
+    fn quality_rects(&self) -> Option<QualityRects> {
+        self.bar_geometry().map(|b| quality_rects(&b))
+    }
+
+    /// The viewer's pick of the stream's resolution: told to the host (the net thread sends it at once), remembered.
+    fn set_quality(&mut self, v: u16) {
+        self.sh.quality.store(v as u32, Ordering::Relaxed);
+        crate::volume::write_setting("viewer_quality", &v.to_string());
+        self.quality_menu = false;
+        self.toast = Some((format!("Качество: {}", crate::quality::label(v)), Instant::now()));
+        self.wake_bar();
+    }
+
     /// One wheel step of zoom around the pointer.
     fn zoom_by(&mut self, steps: f32) {
         let Some((at, _)) = self.shown_frac() else { return };
@@ -1499,6 +1545,22 @@ impl App {
     }
 }
 
+/// The quality chip and the five rows of its menu (top to bottom as in `quality::CHOICES`).
+type QualityRects = ((i32, i32, i32, i32), [(i32, i32, i32, i32); 5]);
+
+/// Where they are for this bar: the chip above the bar's right end, the menu above the chip.
+fn quality_rects(b: &Bar) -> QualityRects {
+    let s = b.s;
+    let (w, h) = (164 * s, 30 * s);
+    let x = (b.x + b.w - w).max(0);
+    let y = b.y - h - 8 * s;
+    let mut rows = [(0, 0, 0, 0); 5];
+    for (i, r) in rows.iter_mut().enumerate() {
+        *r = (x, y - 10 * s - (5 - i as i32) * h, w, h);
+    }
+    ((x, y, w, h), rows)
+}
+
 impl ApplicationHandler<UserEv> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -1673,6 +1735,19 @@ impl ApplicationHandler<UserEv> for App {
                     {
                         self.toggle_fullscreen()
                     }
+                    // Q: the next resolution (auto, 720p, 1080p, 1440p, the original).
+                    _ if !self.mods.control_key()
+                        && !self.mods.alt_key()
+                        && matches!(event.physical_key, winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyQ)) =>
+                    {
+                        let cur = self.sh.quality.load(Ordering::Relaxed) as u16;
+                        let i = crate::quality::CHOICES.iter().position(|c| c.0 == cur).unwrap_or(0);
+                        self.set_quality(crate::quality::CHOICES[(i + 1) % crate::quality::CHOICES.len()].0);
+                    }
+                    Key::Named(NamedKey::Escape) if self.quality_menu => {
+                        self.quality_menu = false;
+                        self.redraw();
+                    }
                     Key::Named(NamedKey::Escape) if self.armed.is_some() || self.picker || self.laser => {
                         self.laser = false; self.input.laser(None);
                         self.armed = None;
@@ -1792,6 +1867,30 @@ impl ApplicationHandler<UserEv> for App {
                 self.wake_bar();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                // The quality chip above the bar and its menu come first.
+                if !self.picker {
+                    if let Some((chip, rows)) = self.quality_rects() {
+                        let c = self.cursor;
+                        let inside = |r: (i32, i32, i32, i32)| c.0 >= r.0 && c.0 < r.0 + r.2 && c.1 >= r.1 && c.1 < r.1 + r.3;
+                        if self.quality_menu {
+                            match rows.iter().position(|r| inside(*r)) {
+                                Some(i) => self.set_quality(crate::quality::CHOICES[i].0),
+                                None => {
+                                    self.quality_menu = false;
+                                    self.redraw();
+                                }
+                            }
+                            self.last_click = None;
+                            return;
+                        }
+                        if self.bar_drawn && inside(chip) {
+                            self.quality_menu = true;
+                            self.last_click = None;
+                            self.wake_bar();
+                            return;
+                        }
+                    }
+                }
                 // A click on the bar belongs to the bar (and does not count towards the double click).
                 self.set_hover();
                 match self.hover {
@@ -1990,7 +2089,7 @@ impl App {
             buf[(oy + ph) * ww..].fill(0);
         }
         drop(p);
-        let opacity = if self.drag || self.picker || self.hover != Hit::Outside {
+        let opacity = if self.drag || self.picker || self.quality_menu || self.hover != Hit::Outside {
             1.0
         } else {
             crate::guilogic::bar_opacity(self.last_move.elapsed().as_millis())
@@ -2015,6 +2114,36 @@ impl App {
             };
             let geom = Bar::with_control(ww as i32, wh as i32, sc, ctl.is_some());
             bar::draw(&mut buf, ww as i32, wh as i32, &geom, &st);
+            // The quality chip above the bar's right end, and its menu.
+            if !self.picker && !self.captured {
+                let mut ob = crate::overlay::Buf { px: &mut buf, w: ww as i32, h: wh as i32 };
+                let (chip, rows) = quality_rects(&geom);
+                let q = self.sh.quality.load(Ordering::Relaxed) as u16;
+                let px = 13.0 * sc as f32;
+                let ty = |r: (i32, i32, i32, i32)| r.1 + (r.3 - (px * 1.2) as i32) / 2;
+                let inside = |r: (i32, i32, i32, i32)| self.cursor.0 >= r.0 && self.cursor.0 < r.0 + r.2 && self.cursor.1 >= r.1 && self.cursor.1 < r.1 + r.3;
+                ob.round(chip.0, chip.1, chip.2, chip.3, chip.3 / 2, 0x00_2B_2D_31, 0.92 * opacity);
+                if inside(chip) || self.quality_menu {
+                    ob.round(chip.0, chip.1, chip.2, chip.3, chip.3 / 2, 0x00_F2_F3_F5, 0.10 * opacity);
+                }
+                let label = format!("Качество: {}", crate::quality::label(q));
+                let tw = crate::overlay::text_width(px, &label);
+                ob.text(chip.0 + (chip.2 - tw) / 2, ty(chip), px, &label, 0x00_F2_F3_F5, opacity);
+                if self.quality_menu {
+                    let (top, last) = (rows[0], rows[rows.len() - 1]);
+                    ob.round(top.0, top.1 - 4 * sc, top.2, last.1 + last.3 - top.1 + 8 * sc, 10 * sc, 0x00_2B_2D_31, 0.97);
+                    for (r, (v, name)) in rows.iter().zip(crate::quality::CHOICES) {
+                        if inside(*r) {
+                            ob.round(r.0 + 4 * sc, r.1, r.2 - 8 * sc, r.3, 6 * sc, 0x00_F2_F3_F5, 0.12);
+                        }
+                        let on = v == q;
+                        if on {
+                            ob.disc(r.0 + 16 * sc, r.1 + r.3 / 2, 3.5 * sc as f32, 0x00_9A_A7_FF, 1.0);
+                        }
+                        ob.text(r.0 + 30 * sc, ty(*r), px, name, if on { 0x00_9A_A7_FF } else { 0x00_F2_F3_F5 }, 1.0);
+                    }
+                }
+            }
             if geom.ctl_w > 90 * sc {
                 if let Some((on, allowed, _, pad_ok, kbm_ok)) = ctl {
                     let mut ob = crate::overlay::Buf { px: &mut buf, w: ww as i32, h: wh as i32 };

@@ -64,6 +64,84 @@ pub fn blit_fit(dst: &mut [u32], ww: usize, wh: usize, src: &[u32], sw: usize, s
     }
 }
 
+/// Shrinks a BGRA picture (rows `sstride` bytes apart) into `dst` (rows `dstride` apart) on the host, before the
+/// encoder: bilinear for small reductions, an average of the covered pixels from 2x on (no shimmer on text and thin
+/// lines). The rows are split between `threads` threads; 4K -> 1440p takes a few milliseconds on a desktop CPU.
+pub fn shrink_bgra(src: &[u8], sw: usize, sh: usize, sstride: usize, dst: &mut [u8], dw: usize, dh: usize, dstride: usize, threads: usize) {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 || sstride < sw * 4 || dstride < dw * 4 {
+        return;
+    }
+    if src.len() < sstride * (sh - 1) + sw * 4 || dst.len() < dstride * (dh - 1) + dw * 4 {
+        return;
+    }
+    let boxy = sw >= dw * 2;
+    // Per destination column: bilinear = left source pixel and the weight of the right one; box = first and
+    // one-past-last source column.
+    let xs: Vec<(usize, usize)> = (0..dw)
+        .map(|x| {
+            if boxy {
+                let x0 = x * sw / dw;
+                (x0, ((x + 1) * sw / dw).max(x0 + 1).min(sw))
+            } else {
+                let fx = ((x as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).max(0.0);
+                let x0 = (fx as usize).min(sw - 1);
+                (x0, (((fx - x0 as f32) * 256.0) as usize).min(256))
+            }
+        })
+        .collect();
+    let px = |row: &[u8], x: usize| u32::from_le_bytes([row[x * 4], row[x * 4 + 1], row[x * 4 + 2], 0]);
+    let band = |y_from: usize, rows: &mut [u8]| {
+        for (i, out) in rows.chunks_mut(dstride).enumerate() {
+            let y = y_from + i;
+            if y >= dh {
+                break;
+            }
+            let out = &mut out[..dw * 4];
+            if boxy {
+                let y0 = y * sh / dh;
+                let y1 = ((y + 1) * sh / dh).max(y0 + 1).min(sh);
+                for (o, &(x0, x1)) in out.chunks_exact_mut(4).zip(&xs) {
+                    let (mut b, mut g, mut r) = (0u32, 0u32, 0u32);
+                    for yy in y0..y1 {
+                        let line = &src[yy * sstride + x0 * 4..yy * sstride + x1 * 4];
+                        for p in line.chunks_exact(4) {
+                            b += p[0] as u32;
+                            g += p[1] as u32;
+                            r += p[2] as u32;
+                        }
+                    }
+                    let n = ((y1 - y0) * (x1 - x0)) as u32;
+                    o.copy_from_slice(&[((b + n / 2) / n) as u8, ((g + n / 2) / n) as u8, ((r + n / 2) / n) as u8, 255]);
+                }
+            } else {
+                let fy = ((y as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).max(0.0);
+                let y0 = (fy as usize).min(sh - 1);
+                let y1 = (y0 + 1).min(sh - 1);
+                let wy = (((fy - y0 as f32) * 256.0) as u32).min(256);
+                let (r0, r1) = (&src[y0 * sstride..y0 * sstride + sw * 4], &src[y1 * sstride..y1 * sstride + sw * 4]);
+                for (o, &(x0, wx)) in out.chunks_exact_mut(4).zip(&xs) {
+                    let x1 = (x0 + 1).min(sw - 1);
+                    let wx = wx as u32;
+                    let v = lerp(lerp(px(r0, x0), px(r0, x1), wx), lerp(px(r1, x0), px(r1, x1), wx), wy) | 0xFF00_0000;
+                    o.copy_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+    };
+    let threads = threads.clamp(1, 16).min(dh);
+    let per = dh.div_ceil(threads);
+    if threads == 1 {
+        band(0, dst);
+        return;
+    }
+    std::thread::scope(|sc| {
+        for (i, rows) in dst.chunks_mut(dstride * per).enumerate() {
+            let band = &band;
+            sc.spawn(move || band(i * per, rows));
+        }
+    });
+}
+
 /// Zoom limits of the viewer (1 = the whole picture).
 pub const ZOOM_MAX: f32 = 8.0;
 
@@ -139,6 +217,57 @@ mod tests {
         assert_eq!(zoom_about((0.0, 0.0), 1.0, 4.0, (1.0, 1.0)), (0.75, 0.75));
         assert_eq!(zoom_about((0.6, 0.6), 4.0, 1.0, (0.1, 0.9)), (0.0, 0.0));
         assert_eq!(clamp_origin((-1.0, 2.0), 2.0), (0.0, 0.5));
+    }
+
+    #[test]
+    fn shrink_bgra_averages_and_is_the_same_on_any_number_of_threads() {
+        // 8x8, left half blue 200, right half blue 100; padded rows on both sides
+        let (sw, sh, sstride) = (8usize, 8usize, 40usize);
+        let mut src = vec![7u8; sstride * sh];
+        for y in 0..sh {
+            for x in 0..sw {
+                let p = &mut src[y * sstride + x * 4..y * sstride + x * 4 + 4];
+                p.copy_from_slice(&[if x < 4 { 200 } else { 100 }, 50, 10, 0]);
+            }
+        }
+        // 2x down (box): 4x4, exact averages, alpha set
+        let dstride = 20usize;
+        let mut d1 = vec![0u8; dstride * 4];
+        shrink_bgra(&src, sw, sh, sstride, &mut d1, 4, 4, dstride, 1);
+        assert_eq!(&d1[0..4], &[200, 50, 10, 255]);
+        assert_eq!(&d1[12..16], &[100, 50, 10, 255]);
+        assert_eq!(d1[16], 0, "row padding is not touched");
+        let mut d3 = vec![0u8; dstride * 4];
+        shrink_bgra(&src, sw, sh, sstride, &mut d3, 4, 4, dstride, 3);
+        assert_eq!(d1, d3);
+        // 1.33x down (bilinear): 6x6, flat areas keep their colour, the seam is in between
+        let mut d = vec![0u8; 24 * 6];
+        shrink_bgra(&src, sw, sh, sstride, &mut d, 6, 6, 24, 2);
+        assert_eq!(&d[0..3], &[200, 50, 10]);
+        assert_eq!(&d[20..23], &[100, 50, 10]);
+        let mut d2 = vec![0u8; 24 * 6];
+        shrink_bgra(&src, sw, sh, sstride, &mut d2, 6, 6, 24, 5);
+        assert_eq!(d, d2);
+        // short buffers are left alone
+        shrink_bgra(&src[..10], sw, sh, sstride, &mut d, 6, 6, 24, 2);
+        shrink_bgra(&src, sw, sh, sstride, &mut [0u8; 8], 6, 6, 24, 2);
+    }
+
+    #[test]
+    #[ignore]
+    fn shrink_bgra_speed() {
+        let (sw, sh) = (3840usize, 2160usize);
+        let src: Vec<u8> = (0..sw * sh * 4).map(|i| (i * 31 % 251) as u8).collect();
+        for (dw, dh) in [(2560usize, 1440usize), (1920, 1080), (1280, 720)] {
+            let mut dst = vec![0u8; dw * dh * 4];
+            for threads in [1usize, 4, 8] {
+                let t = std::time::Instant::now();
+                for _ in 0..20 {
+                    shrink_bgra(&src, sw, sh, sw * 4, &mut dst, dw, dh, dw * 4, threads);
+                }
+                println!("4K -> {dw}x{dh}, {threads} thr: {:.1} ms", t.elapsed().as_secs_f64() * 50.0);
+            }
+        }
     }
 
     #[test]

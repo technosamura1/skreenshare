@@ -138,6 +138,21 @@ pub fn connected() {
     }
 }
 
+/// The viewer said goodbye by itself (closed its window, pressed «Отключиться»): the GUI may keep the show going
+/// and let them come back. Nothing in a console.
+pub fn viewer_left() {
+    if ipc() {
+        println!("@VIEWERLEFT");
+    }
+}
+
+/// The streamer ended the show (so there is nothing to come back to).
+pub fn host_bye() {
+    if ipc() {
+        println!("@HOSTBYE");
+    }
+}
+
 type StopCb = Box<dyn FnOnce() + Send>;
 static STOP_CB: std::sync::Mutex<Option<StopCb>> = std::sync::Mutex::new(None);
 static STOP_REQ: AtomicBool = AtomicBool::new(false);
